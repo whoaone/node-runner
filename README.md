@@ -30,5 +30,5 @@ Whether you're a student learning FEA, an engineer needing a quick tool for simp
 
 **1. Clone the repository:**
 ```bash
-git clone [https://github.com/your-username/node-runner.git](https://github.com/your-username/node-runner.git)
+git clone [https://github.com/your-username/node-runner.git](https://github.com/whoaone/node-runner.git)
 cd node-runner
