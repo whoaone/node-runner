@@ -5,6 +5,8 @@ import datetime
 import numpy as np
 from io import StringIO
 from pyNastran.bdf.bdf import BDF
+from scipy.spatial import cKDTree
+from pyNastran.bdf.cards.elements.shell import CQUAD4, CTRIA3
 
 class NastranModelGenerator:
     def __init__(self, params=None):
@@ -340,6 +342,217 @@ class NastranModelGenerator:
         J=(1/3)*(H*t**3+W1*t**3+W2*t**3)
         return {'A':A,'I1':I1_web+I1_fl1+I1_fl2,'I2':I2_web+I2_fl1+I2_fl2,'J':J}
     
+
+    # --- NEW: Method to find duplicate nodes (Phase 1) ---
+    def find_duplicate_nodes(self, tolerance):
+        """
+        Finds groups of duplicate nodes within a given tolerance using a k-d tree.
+
+        Args:
+            tolerance (float): The distance within which nodes are considered duplicates.
+
+        Returns:
+            list[list[int]]: A list of groups, where each inner list contains the IDs
+                             of duplicate nodes. e.g., [[101, 201], [105, 304, 501]]
+        """
+        if not self.model.nodes or tolerance <= 0:
+            return []
+
+        # Extract node IDs and their corresponding coordinates into numpy arrays
+        node_ids = np.array(list(self.model.nodes.keys()))
+        coords = np.array([node.get_position() for node in self.model.nodes.values()])
+
+        # Build the k-d tree for efficient spatial searching
+        tree = cKDTree(coords)
+
+        # Find all pairs of nodes within the given tolerance radius.
+        # This returns a list where each element is a list of indices of neighboring points.
+        pairs = tree.query_ball_tree(tree, r=tolerance)
+
+        # Process the raw pairs into unique, sorted groups of duplicate node IDs.
+        # A set is used to automatically handle uniqueness.
+        duplicate_sets = set()
+        for i, neighbors_indices in enumerate(pairs):
+            # A group must have more than one node to be considered a duplicate set.
+            if len(neighbors_indices) > 1:
+                # Convert indices back to actual node IDs and store as a sorted tuple.
+                group_ids = tuple(sorted([node_ids[j] for j in neighbors_indices]))
+                duplicate_sets.add(group_ids)
+
+        # Convert the set of tuples back to a list of lists for the final output.
+        return [list(group) for group in sorted(list(duplicate_sets))]
+    
+
+    # --- NEW: Method to merge duplicate nodes (Phase 2) ---
+    def merge_duplicate_nodes(self, tolerance):
+        """
+        Finds and merges duplicate nodes, updating all element and entity references.
+
+        Args:
+            tolerance (float): The distance within which nodes are considered duplicates.
+
+        Returns:
+            dict: A summary of the operation, e.g.,
+                  {'groups_found': 5, 'nodes_merged': 10}
+        """
+        # Step 1: Find the groups of duplicate nodes using our Phase 1 function.
+        duplicate_groups = self.find_duplicate_nodes(tolerance)
+        if not duplicate_groups:
+            return {'groups_found': 0, 'nodes_merged': 0}
+
+        # Step 2: For each group, determine the "master" node (the one with the lowest ID)
+        # and create a mapping from the other nodes in the group to the master.
+        remap_dict = {}
+        nodes_to_delete = set()
+        for group in duplicate_groups:
+            master_nid = min(group)
+            for nid in group:
+                if nid != master_nid:
+                    remap_dict[nid] = master_nid
+                    nodes_to_delete.add(nid)
+
+        # Step 3: Iterate through all entities in the model and update their node references.
+        # Combine standard elements and rigid elements for updating.
+        all_elements = list(self.model.elements.values()) + \
+                       list(self.model.rigid_elements.values())
+
+        for element in all_elements:
+            # Re-create the element's node list, replacing any old IDs with master IDs.
+            element.nodes = [remap_dict.get(nid, nid) for nid in element.nodes]
+
+        # Update node references in constraints (SPCs).
+        for sid, spc_cards in self.model.spcs.items():
+            for card in spc_cards:
+                new_node_list = [remap_dict.get(nid, nid) for nid in card.nodes]
+                # Use set() to remove potential duplicate node IDs in the list after remapping.
+                card.nodes = list(set(new_node_list))
+
+        # Update node references in loads (FORCE, MOMENT, etc.).
+        for sid, load_cards in self.model.loads.items():
+            for card in load_cards:
+                # These cards have a single node ID attribute.
+                if hasattr(card, 'node_id') and card.node_id in remap_dict:
+                    card.node_id = remap_dict[card.node_id]
+                # Accommodate for legacy or different card types that might use '.node'.
+                elif hasattr(card, 'node') and card.node in remap_dict:
+                    card.node = remap_dict[card.node]
+
+        # Step 4: After all references are updated, delete the old nodes from the model.
+        for nid in nodes_to_delete:
+            if nid in self.model.nodes:
+                del self.model.nodes[nid]
+
+        # Step 5: Return a summary of the operation.
+        return {
+            'groups_found': len(duplicate_groups),
+            'nodes_merged': len(nodes_to_delete)
+        }
+
+
+     # --- NEW: Method to merge a specific list of node groups (Revised Phase 4) ---
+    def merge_node_groups(self, groups_to_merge):
+        """
+        Merges a specific list of node groups, updating all entity references.
+
+        Args:
+            groups_to_merge (list[list[int]]): A list of groups to merge,
+                e.g., [[101, 201], [105, 304, 501]].
+
+        Returns:
+            dict: A summary of the operation.
+        """
+        if not groups_to_merge:
+            return {'groups_found': 0, 'nodes_merged': 0}
+
+        remap_dict = {}
+        nodes_to_delete = set()
+        for group in groups_to_merge:
+            master_nid = min(group)
+            for nid in group:
+                if nid != master_nid:
+                    remap_dict[nid] = master_nid
+                    nodes_to_delete.add(nid)
+
+        all_elements = list(self.model.elements.values()) + \
+                       list(self.model.rigid_elements.values())
+        for element in all_elements:
+            element.nodes = [remap_dict.get(nid, nid) for nid in element.nodes]
+
+        for sid, spc_cards in self.model.spcs.items():
+            for card in spc_cards:
+                card.nodes = list(set([remap_dict.get(nid, nid) for nid in card.nodes]))
+
+        for sid, load_cards in self.model.loads.items():
+            for card in load_cards:
+                if hasattr(card, 'node_id') and card.node_id in remap_dict:
+                    card.node_id = remap_dict[card.node_id]
+                elif hasattr(card, 'node') and card.node in remap_dict:
+                    card.node = remap_dict[card.node]
+
+        for nid in nodes_to_delete:
+            if nid in self.model.nodes:
+                del self.model.nodes[nid]
+
+        return {
+            'groups_found': len(groups_to_merge),
+            'nodes_merged': len(nodes_to_delete)
+        }
+
+    
+
+
+
+
+    def flip_shell_element_normals(self, eids_to_flip):
+        """
+        (DEBUGGING VERSION) Reverses node connectivity for shell elements.
+        Includes extensive print statements to diagnose the filtering logic.
+        """
+        # --- Start of Debug Block ---
+        print("\n--- DEBUG: Inside flip_shell_element_normals ---")
+        print(f"Received {len(eids_to_flip)} EIDs to potentially flip: {eids_to_flip}")
+        print("-------------------------------------------------")
+        print("Checking element types for filtering...")
+
+        valid_shells_to_flip = []
+        for eid in eids_to_flip:
+            if eid in self.model.elements:
+                element = self.model.elements[eid]
+                elem_type = element.type
+                # This line prints the type of every element passed into the function
+                print(f"  - EID {eid}: Type is '{elem_type}'")
+                
+                if elem_type in ['CQUAD4', 'CTRIA3', 'CMEMBRAN']:
+                    valid_shells_to_flip.append(element)
+                    print(f"    -> VALID. Added to flip list.")
+                else:
+                    print(f"    -> INVALID. Skipped.")
+            else:
+                print(f"  - EID {eid}: Not found in model.elements. Skipped.")
+        
+        print("-------------------------------------------------")
+        print(f"Filter complete. Final list to be flipped contains {len(valid_shells_to_flip)} elements.")
+        # --- End of Debug Block ---
+
+        # The original flipping logic remains the same
+        if not valid_shells_to_flip:
+            return 0
+
+        for element in valid_shells_to_flip:
+            nodes = element.nodes
+            if element.type in ['CQUAD4', 'CMEMBRAN'] and len(nodes) == 4:
+                element.nodes = [nodes[0], nodes[3], nodes[2], nodes[1]]
+            elif element.type == 'CTRIA3' and len(nodes) == 3:
+                element.nodes = [nodes[0], nodes[2], nodes[1]]
+        
+        final_count = len(valid_shells_to_flip)
+        print(f"Function finished. Returning count: {final_count}")
+        print("--- END DEBUG ---\n")
+        return final_count
+    
+    
+    
+    
     def transform_nodes(self, node_ids, params):
         if not (transform_type := params.get('type')) or not node_ids: return
         node_coords = np.array([self.model.nodes[nid].get_position() for nid in node_ids])
@@ -410,9 +623,6 @@ class NastranModelGenerator:
         elif type == 'CTRIA3': return self.model.add_ctria3(eid, pid, nodes).eid
         
    
-# nastran_generator.py
-
-# ... at the end of the NastranModelGenerator class ...
 
     def add_rbe_element(self, eid, elem_type, indep_nodes, dep_nodes, dof):
         if not eid: eid = self.get_next_available_id('element')
@@ -420,7 +630,6 @@ class NastranModelGenerator:
         elif elem_type == 'RBE3': return self.model.add_rbe3(eid, dep_nodes[0], dof, indep_nodes).eid
 
 
-# In nas.py, add the following methods to the NastranModelGenerator class.
 
     def add_nodal_load(self, sid, node_ids, load_type, components):
         """Adds FORCE or MOMENT cards to a list of nodes.
@@ -509,7 +718,6 @@ class NastranModelGenerator:
         return len(node_ids)
         
 
-    # --- NEW: Method to delete elements ---
     def delete_elements(self, eids_to_delete):
         deleted_count = 0
         for eid in eids_to_delete:
@@ -519,7 +727,7 @@ class NastranModelGenerator:
                 deleted_count += 1
         return deleted_count
 
-    # --- NEW: Method to delete nodes and connected elements ---
+
     def delete_nodes(self, nids_to_delete):
         nids_to_delete_set = set(nids_to_delete)
         
@@ -567,3 +775,402 @@ class NastranModelGenerator:
                 if sid in self.model.spcs: self.model.spcs.pop(sid, None) # legacy
                 deleted_count += 1
         return deleted_count
+    
+      # --- NEW: Element Quality Calculation Methods (Phase 1) ---
+
+    def calculate_element_quality(self):
+        """
+        Calculates quality metrics for all shell elements in the model.
+
+        Returns:
+            dict: A dictionary mapping element IDs to their quality metrics.
+                  e.g., {101: {'warp': 0.05, 'aspect': 1.5, 'skew': 12.0}, ...}
+        """
+        quality_data = {}
+        # Get all node coordinates once to avoid repeated lookups inside the loop
+        all_node_coords = {nid: node.xyz for nid, node in self.model.nodes.items()}
+
+        for eid, element in self.model.elements.items():
+            try:
+                # Get the actual 3D coordinates for each of the element's nodes
+                node_coords = [all_node_coords[nid] for nid in element.nodes]
+            except KeyError:
+                continue # Skip elements with missing nodes
+
+            metrics = {}
+            if element.type in ['CQUAD4', 'CMEMBRAN'] and len(node_coords) == 4:
+                metrics['warp'] = self._calculate_quad_warp(node_coords)
+                metrics['aspect'] = self._calculate_aspect_ratio(node_coords)
+                metrics['skew'] = self._calculate_quad_skew(node_coords)
+            elif element.type == 'CTRIA3' and len(node_coords) == 3:
+                # Triangles do not have warping
+                metrics['aspect'] = self._calculate_aspect_ratio(node_coords)
+                metrics['skew'] = self._calculate_tria_skew(node_coords)
+
+            if metrics:
+                quality_data[eid] = metrics
+
+        return quality_data
+
+    def _calculate_quad_warp(self, points):
+        """Calculates the warping angle of a quad element in degrees."""
+        p0, p1, p2, p3 = points
+        # Create normals for two triangles formed by splitting the quad along a diagonal
+        n1 = np.cross(p1 - p0, p2 - p0)
+        n2 = np.cross(p2 - p0, p3 - p0)
+        
+        norm_n1 = np.linalg.norm(n1)
+        norm_n2 = np.linalg.norm(n2)
+        if norm_n1 < 1e-9 or norm_n2 < 1e-9: return 0.0
+
+        # Find the angle between the two normals
+        dot_product = np.dot(n1 / norm_n1, n2 / norm_n2)
+        angle = np.rad2deg(np.arccos(np.clip(dot_product, -1.0, 1.0)))
+        return angle
+
+    def _calculate_aspect_ratio(self, points):
+        """Calculates the ratio of the longest edge to the shortest edge."""
+        num_points = len(points)
+        edge_lengths = []
+        for i in range(num_points):
+            p1 = points[i]
+            p2 = points[(i + 1) % num_points] # Wraps around for the last edge
+            edge_lengths.append(np.linalg.norm(p1 - p2))
+        
+        min_edge = min(edge_lengths)
+        if not edge_lengths or min_edge < 1e-9: return 1.0
+        
+        return max(edge_lengths) / min_edge
+
+    def _calculate_quad_skew(self, points):
+        """Calculates the skew of a quad as the deviation from 90 degrees between diagonals."""
+        p0, p1, p2, p3 = points
+        # Diagonals
+        v1 = p2 - p0
+        v2 = p3 - p1
+        
+        dot_product = np.dot(v1, v2)
+        mag_prod = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if mag_prod < 1e-9: return 0.0
+
+        angle = np.rad2deg(np.arccos(np.clip(dot_product / mag_prod, -1.0, 1.0)))
+        return abs(90.0 - angle)
+
+    def _calculate_tria_skew(self, points):
+        """Calculates the skew of a triangle as the max deviation from an ideal angle (60 deg)."""
+        p0, p1, p2 = points
+        # Get edge lengths
+        a = np.linalg.norm(p1 - p2)
+        b = np.linalg.norm(p0 - p2)
+        c = np.linalg.norm(p0 - p1)
+        
+        try: # Use the Law of Cosines to find the angles
+            alpha = np.rad2deg(np.arccos((b**2 + c**2 - a**2) / (2 * b * c)))
+            beta = np.rad2deg(np.arccos((a**2 + c**2 - b**2) / (2 * a * c)))
+            gamma = 180.0 - alpha - beta
+        except (ValueError, ZeroDivisionError):
+            return 90.0 # Max possible skew for a degenerate triangle
+
+        # Find the angle that deviates the most from the ideal 60 degrees
+        min_angle = min(alpha, beta, gamma)
+        max_angle = max(alpha, beta, gamma)
+        return max(max_angle - 60, 60 - min_angle)
+    
+
+
+
+    def add_coordinate_system(self, cid, origin, z_axis_point, xz_plane_point):
+        """
+        Adds a CORD2R (rectangular) coordinate system to the model.
+
+        Args:
+            cid (int): The coordinate system ID (must be > 0).
+            origin (list[float]): The [x, y, z] coordinates of the origin point.
+            z_axis_point (list[float]): The [x, y, z] of a point on the new z-axis.
+            xz_plane_point (list[float]): The [x, y, z] of a point in the new xz-plane.
+
+        Returns:
+            The created pyNastran CORD2R card object.
+        """
+        # --- FIX: Corrected keyword arguments from z_axis/xz_plane to zaxis/xzplane ---
+        return self.model.add_cord2r(cid, rid=0, origin=origin, zaxis=z_axis_point, xzplane=xz_plane_point)
+
+
+
+    def add_cylindrical_coord_system(self, cid, origin, z_axis_point, xz_plane_point):
+        """Adds a CORD2C (cylindrical) coordinate system to the model."""
+        return self.model.add_cord2c(cid, rid=0, origin=origin, zaxis=z_axis_point, xzplane=xz_plane_point, comment=f'$ Global Cylindrical')
+
+    def add_spherical_coord_system(self, cid, origin, z_axis_point, xz_plane_point):
+        """Adds a CORD2S (spherical) coordinate system to the model."""
+        return self.model.add_cord2s(cid, rid=0, origin=origin, zaxis=z_axis_point, xzplane=xz_plane_point, comment=f'$ Global Spherical')
+
+
+    def _build_rotation_matrix(self, rotations_deg):
+        """Builds a 3x3 ZYX Euler rotation matrix from degrees."""
+        rx, ry, rz = np.deg2rad(rotations_deg)
+        Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
+        Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
+        Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
+        # Combine in ZYX order
+        return Rz @ Ry @ Rx
+
+    def add_coord_by_translate_rotate(self, cid, ref_cid, translations, rotations, coord_type):
+        """Creates a new coordinate system by transforming a reference system."""
+        ref_coord = self.model.coords[ref_cid]
+        
+        # --- FIX: Changed ref_coord.Origin() to ref_coord.origin ---
+        ref_origin = ref_coord.origin
+        
+        ref_matrix = ref_coord.beta() # Gets the 3x3 orientation matrix of the reference Csys
+
+        # 1. Create the new orientation matrix by applying the new rotations
+        new_orientation_matrix = self._build_rotation_matrix(rotations) @ ref_matrix
+
+        # 2. Calculate the new origin by applying translation in the reference frame
+        new_origin = ref_origin + (ref_matrix @ np.array(translations))
+
+        # 3. Derive the 3 "defining points" required by Nastran from the new matrix
+        z_axis_vector = new_orientation_matrix[:, 2] # The 3rd column is the Z-axis
+        z_axis_point = new_origin + z_axis_vector
+
+        x_axis_vector = new_orientation_matrix[:, 0] # The 1st column is the X-axis
+        xz_plane_point = new_origin + x_axis_vector
+        
+        # 4. Call the correct low-level card-adding method based on the desired type
+        if coord_type == 'rectangular':
+            self.model.add_cord2r(cid, rid=ref_cid, origin=new_origin, zaxis=z_axis_point, xzplane=xz_plane_point)
+        elif coord_type == 'cylindrical':
+            self.model.add_cord2c(cid, rid=ref_cid, origin=new_origin, zaxis=z_axis_point, xzplane=xz_plane_point)
+        elif coord_type == 'spherical':
+            self.model.add_cord2s(cid, rid=ref_cid, origin=new_origin, zaxis=z_axis_point, xzplane=xz_plane_point)
+
+        return self.model.coords[cid]
+    
+
+    def import_and_append_bdf(self, filepath):
+        """
+        Reads a BDF file and merges its contents into the current model.
+        This method can handle both full decks and partial (punch) files.
+        Any entities in the imported file with IDs that already exist in
+        the current model will be overwritten.
+
+        Args:
+            filepath (str): The path to the BDF file to import.
+
+        Returns:
+            dict: A summary of the number of each entity type imported.
+        """
+        summary = {
+            'nodes': 0, 'elements': 0, 'properties': 0, 'materials': 0,
+            'loads': 0, 'constraints': 0, 'coords': 0
+        }
+        
+        temp_model = BDF(debug=False)
+        
+        try:
+            temp_model.read_bdf(filepath, punch=False)
+        except Exception:
+            try:
+                temp_model.read_bdf(filepath, punch=True)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse BDF as full or partial deck: {e}")
+
+        try:
+            # Merge Nodes (GRID)
+            for nid, node in temp_model.nodes.items():
+                self.model.add_grid(nid, node.xyz, node.cp, node.cd, node.ps, node.seid, comment=node.comment)
+                summary['nodes'] += 1
+
+            # Merge Elements (CQUAD4, CTRIA3, CBEAM, etc.)
+            for eid, element in temp_model.elements.items():
+                # --- FIX: Changed write_card_list() to repr_fields() ---
+                self.model.add_card(element.repr_fields(), element.type, is_list=True, comment=element.comment)
+                summary['elements'] += 1
+            for eid, element in temp_model.rigid_elements.items():
+                # --- FIX: Changed write_card_list() to repr_fields() ---
+                self.model.add_card(element.repr_fields(), element.type, is_list=True, comment=element.comment)
+                summary['elements'] += 1
+
+            # Merge Properties (PSHELL, PCOMP, etc.)
+            for pid, prop in temp_model.properties.items():
+                # --- FIX: Changed write_card_list() to repr_fields() ---
+                self.model.add_card(prop.repr_fields(), prop.type, is_list=True, comment=prop.comment)
+                summary['properties'] += 1
+
+            # Merge Materials (MAT1, MAT8, etc.)
+            for mid, mat in temp_model.materials.items():
+                # --- FIX: Changed write_card_list() to repr_fields() ---
+                self.model.add_card(mat.repr_fields(), mat.type, is_list=True, comment=mat.comment)
+                summary['materials'] += 1
+                
+            # Merge Coordinate Systems (CORD2R, etc.)
+            for cid, coord in temp_model.coords.items():
+                if cid > 2:
+                    # --- FIX: Changed write_card_list() to repr_fields() ---
+                    self.model.add_card(coord.repr_fields(), coord.type, is_list=True, comment=coord.comment)
+                    summary['coords'] += 1
+
+            # Merge Loads (FORCE, PLOAD4, etc.)
+            for sid, load_cards in temp_model.loads.items():
+                if sid not in self.model.loads:
+                    self.model.loads[sid] = []
+                # For loads/spcs, we append the card objects directly
+                for card in load_cards:
+                    self.model.loads[sid].append(card)
+                    summary['loads'] += 1
+
+            # Merge Constraints (SPC, SPC1, etc.)
+            for sid, spc_cards in temp_model.spcs.items():
+                if sid not in self.model.spcs:
+                    self.model.spcs[sid] = []
+                for card in spc_cards:
+                    self.model.spcs[sid].append(card)
+                    summary['constraints'] += 1
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to merge BDF data into current model: {e}")
+
+        return summary
+
+
+# START: New method in nas.py
+    def add_cbush(self, eid, pid, n1, n2, orientation):
+        """
+        Adds a CBUSH element to the model.
+
+        Args:
+            eid (int): Element ID.
+            pid (int): Property ID (must be a PBUSH).
+            n1 (int): Node ID 1.
+            n2 (int): Node ID 2 (can be None for grounding).
+            orientation (dict): Defines the element orientation.
+                {'method': 'vector', 'values': [x,y,z]}
+                {'method': 'node', 'values': [g0]}
+                {'method': 'cid', 'values': [cid]}
+                {'method': 'default'}
+        """
+        if not eid:
+            eid = self.get_next_available_id('element')
+
+        nids = [n1, n2] if n2 is not None else [n1]
+        x, g0, cid = None, None, None
+        
+        method = orientation.get('method')
+        if method == 'vector':
+            x = orientation['values']
+        elif method == 'node':
+            g0 = orientation['values'][0]
+        elif method == 'cid':
+            cid = orientation['values'][0]
+        
+        return self.model.add_cbush(eid, pid, nids, x=x, g0=g0, cid=cid).eid
+# END: New method in nas.py
+
+# START: Final replacement for get_cbush_orientation_matrix in nas.py
+    def get_cbush_orientation_matrix(self, eid):
+        """
+        Calculates the 3x3 orientation matrix for a CBUSH element.
+        
+        Returns:
+            np.ndarray: A 3x3 numpy array representing the rotation matrix.
+                        Columns are the element's x, y, and z axes.
+        """
+        if eid not in self.model.elements or self.model.elements[eid].type != 'CBUSH':
+            return np.identity(3)
+
+        elem = self.model.elements[eid]
+        n1 = elem.nodes[0]
+        n2 = elem.nodes[1] if len(elem.nodes) > 1 else None
+        
+        p1 = self.model.nodes[n1].get_position()
+        p2 = self.model.nodes[n2].get_position() if n2 is not None else p1
+
+        # --- THIS IS THE DEFINITIVE FIX ---
+        # A blank vector from a BDF is parsed as [None, None, None]. 
+        # This check correctly identifies if a real vector has been provided.
+        has_orientation_vector = elem.x is not None and not all(v is None for v in elem.x)
+
+        # If no orientation method is specified, it aligns with the global system.
+        if elem.g0 is None and not has_orientation_vector and elem.cid is None:
+            return np.identity(3)
+
+        # For all other cases, the element x-axis is from node 1 to node 2.
+        x_axis = p2 - p1
+        if np.linalg.norm(x_axis) < 1e-9: # Zero-length element case
+            x_axis = np.array([1., 0., 0.])
+        else:
+            x_axis = x_axis / np.linalg.norm(x_axis)
+
+        # Determine the vector that defines the XY plane
+        v_plane = None
+        if has_orientation_vector:
+            v_plane = np.array(elem.x, dtype=float)
+        elif elem.g0 is not None:
+            p0 = self.model.nodes[elem.g0].get_position()
+            v_plane = p0 - p1
+        elif elem.cid is not None:
+            v_plane = self.model.coords[elem.cid].beta()[:, 1]
+
+        # Fallback logic for invalid or collinear orientation vectors
+        if v_plane is None or np.linalg.norm(v_plane) < 1e-9:
+            v_plane = np.array([0., 0., 1.])
+
+        if np.linalg.norm(np.cross(x_axis, v_plane)) < 1e-9:
+            v_plane = np.array([0., 1., 0.])
+        
+        v_plane = v_plane / np.linalg.norm(v_plane)
+
+        # Calculate the final axes using cross products
+        z_axis = np.cross(x_axis, v_plane)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        
+        return np.column_stack([x_axis, y_axis, z_axis])
+# END: Final replacement for get_cbush_orientation_matrix in nas.py
+
+
+# START: New helper method in nas.py
+    def get_beam_orientation_matrix(self, eid):
+        """
+        Calculates the 3x3 orientation matrix for a CBEAM or CBAR element.
+        """
+        if eid not in self.model.elements:
+            return np.identity(3)
+        
+        elem = self.model.elements[eid]
+        if elem.type not in ['CBEAM', 'CBAR']:
+            return np.identity(3)
+
+        n1, n2 = elem.nodes
+        p1 = self.model.nodes[n1].get_position()
+        p2 = self.model.nodes[n2].get_position()
+
+        # The element x-axis is from node 1 to node 2.
+        x_axis = p2 - p1
+        if np.linalg.norm(x_axis) < 1e-9: # Zero-length element
+            return np.identity(3)
+        x_axis = x_axis / np.linalg.norm(x_axis)
+
+        # Determine the vector that defines the XY plane
+        v_plane = None
+        if elem.x is not None and not all(v is None for v in elem.x):
+            v_plane = np.array(elem.x, dtype=float)
+        elif elem.g0 is not None:
+            p0 = self.model.nodes[elem.g0].get_position()
+            v_plane = p0 - p1
+        
+        if v_plane is None or np.linalg.norm(v_plane) < 1e-9 or np.linalg.norm(np.cross(x_axis, v_plane)) < 1e-9:
+            # Fallback for collinear or undefined vectors
+            v_plane = np.array([0., 0., 1.])
+            if np.linalg.norm(np.cross(x_axis, v_plane)) < 1e-9:
+                v_plane = np.array([0., 1., 0.])
+        
+        v_plane = v_plane / np.linalg.norm(v_plane)
+
+        z_axis = np.cross(x_axis, v_plane)
+        z_axis = z_axis / np.linalg.norm(z_axis)
+        y_axis = np.cross(z_axis, x_axis)
+        
+        return np.column_stack([x_axis, y_axis, z_axis])
+# END: New helper method in nas.py
