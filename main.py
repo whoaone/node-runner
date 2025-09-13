@@ -61,7 +61,7 @@ class MaterialEditorDialog(QDialog):
     def populate_table(self):
         self.table.setRowCount(len(self.model.materials))
         for row, (mid, mat) in enumerate(sorted(self.model.materials.items())):
-            title = mat.comment.strip().lstrip('$').strip() or f'{mat.type} {mid}'
+            title = MainWindow._get_entity_title_from_comment(mat.comment, mat.type, mid)
             self.table.setItem(row, 0, QTableWidgetItem(str(mid)))
             self.table.setItem(row, 1, QTableWidgetItem(title))
             self.table.setItem(row, 2, QTableWidgetItem(mat.type))
@@ -109,7 +109,7 @@ class PropertyEditorDialog(QDialog):
     def populate_table(self):
         self.table.setRowCount(len(self.model.properties))
         for row, (pid, prop) in enumerate(sorted(self.model.properties.items())):
-            title = prop.comment.strip().lstrip('$').strip() or f'{prop.type} {pid}'
+            title = MainWindow._get_entity_title_from_comment(prop.comment, prop.type, pid)
             self.table.setItem(row, 0, QTableWidgetItem(str(pid)))
             self.table.setItem(row, 1, QTableWidgetItem(title))
             self.table.setItem(row, 2, QTableWidgetItem(prop.type))
@@ -280,36 +280,46 @@ class CreateMaterialDialog(QDialog):
             self.mat9_rho.setText(str(mat.rho)); self.mat9_tref.setText(str(mat.tref))
         self.type_combo.setEnabled(False)
 
+# START: Corrected replacement for get_parameters method in CreateMaterialDialog
     def get_parameters(self):
+        """Retrieves the material parameters from the UI fields."""
         try:
+            mat_type_full = self.type_combo.currentText()
+            mat_type = mat_type_full.split(' ')[0] # e.g., "MAT1" from "MAT1 (Isotropic)"
+            
             base_params = {
                 'mid': int(self.mid_input.text()),
-                'comment': f"$ {self.title_input.text()}"
+                'comment': f"$ {self.title_input.text()}",
+                'type': mat_type
             }
-            if self.type_combo.currentIndex() == 0: # MAT1
-                base_params['type'] = 'MAT1'
+
+            if mat_type == 'MAT1':
                 base_params.update({
-                    'E': float(self.mat1_e.text()), 'G': float(self.mat1_g.text()), 'nu': float(self.mat1_nu.text()),
-                    'rho': float(self.mat1_rho.text()), 'a': float(self.mat1_a.text()), 'tref': float(self.mat1_tref.text()), 'ge': float(self.mat1_ge.text())
+                    'E': float(self.mat1_e.text()), 'G': float(self.mat1_g.text()),
+                    'nu': float(self.mat1_nu.text()), 'rho': float(self.mat1_rho.text()),
+                    'a': float(self.mat1_a.text()), 'tref': float(self.mat1_tref.text()),
+                    'ge': float(self.mat1_ge.text())
                 })
-            elif self.type_combo.currentIndex() == 1: # MAT8
-                base_params['type'] = 'MAT8'
+            elif mat_type == 'MAT8':
                 base_params.update({
-                    'E1': float(self.mat8_e1.text()), 'E2': float(self.mat8_e2.text()), 'nu12': float(self.mat8_nu12.text()),
-                    'G12': float(self.mat8_g12.text()), 'G1z': float(self.mat8_g1z.text()), 'G2z': float(self.mat8_g2z.text()),
-                    'rho': float(self.mat8_rho.text()), 'a1': float(self.mat8_a1.text()), 'a2': float(self.mat8_a2.text()), 'tref': float(self.mat8_tref.text())
+                    'E1': float(self.mat8_e1.text()), 'E2': float(self.mat8_e2.text()),
+                    'nu12': float(self.mat8_nu12.text()), 'G12': float(self.mat8_g12.text()),
+                    'G1z': float(self.mat8_g1z.text()), 'G2z': float(self.mat8_g2z.text()),
+                    'rho': float(self.mat8_rho.text()), 'a1': float(self.mat8_a1.text()),
+                    'a2': float(self.mat8_a2.text()), 'tref': float(self.mat8_tref.text())
                 })
-            elif self.type_combo.currentIndex() == 2: # MAT9
-                base_params['type'] = 'MAT9'
-                gij_dict = {key: float(le.text()) for key, le in self.mat9_gij.items()}
-                base_params.update(gij_dict)
+            elif mat_type == 'MAT9':
+                g_values = {key: float(le.text()) for key, le in self.mat9_gij.items()}
+                base_params.update(g_values)
                 base_params.update({
                     'rho': float(self.mat9_rho.text()), 'tref': float(self.mat9_tref.text())
                 })
+                
             return base_params
         except (ValueError, KeyError) as e:
-            QMessageBox.warning(self, "Input Error", f"Please provide valid numerical inputs. Error: {e}")
+            QMessageBox.warning(self, "Input Error", f"Please provide valid numerical inputs for all material fields. Error: {e}")
             return None
+# END: Corrected replacement for get_parameters method in CreateMaterialDialog
 
 class CreatePropertyDialog(QDialog):
     def __init__(self, next_pid, model, parent=None, existing_prop=None):
@@ -330,7 +340,8 @@ class CreatePropertyDialog(QDialog):
         self.title_input = QLineEdit()
 
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["PSHELL", "PCOMP", "PBAR", "PBEAM"])
+
+        self.type_combo.addItems(["PSHELL", "PCOMP", "PBAR", "PBEAM", "PBUSH"])
         
         form_layout.addRow("Property ID (PID):", self.pid_input)
         form_layout.addRow("Title:", self.title_input)
@@ -341,12 +352,17 @@ class CreatePropertyDialog(QDialog):
         self.pshell_widget = self._create_pshell_ui()
         self.pcomp_widget = self._create_pcomp_ui()
         self.pbar_widget = self._create_pbar_ui()
+
         self.pbeam_widget = self._create_pbeam_ui()
+
+        self.pbush_widget = self._create_pbush_ui()
 
         self.stacked_layout.addWidget(self.pshell_widget)
         self.stacked_layout.addWidget(self.pcomp_widget)
         self.stacked_layout.addWidget(self.pbar_widget)
         self.stacked_layout.addWidget(self.pbeam_widget)
+
+        self.stacked_layout.addWidget(self.pbush_widget)
         main_layout.addLayout(self.stacked_layout)
         
         self.type_combo.currentIndexChanged.connect(self.stacked_layout.setCurrentIndex)
@@ -461,7 +477,7 @@ class CreatePropertyDialog(QDialog):
 
     def _populate_from_existing(self, prop):
         self.title_input.setText(prop.comment.strip().lstrip('$').strip())
-        prop_type_map = {"PSHELL": 0, "PCOMP": 1, "PBAR": 2, "PBEAM": 3}
+        prop_type_map = {"PSHELL": 0, "PCOMP": 1, "PBAR": 2, "PBEAM": 3, "PBUSH": 4}
         self.type_combo.setCurrentIndex(prop_type_map.get(prop.type, 0))
         self.type_combo.setEnabled(False)
         
@@ -486,6 +502,44 @@ class CreatePropertyDialog(QDialog):
             self.pbeam_mid.setCurrentText(str(prop.mid))
             self.pbeam_A.setText(str(prop.A[0])); self.pbeam_i1.setText(str(prop.i1[0]));
             self.pbeam_i2.setText(str(prop.i2[0])); self.pbeam_j.setText(str(prop.j[0]));
+        elif prop.type == 'PBUSH':
+            k_values = prop.k
+            self.pbush_k1.setText(str(k_values[0] if len(k_values) > 0 else 0.0))
+            self.pbush_k2.setText(str(k_values[1] if len(k_values) > 1 else 0.0))
+            self.pbush_k3.setText(str(k_values[2] if len(k_values) > 2 else 0.0))
+            self.pbush_k4.setText(str(k_values[3] if len(k_values) > 3 else 0.0))
+            self.pbush_k5.setText(str(k_values[4] if len(k_values) > 4 else 0.0))
+            self.pbush_k6.setText(str(k_values[5] if len(k_values) > 5 else 0.0))
+
+    # START: New UI method in CreatePropertyDialog class in main.py
+    def _create_pbush_ui(self):
+        """Creates the UI panel for PBUSH stiffness inputs."""
+        widget = QWidget()
+        layout = QGridLayout(widget)
+        
+        self.pbush_k1 = self._create_prop_qlineedit("0.0")
+        self.pbush_k2 = self._create_prop_qlineedit("0.0")
+        self.pbush_k3 = self._create_prop_qlineedit("0.0")
+        self.pbush_k4 = self._create_prop_qlineedit("0.0")
+        self.pbush_k5 = self._create_prop_qlineedit("0.0")
+        self.pbush_k6 = self._create_prop_qlineedit("0.0")
+
+        layout.addWidget(QLabel("K1 (TX Stiffness):"), 0, 0)
+        layout.addWidget(self.pbush_k1, 0, 1)
+        layout.addWidget(QLabel("K2 (TY Stiffness):"), 1, 0)
+        layout.addWidget(self.pbush_k2, 1, 1)
+        layout.addWidget(QLabel("K3 (TZ Stiffness):"), 2, 0)
+        layout.addWidget(self.pbush_k3, 2, 1)
+        
+        layout.addWidget(QLabel("K4 (RX Stiffness):"), 0, 2)
+        layout.addWidget(self.pbush_k4, 0, 3)
+        layout.addWidget(QLabel("K5 (RY Stiffness):"), 1, 2)
+        layout.addWidget(self.pbush_k5, 1, 3)
+        layout.addWidget(QLabel("K6 (RZ Stiffness):"), 2, 2)
+        layout.addWidget(self.pbush_k6, 2, 3)
+        
+        return widget
+# END: New UI method in CreatePropertyDialog class in main.py
 
     def get_parameters(self):
         try:
@@ -520,21 +574,29 @@ class CreatePropertyDialog(QDialog):
                     'mid': int(self.pbeam_mid.currentText()), 'A': float(self.pbeam_A.text()),
                     'i1': float(self.pbeam_i1.text()), 'i2': float(self.pbeam_i2.text()), 'j': float(self.pbeam_j.text()),
                 })
+            elif prop_type == 'PBUSH':
+                k_values = [
+                    float(self.pbush_k1.text()), float(self.pbush_k2.text()),
+                    float(self.pbush_k3.text()), float(self.pbush_k4.text()),
+                    float(self.pbush_k5.text()), float(self.pbush_k6.text())
+                ]
+                base_params.update({'k': k_values})
             return base_params
         except (ValueError, KeyError, AttributeError) as e:
             QMessageBox.warning(self, "Input Error", f"Invalid input for property data. Error: {e}")
             return None
 
-
-
+# START: Upgraded ElementEditorDialog in main.py
 class ElementEditorDialog(QDialog):
     def __init__(self, model, parent=None):
         super().__init__(parent)
+        self.parent_window = parent
         self.setWindowTitle("Edit Element")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(450)
         self.model = model
         self.current_eid = None
         self.node_inputs = []
+        self.orientation_widget = None
 
         main_layout = QVBoxLayout(self)
 
@@ -563,8 +625,7 @@ class ElementEditorDialog(QDialog):
     def _load_element_data(self):
         try:
             eid = int(self.eid_input.text())
-            if eid not in self.model.elements:
-                raise KeyError
+            if eid not in self.model.elements: raise KeyError
             self.current_eid = eid
             element = self.model.elements[eid]
             self._populate_ui_for_element(element)
@@ -577,12 +638,13 @@ class ElementEditorDialog(QDialog):
     def _clear_layout(self, layout):
         while layout.count():
             child = layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+            if widget := child.widget():
+                widget.deleteLater()
 
     def _populate_ui_for_element(self, element):
         self._clear_layout(self.props_layout)
         self.node_inputs = []
+        self.orientation_widget = None
 
         self.props_layout.addRow(QLabel(f"<b>Type: {element.type}</b>"))
 
@@ -598,30 +660,49 @@ class ElementEditorDialog(QDialog):
                 node_edit = QLineEdit(str(nid))
                 self.node_inputs.append(node_edit)
                 self.props_layout.addRow(f"Node {i+1} ID:", node_edit)
+        
+        # --- MODIFIED: Add CBEAM and CBAR to this check ---
+        if element.type in ['CBUSH', 'CBEAM', 'CBAR']:
+            self.orientation_widget = OrientationWidget(self.model, self)
+            self.orientation_widget.set_orientation(element)
+            self.props_layout.addRow(self.orientation_widget)
+            self.orientation_widget.pick_orientation_node_requested.connect(self._pick_orientation_node_for_edit)
+
+    def _pick_orientation_node_for_edit(self):
+        if self.parent_window and self.orientation_widget:
+            self.hide()
+            self.parent_window._activate_single_node_picker(self.orientation_widget.orient_node_id.setText, calling_dialog=self)
 
     def accept(self):
         if self.current_eid is None:
-            super().reject() # Nothing to save
-            return
+            super().reject(); return
         
         try:
             element = self.model.elements[self.current_eid]
+            element.pid = int(self.pid_combo.currentText())
             
-            new_pid = int(self.pid_combo.currentText())
-            element.pid = new_pid
+            # Recreate node list, handling potential grounding (e.g., CBUSH)
+            new_nodes = [int(le.text()) for le in self.node_inputs]
+            if len(element.nodes) == 1 and len(new_nodes) == 1:
+                element.nodes = new_nodes
+            elif len(new_nodes) == 2:
+                 element.nodes = new_nodes
 
-            new_node_ids = [int(le.text()) for le in self.node_inputs]
-            if len(new_node_ids) != len(element.nodes):
-                raise ValueError("Number of nodes does not match element type.")
+            if self.orientation_widget:
+                new_orient = self.orientation_widget.get_orientation()
+                element.g0 = element.x = None # CID is not on CBEAM/CBAR
+                if hasattr(element, 'cid'): element.cid = None
+
+                method = new_orient.get('method')
+                if method == 'vector': element.x = new_orient['values']
+                elif method == 'node': element.g0 = new_orient['values'][0]
+                elif method == 'cid' and hasattr(element, 'cid'):
+                    element.cid = new_orient['values'][0]
             
-            element.nodes = new_node_ids
-
             super().accept()
         except (ValueError, KeyError) as e:
             QMessageBox.warning(self, "Input Error", f"Failed to save element: {e}")
-
-
-
+# END: Upgraded ElementEditorDialog in main.py
 
 class InfoDialog(QDialog):
     def __init__(self, title, content, parent=None):
@@ -995,6 +1076,169 @@ class CreatePlateElementDialog(QDialog):
             if self.type_combo.currentText() == "CQUAD4": nodes.append(int(self.n4_input.text()))
             return {'eid': int(self.eid_input.text()), 'pid': int(self.pid_combo.currentText()), 'nodes': nodes, 'type': self.type_combo.currentText()}
         except (ValueError, KeyError): QMessageBox.warning(self, "Input Error", "Invalid input."); return None
+
+
+# START: Complete and correct OrientationWidget class
+class OrientationWidget(QWidget):
+    """A reusable widget for defining element orientation."""
+    # Add a signal to notify the parent dialog when the pick button is clicked
+    pick_orientation_node_requested = QtCore.Signal()
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self.model = model
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        orient_group = QGroupBox("Orientation")
+        orient_layout = QVBoxLayout(orient_group)
+
+        self.orient_default_rb = QRadioButton("Align with Global Coordinate System", checked=True)
+        self.orient_vector_rb = QRadioButton("Custom Vector (defines XY plane)")
+        self.orient_node_rb = QRadioButton("Orientation Node (defines XY plane)")
+        self.orient_cid_rb = QRadioButton("By Coordinate System (CID)")
+
+        self.orient_vector_widget = QWidget()
+        vec_form = QFormLayout(self.orient_vector_widget); vec_form.setContentsMargins(20, 5, 5, 5)
+        self.vec_x, self.vec_y, self.vec_z = QLineEdit("1.0"), QLineEdit("0.0"), QLineEdit("0.0")
+        vec_layout = QHBoxLayout(); vec_layout.addWidget(self.vec_x); vec_layout.addWidget(self.vec_y); vec_layout.addWidget(self.vec_z)
+        vec_form.addRow("Vector (X,Y,Z):", vec_layout)
+
+        self.orient_node_widget = QWidget()
+        node_layout = QHBoxLayout(self.orient_node_widget); node_layout.setContentsMargins(20, 0, 0, 0)
+        self.orient_node_id = QLineEdit()
+        pick_orient_node_btn = QPushButton("Pick...")
+        node_layout.addWidget(QLabel("Node ID (G0):")); node_layout.addWidget(self.orient_node_id); node_layout.addWidget(pick_orient_node_btn)
+        
+        self.orient_cid_widget = QWidget()
+        cid_layout = QHBoxLayout(self.orient_cid_widget); cid_layout.setContentsMargins(20,0,0,0)
+        self.cid_combo = QComboBox()
+        self.cid_combo.addItems([str(cid) for cid in model.coords.keys()])
+        cid_layout.addWidget(QLabel("Coord ID:")); cid_layout.addWidget(self.cid_combo, 1)
+
+        orient_layout.addWidget(self.orient_default_rb)
+        orient_layout.addWidget(self.orient_vector_rb); orient_layout.addWidget(self.orient_vector_widget)
+        orient_layout.addWidget(self.orient_node_rb); orient_layout.addWidget(self.orient_node_widget)
+        orient_layout.addWidget(self.orient_cid_rb); orient_layout.addWidget(self.orient_cid_widget)
+        layout.addWidget(orient_group)
+        
+        pick_orient_node_btn.clicked.connect(self.pick_orientation_node_requested.emit)
+        self.orient_vector_rb.toggled.connect(self._update_ui_visibility)
+        self.orient_node_rb.toggled.connect(self._update_ui_visibility)
+        self.orient_cid_rb.toggled.connect(self._update_ui_visibility)
+        self._update_ui_visibility()
+
+    def _update_ui_visibility(self):
+        self.orient_vector_widget.setVisible(self.orient_vector_rb.isChecked())
+        self.orient_node_widget.setVisible(self.orient_node_rb.isChecked())
+        self.orient_cid_widget.setVisible(self.orient_cid_rb.isChecked())
+
+    def get_orientation(self):
+        """Returns the orientation dictionary based on the UI state."""
+        orientation = {'method': 'default'}
+        if self.orient_vector_rb.isChecked():
+            vec = [float(self.vec_x.text()), float(self.vec_y.text()), float(self.vec_z.text())]
+            orientation = {'method': 'vector', 'values': vec}
+        elif self.orient_node_rb.isChecked():
+            orientation = {'method': 'node', 'values': [int(self.orient_node_id.text())]}
+        elif self.orient_cid_rb.isChecked():
+            orientation = {'method': 'cid', 'values': [int(self.cid_combo.currentText())]}
+        return orientation
+
+# START: Corrected replacement for set_orientation method in OrientationWidget
+    def set_orientation(self, element):
+        """Sets the UI state based on a pyNastran element object."""
+        # Check if the element CAN have a CID and if it's set
+        if hasattr(element, 'cid') and element.cid is not None:
+            self.orient_cid_rb.setChecked(True)
+            self.cid_combo.setCurrentText(str(element.cid))
+        # Then check for G0
+        elif hasattr(element, 'g0') and element.g0 is not None:
+            self.orient_node_rb.setChecked(True)
+            self.orient_node_id.setText(str(element.g0))
+        # Then check for the vector
+        elif hasattr(element, 'x') and element.x is not None and not all(v is None for v in element.x):
+            self.orient_vector_rb.setChecked(True)
+            self.vec_x.setText(str(element.x[0]))
+            self.vec_y.setText(str(element.x[1]))
+            self.vec_z.setText(str(element.x[2]))
+        # If none of the above, it's a default orientation
+        else:
+            self.orient_default_rb.setChecked(True)
+# END: Corrected replacement for set_orientation method in OrientationWidget
+
+
+
+
+
+# END: Updated OrientationWidget in main.py
+
+# START: Updated CreateBushElementDialog in main.py
+class CreateBushElementDialog(QDialog):
+    def __init__(self, next_eid, model, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.model = model
+        self.setWindowTitle("Create Bush Element")
+        main_layout = QVBoxLayout(self)
+
+        top_form = QFormLayout()
+        self.eid_input = QLineEdit(str(next_eid))
+        self.pid_combo = QComboBox()
+        pbush_ids = [str(pid) for pid, prop in model.properties.items() if prop.type == 'PBUSH']
+        self.pid_combo.addItems(pbush_ids)
+        
+        self.n1_input, self.n2_input = QLineEdit(), QLineEdit()
+        pick_n1_btn, pick_n2_btn = QPushButton("Pick..."), QPushButton("Pick...")
+        self.ground_n2_check = QCheckBox("Ground Node 2")
+
+        n1_widget = QWidget(); n1_layout = QHBoxLayout(n1_widget); n1_layout.setContentsMargins(0,0,0,0); n1_layout.addWidget(self.n1_input); n1_layout.addWidget(pick_n1_btn)
+        n2_widget = QWidget(); n2_layout = QHBoxLayout(n2_widget); n2_layout.setContentsMargins(0,0,0,0); n2_layout.addWidget(self.n2_input); n2_layout.addWidget(pick_n2_btn); n2_layout.addWidget(self.ground_n2_check)
+        
+        top_form.addRow("Element ID (0 for auto):", self.eid_input)
+        top_form.addRow("Property ID (PID):", self.pid_combo)
+        top_form.addRow("Node 1 ID:", n1_widget)
+        top_form.addRow("Node 2 ID:", n2_widget)
+        main_layout.addLayout(top_form)
+
+        self.orientation_widget = OrientationWidget(model, self)
+        main_layout.addWidget(self.orientation_widget)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        main_layout.addWidget(button_box)
+
+        button_box.accepted.connect(self.accept); button_box.rejected.connect(self.reject)
+        self.ground_n2_check.toggled.connect(self.n2_input.setDisabled)
+        self.ground_n2_check.toggled.connect(pick_n2_btn.setDisabled)
+        pick_n1_btn.clicked.connect(self._pick_node_1)
+        pick_n2_btn.clicked.connect(self._pick_node_2)
+        # --- CONNECT THE WIDGET'S SIGNAL TO OUR PICKER METHOD ---
+        self.orientation_widget.pick_orientation_node_requested.connect(self._pick_orientation_node)
+
+    def _pick_node_1(self):
+        if self.parent_window: self.hide(); self.parent_window._activate_single_node_picker(self.n1_input.setText, calling_dialog=self)
+    def _pick_node_2(self):
+        if self.parent_window: self.hide(); self.parent_window._activate_single_node_picker(self.n2_input.setText, calling_dialog=self)
+    
+    # --- ADD THIS METHOD BACK ---
+    def _pick_orientation_node(self):
+        if self.parent_window: self.hide(); self.parent_window._activate_single_node_picker(self.orientation_widget.orient_node_id.setText, calling_dialog=self)
+
+    def get_parameters(self):
+        try:
+            params = {
+                'eid': int(self.eid_input.text()),
+                'pid': int(self.pid_combo.currentText()),
+                'n1': int(self.n1_input.text()),
+                'n2': None if self.ground_n2_check.isChecked() else int(self.n2_input.text()),
+                'orientation': self.orientation_widget.get_orientation()
+            }
+            return params
+        except (ValueError, KeyError, AttributeError):
+            QMessageBox.warning(self, "Input Error", "Invalid input. Ensure all required fields are filled correctly.")
+            return None
+# END: Updated CreateBushElementDialog in main.py
+
 
 class CreateRbeDialog(QDialog):
     def __init__(self, next_eid, all_node_ids, parent=None):
@@ -1681,21 +1925,364 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
         except (IndexError, TypeError, KeyError) as e:
             self.main_window._update_status(f"Could not select {entity_type.lower()}: {e}", is_error=True)
 
+
+
+# --- NEW: Dialog for Coincident Node Checker (Phase 3.5 - Interactive) ---
+class CoincidentNodeDialog(QDialog):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setWindowTitle("Coincident Node Checker")
+        self.setMinimumSize(450, 400) # Increased size slightly for new buttons
+
+        main_layout = QVBoxLayout(self)
+
+        # --- Top panel for user input ---
+        input_group = QGroupBox("Input Parameters")
+        form_layout = QFormLayout(input_group)
+        
+        self.tolerance_input = QLineEdit("0.001")
+        validator = QDoubleValidator(0.0, 1.0, 8, self)
+        validator.setNotation(QDoubleValidator.StandardNotation)
+        self.tolerance_input.setValidator(validator)
+        form_layout.addRow("Merge Tolerance:", self.tolerance_input)
+        
+        self.find_button = QPushButton("Find Coincident Nodes")
+        form_layout.addWidget(self.find_button)
+        main_layout.addWidget(input_group)
+
+        # --- Results panel for displaying and editing found sets ---
+        results_group = QGroupBox("Found Sets")
+        results_layout = QVBoxLayout(results_group)
+        
+        self.results_list = QListWidget()
+        # --- MODIFIED: Enable selection of multiple items ---
+        self.results_list.setSelectionMode(QListWidget.ExtendedSelection)
+        results_layout.addWidget(self.results_list)
+
+        # --- NEW: Add buttons for removing items from the list ---
+        edit_buttons_layout = QHBoxLayout()
+        remove_button = QPushButton("Remove Selected")
+        clear_button = QPushButton("Clear All")
+        edit_buttons_layout.addStretch() # Pushes buttons to the right
+        edit_buttons_layout.addWidget(remove_button)
+        edit_buttons_layout.addWidget(clear_button)
+        results_layout.addLayout(edit_buttons_layout)
+        
+        main_layout.addWidget(results_group)
+
+        # --- Bottom action buttons ---
+        button_box = QDialogButtonBox()
+        self.merge_button = button_box.addButton("Merge Selected", QDialogButtonBox.AcceptRole)
+        self.close_button = button_box.addButton(QDialogButtonBox.Close)
+        self.merge_button.setEnabled(False)
+        main_layout.addWidget(button_box)
+
+        # --- Connect signals to slots ---
+        self.find_button.clicked.connect(self._find_nodes)
+        remove_button.clicked.connect(self._remove_selected_items)
+        clear_button.clicked.connect(self._clear_all_items)
+        self.merge_button.clicked.connect(self.accept)
+        self.close_button.clicked.connect(self.reject)
+
+    def _find_nodes(self):
+        """Calls the backend find method and populates the results list."""
+        self._clear_all_items()
+        try:
+            tolerance = float(self.tolerance_input.text())
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter a valid tolerance value.")
+            return
+
+        if not self.main_window.current_generator:
+            QMessageBox.warning(self, "No Model", "No model is loaded.")
+            return
+            
+        duplicate_groups = self.main_window.current_generator.find_duplicate_nodes(tolerance)
+
+        if not duplicate_groups:
+            self.results_list.addItem("No coincident nodes found with this tolerance.")
+            return
+
+        for i, group in enumerate(duplicate_groups):
+            master_nid = min(group)
+            others = [str(nid) for nid in group if nid != master_nid]
+            item_text = f"Group {i+1}: Merge {', '.join(others)} -> into {master_nid}"
+            
+            # --- MODIFIED: Store raw data with the list item ---
+            item = QListWidgetItem(item_text)
+            item.setData(QtCore.Qt.UserRole, group) # Store the raw list e.g., [11, 12, 10]
+            self.results_list.addItem(item)
+            
+        self._update_merge_button_state()
+
+    # --- NEW: Method to remove only the selected items ---
+    def _remove_selected_items(self):
+        selected_items = self.results_list.selectedItems()
+        if not selected_items:
+            return
+        for item in selected_items:
+            # Taking the item from the list widget also deletes it
+            self.results_list.takeItem(self.results_list.row(item))
+        self._update_merge_button_state()
+
+    # --- NEW: Method to clear all items from the list ---
+    def _clear_all_items(self):
+        self.results_list.clear()
+        self._update_merge_button_state()
+
+    # --- NEW: Helper to dynamically set the merge button state ---
+    def _update_merge_button_state(self):
+        # Enable the merge button only if there are items in the list.
+        is_enabled = self.results_list.count() > 0 and \
+                     "No coincident nodes found" not in self.results_list.item(0).text()
+        self.merge_button.setEnabled(is_enabled)
+        # Also update the button text to be more accurate
+        self.merge_button.setText(f"Merge {self.results_list.count()} Groups") if is_enabled else "Merge Selected"
+
+    # --- NEW: Handle the delete key press for convenience ---
+    def keyPressEvent(self, event):
+        """Handles the Delete key to remove selected items from the list."""
+        if event.key() == QtCore.Qt.Key_Delete and self.results_list.hasFocus():
+            self._remove_selected_items()
+        else:
+            super().keyPressEvent(event) # Pass on other key events
+    
+    # --- NEW: Getter method to retrieve results (Revised Phase 4) ---
+    def get_groups_to_merge(self):
+        """Retrieves the raw node group data from the items remaining in the list."""
+        groups = []
+        for i in range(self.results_list.count()):
+            item = self.results_list.item(i)
+            # Ensure we don't process the "No nodes found" informational message
+            if item.data(QtCore.Qt.UserRole):
+                groups.append(item.data(QtCore.Qt.UserRole))
+        return groups
+
+
+class CreateCoordDialog(QDialog):
+    def __init__(self, next_cid, model, parent=None, existing_coord=None):
+        super().__init__(parent)
+        self.model = model
+        title = "Edit Coordinate System" if existing_coord else "Create Coordinate System"
+        self.setWindowTitle(title)
+        self.setMinimumWidth(450)
+
+        # --- Main Layout ---
+        main_layout = QVBoxLayout(self)
+        top_form = QFormLayout()
+
+        # --- Top-Level Controls (always visible) ---
+        self.cid_input = QLineEdit(str(next_cid))
+        self.cid_input.setValidator(QtGui.QIntValidator(1, 99999999, self))
+        
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["Rectangular", "Cylindrical", "Spherical"])
+
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["3 Points", "Rotate and Translate"])
+
+        top_form.addRow("Coordinate ID (CID):", self.cid_input)
+        top_form.addRow("System Type:", self.type_combo)
+        top_form.addRow("Definition Method:", self.method_combo)
+        main_layout.addLayout(top_form)
+
+        # --- Stacked Layout for Different Method Panels ---
+        self.stacked_layout = QStackedLayout()
+        self.panel_3_points = self._create_3_points_panel()
+        self.panel_rotate_translate = self._create_rotate_translate_panel()
+        self.stacked_layout.addWidget(self.panel_3_points)
+        self.stacked_layout.addWidget(self.panel_rotate_translate)
+        main_layout.addLayout(self.stacked_layout)
+        
+        # --- Bottom Button Box ---
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        main_layout.addWidget(button_box)
+
+        # --- Connections ---
+        self.method_combo.currentIndexChanged.connect(self.stacked_layout.setCurrentIndex)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        # --- Populate for Edit Mode ---
+        if existing_coord:
+            self.cid_input.setText(str(existing_coord.cid))
+            self.cid_input.setEnabled(False)
+            type_map = {'CORD2R': 0, 'CORD2C': 1, 'CORD2S': 2}
+            self.type_combo.setCurrentIndex(type_map.get(existing_coord.type, 0))
+            
+            self.method_combo.setCurrentIndex(0)
+            self.method_combo.setEnabled(False)
+            
+            # --- FIX: Changed existing_coord.Origin() to existing_coord.origin ---
+            origin = existing_coord.origin
+            self.p3_origin_x.setText(str(origin[0])); self.p3_origin_y.setText(str(origin[1])); self.p3_origin_z.setText(str(origin[2]))
+            
+            z_axis_pt = existing_coord.G1(); self.p3_z_axis_x.setText(str(z_axis_pt[0])); self.p3_z_axis_y.setText(str(z_axis_pt[1])); self.p3_z_axis_z.setText(str(z_axis_pt[2]))
+            xz_plane_pt = existing_coord.G2(); self.p3_xz_plane_x.setText(str(xz_plane_pt[0])); self.p3_xz_plane_y.setText(str(xz_plane_pt[1])); self.p3_xz_plane_z.setText(str(xz_plane_pt[2]))
+
+    def _create_3_points_panel(self):
+        """Creates the widget with inputs for the '3 Points' definition method."""
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 10, 0, 0)
+        
+        self.p3_origin_x, self.p3_origin_y, self.p3_origin_z = QLineEdit("0.0"), QLineEdit("0.0"), QLineEdit("0.0")
+        self.p3_z_axis_x, self.p3_z_axis_y, self.p3_z_axis_z = QLineEdit("0.0"), QLineEdit("0.0"), QLineEdit("1.0")
+        self.p3_xz_plane_x, self.p3_xz_plane_y, self.p3_xz_plane_z = QLineEdit("1.0"), QLineEdit("0.0"), QLineEdit("0.0")
+        
+        for w in [self.p3_origin_x, self.p3_origin_y, self.p3_origin_z, self.p3_z_axis_x, self.p3_z_axis_y, self.p3_z_axis_z, self.p3_xz_plane_x, self.p3_xz_plane_y, self.p3_xz_plane_z]:
+            w.setValidator(QDoubleValidator())
+            
+        p3_origin_layout = QHBoxLayout(); p3_origin_layout.addWidget(self.p3_origin_x); p3_origin_layout.addWidget(self.p3_origin_y); p3_origin_layout.addWidget(self.p3_origin_z)
+        p3_z_axis_layout = QHBoxLayout(); p3_z_axis_layout.addWidget(self.p3_z_axis_x); p3_z_axis_layout.addWidget(self.p3_z_axis_y); p3_z_axis_layout.addWidget(self.p3_z_axis_z)
+        p3_xz_plane_layout = QHBoxLayout(); p3_xz_plane_layout.addWidget(self.p3_xz_plane_x); p3_xz_plane_layout.addWidget(self.p3_xz_plane_y); p3_xz_plane_layout.addWidget(self.p3_xz_plane_z)
+
+        form.addRow("Origin (X,Y,Z):", p3_origin_layout)
+        form.addRow("Point on Z-Axis (X,Y,Z):", p3_z_axis_layout)
+        form.addRow("Point on XZ-Plane (X,Y,Z):", p3_xz_plane_layout)
+        return panel
+
+    def _create_rotate_translate_panel(self):
+        """Creates the widget with inputs for the 'Rotate and Translate' method."""
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 10, 0, 0)
+        
+        self.ref_cid_combo = QComboBox()
+        for cid in sorted(self.model.coords.keys()):
+            self.ref_cid_combo.addItem(str(cid))
+        
+        self.trans_dx, self.trans_dy, self.trans_dz = QLineEdit("0.0"), QLineEdit("0.0"), QLineEdit("0.0")
+        self.rot_rx, self.rot_ry, self.rot_rz = QLineEdit("0.0"), QLineEdit("0.0"), QLineEdit("0.0")
+
+        for w in [self.trans_dx, self.trans_dy, self.trans_dz, self.rot_rx, self.rot_ry, self.rot_rz]:
+            w.setValidator(QDoubleValidator())
+
+        trans_layout = QHBoxLayout(); trans_layout.addWidget(self.trans_dx); trans_layout.addWidget(self.trans_dy); trans_layout.addWidget(self.trans_dz)
+        rot_layout = QHBoxLayout(); rot_layout.addWidget(self.rot_rx); rot_layout.addWidget(self.rot_ry); rot_layout.addWidget(self.rot_rz)
+
+        form.addRow("Reference System (CID):", self.ref_cid_combo)
+        form.addRow("Translate (dX,dY,dZ):", trans_layout)
+        form.addRow("Rotate (rX,rY,rZ) deg:", rot_layout)
+        return panel
+
+    def get_parameters(self):
+        try:
+            params = {
+                'cid': int(self.cid_input.text()),
+                'type': self.type_combo.currentText().lower(),
+                'method': self.method_combo.currentText()
+            }
+            if self.method_combo.currentText() == "3 Points":
+                params['origin'] = [float(self.p3_origin_x.text()), float(self.p3_origin_y.text()), float(self.p3_origin_z.text())]
+                params['z_axis_point'] = [float(self.p3_z_axis_x.text()), float(self.p3_z_axis_y.text()), float(self.p3_z_axis_z.text())]
+                params['xz_plane_point'] = [float(self.p3_xz_plane_x.text()), float(self.p3_xz_plane_y.text()), float(self.p3_xz_plane_z.text())]
+                origin_v, z_axis_v, xz_plane_v = np.array(params['origin']), np.array(params['z_axis_point']), np.array(params['xz_plane_point'])
+                if np.allclose(origin_v, z_axis_v) or np.linalg.norm(np.cross(z_axis_v - origin_v, xz_plane_v - origin_v)) < 1e-9:
+                    QMessageBox.warning(self, "Invalid Input", "The three defining points for the coordinate system cannot be collinear.")
+                    return None
+            
+            elif self.method_combo.currentText() == "Rotate and Translate":
+                params['ref_cid'] = int(self.ref_cid_combo.currentText())
+                params['translations'] = [float(self.trans_dx.text()), float(self.trans_dy.text()), float(self.trans_dz.text())]
+                params['rotations'] = [float(self.rot_rx.text()), float(self.rot_ry.text()), float(self.rot_rz.text())]
+
+            return params
+        except (ValueError, KeyError) as e:
+            QMessageBox.warning(self, "Input Error", f"Please provide valid numerical inputs. Error: {e}")
+            return None
+
+
+# --- PASTE THE DIALOG CLASS HERE ---
+class ImportOptionsDialog(QDialog):
+    """A simple dialog to ask the user how to import a BDF file."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Options")
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.addWidget(QLabel("How would you like to import this file?"))
+
+        self.new_model_rb = QRadioButton("Start a new model from this file")
+        self.append_model_rb = QRadioButton("Append cards to the current model")
+        self.append_model_rb.setChecked(True)
+
+        main_layout.addWidget(self.new_model_rb)
+        main_layout.addWidget(self.append_model_rb)
+        
+        note_label = QLabel(
+            "<b>Note:</b> Appending will overwrite any existing entities (nodes, elements, etc.) "
+            "that have the same ID as an entity in the imported file."
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("font-size: 11px; color: #9aa3b2; padding-top: 5px;")
+        main_layout.addWidget(note_label)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        main_layout.addWidget(button_box)
+        
+    def get_selected_option(self):
+        if self.new_model_rb.isChecked():
+            return 'new'
+        return 'append'
+
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v1.0"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v1.1.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         self.load_scaling_info = {}
         self.type_color_map, self.pid_color_map = {"Shells": "#0077be", "Beams": "#f85a40"}, {}
-        self.active_selection_dialog, self.current_node_ids_sorted = None, []; self.default_interactor_style = None
+        
+        # --- FIX: Separated chained assignments onto individual lines ---
+        self.active_selection_dialog = None
+        self.current_node_ids_sorted = []
+        self.default_interactor_style = None
+
         self.picking_target_callback = None
+        self.active_sub_dialog = None
         self.active_creation_dialog = None
         self.current_selection_type = None
-        self.initUI(); self._auto_load_materials()
+        self.quality_results = None 
+        
+        self.initUI()
+        self._create_new_model()
+        self._auto_load_materials()
         self.tree_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.tree_widget.customContextMenuRequested.connect(self._show_tree_context_menu)
+
+
+    @staticmethod
+    def _get_entity_title_from_comment(comment, entity_type, entity_id):
+        """
+        Intelligently parses a Nastran comment string to find a title.
+        It looks for a colon as a delimiter, typical of Femap-generated titles.
+        If no valid title format is found, it returns a default name.
+        """
+        default_title = f"{entity_type} {entity_id}"
+        if not comment:
+            return default_title
+        
+        clean_comment = comment.strip().lstrip('$').strip()
+        
+        # Look for a colon, which is the key delimiter for Femap-style titles.
+        if ':' in clean_comment:
+            # Split at the first colon and take the second part as the title.
+            parts = clean_comment.split(':', 1)
+            if len(parts) > 1:
+                title = parts[1].strip()
+                # Return the title only if it's not empty after stripping.
+                return title if title else default_title
+        
+        # If no colon or no text after the colon, it's not a title, so use the default.
+        return default_title
+
 
     def initUI(self):
         self._create_menu_bar()
@@ -1713,6 +2300,31 @@ class MainWindow(QMainWindow):
         display_layout.addRow("Show Node IDs:", self.show_node_labels_check)
         display_layout.addRow("Show Element IDs:", self.show_elem_labels_check)
 
+        self.show_bush_orient_check = QCheckBox()
+        display_layout.addRow("Show Bush Orientations:", self.show_bush_orient_check)
+
+        # --- ADD THESE TWO LINES ---
+        self.show_beam_orient_check = QCheckBox()
+        display_layout.addRow("Show Beam Orientations:", self.show_beam_orient_check)
+
+        # --- NEW: Add normals visualization controls (Phase 2) ---
+        self.show_normals_check = QCheckBox()
+        display_layout.addRow("Show Element Normals:", self.show_normals_check)
+
+        self.normal_arrow_scale_input = QLineEdit("5") # Default to 5%
+        self.normal_arrow_scale_input.setValidator(QDoubleValidator(0.1, 100.0, 2, self))
+        display_layout.addRow("Normal Arrow Size (%):", self.normal_arrow_scale_input)
+
+        # --- NEW: Quality metric selection widget (initially hidden) ---
+        self.quality_widget = QWidget()
+        quality_layout = QFormLayout(self.quality_widget)
+        quality_layout.setContentsMargins(0, 5, 0, 0) # Adjust spacing
+        self.quality_metric_combo = QComboBox()
+        quality_layout.addRow("Metric:", self.quality_metric_combo)
+        display_layout.addRow(self.quality_widget)
+        self.quality_widget.setVisible(False)
+
+
         # --- NEW: Add arrow scaling controls ---
         self.arrow_scale_input = QLineEdit("10.0")
         self.arrow_scale_input.setValidator(QDoubleValidator(0.1, 100.0, 2, self))
@@ -1723,19 +2335,8 @@ class MainWindow(QMainWindow):
         display_layout.addRow("Use Relative Scaling:", self.relative_scaling_check)
 
         left_panel_layout.addWidget(display_group)
-        entity_group = QGroupBox("View Entity")
-        entity_layout = QFormLayout(entity_group)
-        self.entity_type_combo = QComboBox()
-        self.entity_type_combo.addItems(["Node", "Element"])
-        self.entity_id_input = QLineEdit()
-        find_button, clear_button = QPushButton("Find"), QPushButton("Clear")
-        button_layout = QHBoxLayout()
-        button_layout.addWidget(find_button)
-        button_layout.addWidget(clear_button)
-        entity_layout.addRow("Entity Type:", self.entity_type_combo)
-        entity_layout.addRow("Entity ID:", self.entity_id_input)
-        entity_layout.addRow(button_layout)
-        left_panel_layout.addWidget(entity_group)
+
+        
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background('#353535')
@@ -1759,8 +2360,41 @@ class MainWindow(QMainWindow):
         self.arrow_scale_input.textChanged.connect(self._update_plot_visibility)
         self.relative_scaling_check.stateChanged.connect(self._update_plot_visibility)
 
-        find_button.clicked.connect(self._find_and_zoom_to_entity)
-        clear_button.clicked.connect(self._clear_entity_highlight)
+        #find_button.clicked.connect(self._find_and_zoom_to_entity)
+        #clear_button.clicked.connect(self._clear_entity_highlight)
+
+
+        self.show_normals_check.stateChanged.connect(self._toggle_element_normals_visibility)
+        self.normal_arrow_scale_input.textChanged.connect(self._toggle_element_normals_visibility)
+
+        self.quality_metric_combo.currentIndexChanged.connect(self._update_plot_visibility)
+        self.show_bush_orient_check.stateChanged.connect(self._update_plot_visibility)
+        self.show_beam_orient_check.stateChanged.connect(self._update_plot_visibility)
+    
+# START: Replacement for _create_new_model in main.py
+    def _create_new_model(self):
+        """Creates a new, empty model with default global coordinate systems."""
+        self.current_generator = NastranModelGenerator()
+        # The helper function now ensures the default coordinate systems are created.
+        self._ensure_default_coords(self.current_generator.model)
+        self._update_viewer(self.current_generator)
+        self._update_status("New model created.")
+# END: Replacement for _create_new_model in main.py
+
+
+    # START: New helper method in main.py
+    def _ensure_default_coords(self, model):
+        """
+        Ensures the three default coordinate systems exist in the given model.
+        This will overwrite any user-defined cards at CIDs 1 and 2.
+        """
+        # pyNastran's BDF() object creates CID 0 (Global Rectangular) by default.
+        # We only need to ensure CIDs 1 and 2 are correct.
+        model.add_cord2c(1, rid=0, origin=[0.,0.,0.], zaxis=[0.,0.,1.], xzplane=[1.,0.,0.], comment='$ Global Cylindrical')
+        model.add_cord2s(2, rid=0, origin=[0.,0.,0.], zaxis=[0.,0.,1.], xzplane=[1.,0.,0.], comment='$ Global Spherical')
+# END: New helper method in main.py
+
+
 
     def _set_axes_label_color(self, color_tuple):
         if not hasattr(self, 'axes_actor') or not self.axes_actor:
@@ -1773,11 +2407,22 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
 
         file_menu = menu_bar.addMenu("&File")
+        
+        new_action = QAction("&New Model", self)
+        new_action.triggered.connect(self._create_new_model)
+        file_menu.addAction(new_action)
+        file_menu.addSeparator()
+
         open_action = QAction("&Open BDF/DAT...", self)
         open_action.triggered.connect(self._open_file_dialog)
         file_menu.addAction(open_action)
         
-        # --- NEW: Added Save BDF action ---
+        # --- NEW: Add the Import menu action ---
+        import_action = QAction("&Import BDF/DAT...", self)
+        import_action.triggered.connect(self._import_file_dialog)
+        file_menu.addAction(import_action)
+
+
         save_action = QAction("&Save BDF File...", self)
         save_action.triggered.connect(self._save_file_dialog)
         file_menu.addAction(save_action)
@@ -1817,6 +2462,10 @@ class MainWindow(QMainWindow):
         create_mat_action.triggered.connect(self._create_material)
         model_menu.addAction(create_mat_action)
         model_menu.addSeparator()
+        create_coord_action = QAction("Coordinate System...", self)
+        create_coord_action.triggered.connect(self._create_coord_system)
+        model_menu.addAction(create_coord_action)
+        model_menu.addSeparator()
         create_load_action = QAction("Load...", self)
         create_load_action.triggered.connect(self._create_load)
         model_menu.addAction(create_load_action)
@@ -1835,9 +2484,19 @@ class MainWindow(QMainWindow):
         create_plates_action = QAction("Plate...", self)
         create_plates_action.triggered.connect(self._create_plate_elements)
         elements_menu.addAction(create_plates_action)
+
+        create_bush_action = QAction("Bush...", self)
+        create_bush_action.triggered.connect(self._create_bush_elements)
+        elements_menu.addAction(create_bush_action)
+
+
         create_rbes_action = QAction("Rigid...", self)
         create_rbes_action.triggered.connect(self._create_rbes)
         elements_menu.addAction(create_rbes_action)
+        mesh_menu.addSeparator()
+        flip_normals_action = QAction("Flip Element Normals...", self)
+        flip_normals_action.triggered.connect(self._open_element_flip_tool)
+        mesh_menu.addAction(flip_normals_action)
 
         delete_menu = menu_bar.addMenu("&Delete")
         delete_nodes_action = QAction("Nodes...", self)
@@ -1859,8 +2518,19 @@ class MainWindow(QMainWindow):
         fuselage_gen_action = QAction("Fuselage Generator...", self)
         fuselage_gen_action.triggered.connect(self._open_fuselage_generator)
         tools_menu.addAction(fuselage_gen_action)
+        tools_menu.addSeparator()
+        coincident_node_action = QAction("Coincident Node Checker...", self)
+        coincident_node_action.triggered.connect(self._open_coincident_node_checker)
+        tools_menu.addAction(coincident_node_action)
 
         view_menu = menu_bar.addMenu("&View")
+
+        # --- NEW: Add the "Find Entities" tool to the View menu ---
+        find_entities_action = QAction("Find Entities...", self)
+        find_entities_action.triggered.connect(self._open_find_entity_tool)
+        view_menu.addAction(find_entities_action)
+        view_menu.addSeparator()
+
         self.show_origin_action = QAction("Show Origin", self, checkable=True)
         self.show_origin_action.toggled.connect(self._toggle_origin)
         view_menu.addAction(self.show_origin_action)
@@ -1895,16 +2565,19 @@ class MainWindow(QMainWindow):
         color_group = QActionGroup(self)
         color_type = QAction("Element Type", self, checkable=True); color_type.triggered.connect(lambda: self._set_coloring_mode("type")); color_group.addAction(color_type)
         color_prop = QAction("Property ID", self, checkable=True, checked=True); color_prop.triggered.connect(lambda: self._set_coloring_mode("property")); color_group.addAction(color_prop)
-        color_menu.addAction(color_type); color_menu.addAction(color_prop)
+        color_qual = QAction("Quality", self, checkable=True); color_qual.triggered.connect(lambda: self._set_coloring_mode("quality")); color_group.addAction(color_qual)
+        color_menu.addAction(color_type); color_menu.addAction(color_prop); color_menu.addAction(color_qual)
         self.transparent_shells_action = QAction("Transparent Shells", self, checkable=True)
         self.transparent_shells_action.toggled.connect(self._toggle_shell_transparency)
         view_menu.addAction(self.transparent_shells_action)
+        self.show_normals_action = QAction("Show Element Normals", self, checkable=True)
+        self.show_normals_action.toggled.connect(self._toggle_element_normals_visibility)
+        view_menu.addAction(self.show_normals_action)
         view_menu.addSeparator()
         edit_colors_action = QAction("Edit Colors...", self)
         edit_colors_action.triggered.connect(self._open_color_manager)
         view_menu.addAction(edit_colors_action)
 
-        # --- NEW: Added Help menu ---
         help_menu = menu_bar.addMenu("&Help")
         about_action = QAction("&About...", self)
         about_action.triggered.connect(self._show_about_dialog)
@@ -1916,8 +2589,10 @@ class MainWindow(QMainWindow):
         self.theme_button = QPushButton("Switch to Light Mode")
         self.theme_button.setFlat(True)
         menu_bar.setCornerWidget(self.theme_button, QtCore.Qt.TopRightCorner)
-    
-    
+
+
+
+
 # --- NEW: Handler for the "Save BDF File..." menu action ---
     def _save_file_dialog(self):
         if not self.current_generator:
@@ -2160,30 +2835,293 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Creation Error", f"Could not create material. Missing parameter: {e}")    
 
 
+    
+    def _open_coincident_node_checker(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            self._update_status("No model loaded to check.", is_error=True)
+            QMessageBox.warning(self, "No Model", "Please load a model before checking for coincident nodes.")
+            return
+
+        dialog = CoincidentNodeDialog(main_window=self, parent=self)
+        
+        # The dialog's exec() method is blocking. Code will only continue here after the
+        # user has clicked "Merge Selected" (which calls accept()) or "Close".
+        if dialog.exec() == QDialog.Accepted:
+            groups_to_merge = dialog.get_groups_to_merge()
+
+            if not groups_to_merge:
+                self._update_status("Merge cancelled: No groups were selected.", is_error=True)
+                return
+
+            # Call the new backend method with only the user-approved groups
+            summary = self.current_generator.merge_node_groups(groups_to_merge)
+            
+            # Provide clear feedback to the user with a summary message box
+            merged_count = summary.get('nodes_merged', 0)
+            group_count = summary.get('groups_found', 0)
+            QMessageBox.information(self, "Merge Complete",
+                                    f"Successfully merged {merged_count} node(s) from {group_count} group(s).")
+            
+            self._update_status(f"Merged {merged_count} coincident nodes.")
+            
+            # Refresh the entire viewer and model tree to reflect the changes
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+
+     # --- NEW: Handler to open the Element Normals Flip tool (Phase 4) ---
+
+    def _open_element_flip_tool(self):
+        """Launches the entity selection dialog to choose shell elements to flip."""
+        # --- FIX: Abort if a selection dialog is already open ---
+        if self.active_selection_dialog:
+            return self.active_selection_dialog.activateWindow()
+
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model contains no elements to flip.")
+            return
+
+        all_shell_eids = [
+            eid for eid, elem in self.current_generator.model.elements.items()
+            if elem.type in ['CQUAD4', 'CTRIA3', 'CMEMBRAN']
+        ]
+        if not all_shell_eids:
+            QMessageBox.information(self, "No Shells", "No shell elements found in the model.")
+            return
+
+        # --- FIX: Refactored to use non-blocking .show() with callbacks ---
+        self.current_selection_type = 'Element'
+        self.active_selection_dialog = EntitySelectionDialog('Element', all_shell_eids, self)
+        self.active_selection_dialog.setWindowTitle("Select Shell Elements to Flip")
+        self.active_selection_dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+
+        # Connect signals for interaction
+        self.active_selection_dialog.request_show_selection.connect(self._highlight_entities)
+        self.active_selection_dialog.request_picking_mode.connect(self._set_picking_mode)
+        self.active_selection_dialog.accepted.connect(self._on_flip_elements_accept) # Connect to new handler
+        self.active_selection_dialog.rejected.connect(self._on_selection_dialog_reject) # Reuse existing reject handler
+        
+        self.active_selection_dialog.show()
+
+
+
+
+    def _on_flip_elements_accept(self):
+        dialog = self.active_selection_dialog
+        if not dialog: return
+
+        selected_eids = dialog.get_selected_ids()
+        
+        normals_were_visible = self.show_normals_check.isChecked()
+        
+        self._end_selection_mode()
+
+        # --- The filtering logic that was here is now removed ---
+
+        if not selected_eids:
+            self._update_status("Flip operation cancelled: No elements selected.")
+            return
+
+        # Pass the original, unfiltered list directly to the backend.
+        # The backend function will now perform the filtering itself.
+        flipped_count = self.current_generator.flip_shell_element_normals(selected_eids)
+
+        # The confirmation message will now be correct because the flipped_count is correct.
+        if flipped_count > 0:
+            QMessageBox.information(self, "Operation Complete", f"Successfully flipped normals for {flipped_count} of {len(selected_eids)} selected element(s).")
+            self._update_status(f"Flipped normals for {flipped_count} elements.")
+        else:
+            QMessageBox.warning(self, "No Valid Elements", f"You selected {len(selected_eids)} element(s), but none were flippable plates.")
+            self._update_status("Flip operation cancelled: No valid shell elements were selected.")
+
+
+        # Viewer update logic remains the same
+        self._update_viewer(self.current_generator, reset_camera=False)
+        if normals_were_visible:
+            self._toggle_element_normals_visibility()
+
+
+   
+    def _toggle_element_normals_visibility(self):
+        """
+        Shows, hides, or redraws the element normals actor based on UI controls.
+        This single handler manages the checkbox, menu item, and size input.
+        """
+        # --- 1. Synchronize the UI controls (Checkbox and Menu Item) ---
+        # We block signals to prevent a recursive loop where a change to one
+        # control triggers a signal that then tries to change the first one back.
+        self.show_normals_action.blockSignals(True)
+        self.show_normals_check.blockSignals(True)
+
+        # Determine the correct checked state. The widget that sent the signal
+        # (the sender) dictates the new state.
+        is_checked = self.show_normals_check.isChecked()
+        if self.sender() in [self.show_normals_action, self.show_normals_check]:
+            is_checked = self.sender().isChecked()
+
+        # Set both controls to the same state
+        self.show_normals_check.setChecked(is_checked)
+        self.show_normals_action.setChecked(is_checked)
+        
+        # Unblock signals now that they are in sync
+        self.show_normals_action.blockSignals(False)
+        self.show_normals_check.blockSignals(False)
+        
+        # --- 2. Update the 3D Plot ---
+        # The simplest and most robust way to handle both visibility and size changes
+        # is to always remove the old actor and recreate it if needed.
+        self.plotter.remove_actor('element_normals_actor', render=False)
+
+        # If the controls are checked on, call the method to create the new actor.
+        if is_checked:
+            self._create_element_normals_actor()
+
+        # Render the final scene
+        self.plotter.render()
+    
+
     def _show_about_dialog(self):
         title = "About Node Runner"
         text = """
-        <p><b>Node Runner v1.0</b></p>
-        <p>Created by Angel Linares, September 2025</p>
-        <hr>
-        <p>A lightweight pre-processor for creating, editing, and visualizing Nastran models. 
-        Includes a parametric fuselage generator and tools for general finite element modeling.</p>
-        
-        <p><b>Capabilities:</b></p>
-        <p style="margin-left: 10px;">✅ Open, view, and <b>save</b> standard Nastran BDF files.</p>
-        <p style="margin-left: 10px;">✅ Create & Edit: Nodes, Elements, Properties, and Materials.</p>
-        <p style="margin-left: 10px;">✅ Create, Edit & Delete: <b>Loads</b> (Force, Moment, Pressure) and <b>Constraints</b> (SPC).</p>
-        <p style="margin-left: 10px;">✅ Interactively select and transform nodes (move, scale, rotate).</p>
-        <p style="margin-left: 10px;">✅ Visualize loads and constraints with an advanced, user-controlled scaling system.</p>
-        <p style="margin-left: 10px;">✅ Includes a tool for parametric fuselage and floor structure generation.</p>
+        <style>
+            p, li { 
+                font-family: Segoe UI, sans-serif; 
+                font-size: 13px;
+                /* --- MODIFIED: Reduced line-height for more compact, "normal" spacing --- */
+                line-height: 1.2;
+            }
+            td {
+                font-family: Segoe UI, sans-serif; 
+                font-size: 13px;
+                line-height: 1.2;
+                vertical-align: top;
+                padding-top: 2px;
+                padding-bottom: 2px;
+            }
+            h3 { 
+                color: #5dadec; 
+                margin-bottom: 5px; 
+                margin-top: 15px; 
+                border-bottom: 1px solid #555;
+            }
+            .detail-list { margin-left: 15px; }
+            .detail-item { font-style: italic; color: #b0b0b0; }
+            .card-container {
+                display: flex;
+                flex-wrap: wrap;
+                margin-left: 10px;
+            }
+            .entity-card {
+                background-color: #404040;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 8px;
+                margin: 4px;
+                min-width: 250px;
+            }
+            .card-title {
+                font-weight: bold;
+                color: #e0e0e0;
+                display: block;
+                margin-bottom: 4px;
+            }
+            .card-content {
+                font-style: italic;
+                color: #b0b0b0;
+            }
+            .card-note {
+                font-style: normal;
+                font-size: 12px;
+                color: #c0c0c0;
+                display: block;
+                margin-top: 5px;
+            }
+        </style>
 
+        <p><b>Node Runner v1.1.0</b></p>
+        <p><i>Created by Angel Linares, September 2025</i></p>
+        <hr>
+        <p>
+            <b>Node Runner</b> is a lightweight, general-purpose pre-processor for the Nastran solver, designed to provide a fast, intuitive, and visually-driven modeling experience. It combines a powerful 3D visualization engine with a streamlined user interface to simplify common Finite Element Analysis (FEA) pre-processing tasks.
+        </p>
+
+        <h3>File Handling & Compatibility</h3>
+        <div class="detail-list">
+            <b>Import:</b> Parses standard Nastran Bulk Data Files (<i>.bdf, .dat</i>), with support for <b>small field</b>, <b>large field</b>, and <b>free field</b> (comma-delimited) formats.<br>
+            <b>Export:</b> Saves models to a clean, standard <b>small field format</b> BDF, ensuring broad compatibility.<br>
+            <b>Solver Support:</b> Generated files are compatible with both major solvers: <b>MSC Nastran</b> and <b>Siemens NX Nastran</b>.
+        </div>
+
+        <h3>Modeling Entities Supported</h3>
+        <div class="card-container">
+            <div class="entity-card">
+                <span class="card-title">Elements</span>
+                <span class="card-content">CQUAD4, CTRIA3, CBEAM, CBAR, CROD, RBE2, RBE3</span>
+            </div>
+            <div class="entity-card">
+                <span class="card-title">Properties</span>
+                <span class="card-content">PSHELL, PCOMP, PBAR, PBEAM</span>
+                <span class="card-note">↳ Includes a detailed <b>composite layup editor</b> for PCOMP.</span>
+            </div>
+            <div class="entity-card">
+                <span class="card-title">Materials</span>
+                <span class="card-content">MAT1 (Isotropic), MAT8 (2D Orthotropic), MAT9 (3D Anisotropic)</span>
+            </div>
+            <div class="entity-card">
+                <span class="card-title">Loads</span>
+                <span class="card-content">FORCE, MOMENT, PLOAD4</span>
+            </div>
+            <div class="entity-card">
+                <span class="card-title">Constraints</span>
+                <span class="card-content">SPC</span>
+            </div>
+        </div>
+        
+        <h3>Interaction & Editing</h3>
+        <div class="detail-list">
+            <b>Full CRUD Lifecycle:</b> Create, Read (View), Update, and Delete support for all major entity types.<br>
+            <b>Powerful Selection Suite:</b> Select entities by picking directly from the 3D viewer, or by using a dedicated tool to select by ID, range, or a pasted list.<br>
+            <b>Multi-Mode Transformation Tool:</b> Interactively transform selected nodes with Translate, Move-to-Point, Scale, and Rotate operations, with options for different origins (global, centroid, custom).
+        </div>
+
+        <h3>3D Visualization</h3>
+        <div class="detail-list">
+            <b>High-Performance Engine:</b> Real-time 3D rendering powered by PyVista.<br>
+            <b>Granular Display Control:</b> A hierarchical model tree provides fine-grained visibility control over each entity group and individual item.<br>
+            <b>Dynamic Vector Scaling:</b> A unique system to control load vector size, with modes for both **relative** (proportional to magnitude) and **uniform** scaling.<br>
+            <b>Customizable Appearance:</b> Switch between light/dark themes and customize entity colors.
+        </div>
+        
+        <h3>Parametric Tools</h3>
+        <div class="detail-list">
+            Includes a **Fuselage Generator** to parametrically create a complete cylindrical fuselage model, including skin, stringers, frames, and an optional floor structure.
+        </div>
+        
+        <hr>
         <p><b>Current Limitations:</b></p>
         <p style="margin-left: 10px;">⚠️ Does not create <b>coordinate systems</b> (CORDs).</p>
         <p style="margin-left: 10px;">⚠️ The fuselage generator does not create tapered or non-cylindrical sections.</p>
         <p style="margin-left: 10px;">⚠️ Does not perform analysis or post-processing.</p>
         """
-        QMessageBox.about(self, title, text)
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        
+        text_edit = QTextEdit(text)
+        text_edit.setReadOnly(True)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
 
+        layout.addWidget(text_edit)
+        layout.addWidget(button_box)
+        
+        dialog.setMinimumSize(600, 700)
+        dialog.exec()
+    
+    
+    
+    
+# START: Replacement for _show_tree_context_menu in main.py
     def _show_tree_context_menu(self, position):
         item = self.tree_widget.itemAt(position)
         if not item:
@@ -2196,20 +3134,16 @@ class MainWindow(QMainWindow):
         entity_type, entity_id = item_data
         menu = QMenu()
 
-        # Add "Edit..." action for applicable types
-        if entity_type in ['property', 'material', 'load_set', 'constraint_set']:
-            action_text = f"Edit {entity_type.replace('_', ' ').capitalize()} {entity_id}..."
-            edit_action = QAction(action_text, self)
+        if entity_type in ['property', 'material', 'load_set', 'constraint_set', 'coord']:
+            # --- MODIFIED LOGIC: Prevent editing of default coordinate systems ---
+            is_default_coord = (entity_type == 'coord' and entity_id in [0, 1, 2])
             
-            if entity_type == 'property':
-                edit_action.triggered.connect(self._open_property_editor)
-            elif entity_type == 'material':
-                edit_action.triggered.connect(self._open_material_editor)
-            elif entity_type in ['load_set', 'constraint_set']:
+            if not is_default_coord:
+                action_text = f"Edit {entity_type.replace('_', ' ').capitalize()} {entity_id}..."
+                edit_action = QAction(action_text, self)
                 edit_action.triggered.connect(lambda: self._handle_edit_from_tree(entity_type, entity_id))
-            menu.addAction(edit_action)
+                menu.addAction(edit_action)
 
-        # Add "Delete" action for applicable types
         if entity_type in ['load_set', 'constraint_set']:
             if menu.actions():
                 menu.addSeparator()
@@ -2217,9 +3151,9 @@ class MainWindow(QMainWindow):
             delete_action.triggered.connect(lambda: self._handle_delete_from_tree(entity_type, entity_id))
             menu.addAction(delete_action)
 
-        # Only show the menu if actions were added
         if menu.actions():
             menu.exec(self.tree_widget.viewport().mapToGlobal(position))
+# END: Replacement for _show_tree_context_menu in main.py
 
     def _handle_delete_from_tree(self, entity_type, entity_id):
         if not self.current_generator: return
@@ -2242,7 +3176,6 @@ class MainWindow(QMainWindow):
                 self._update_plot_visibility()
         
     def _handle_edit_from_tree(self, entity_type, entity_id):
-        """Launches the correct dialog in 'edit' mode for a given entity."""
         if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
         if not self.current_generator: return
         
@@ -2257,6 +3190,12 @@ class MainWindow(QMainWindow):
             dialog.selection_requested.connect(self._handle_sub_dialog_selection_request)
             dialog.accepted.connect(self._on_constraint_creation_accept)
             dialog.rejected.connect(self._on_creation_reject)
+        elif entity_type == 'coord':
+            coord_to_edit = self.current_generator.model.coords.get(entity_id)
+            if coord_to_edit:
+                dialog = CreateCoordDialog(entity_id, self.current_generator.model, self, existing_coord=coord_to_edit)
+                dialog.accepted.connect(self._on_coord_creation_accept)
+                dialog.rejected.connect(self._on_creation_reject)
         
         if dialog:
             dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
@@ -2321,6 +3260,8 @@ class MainWindow(QMainWindow):
         elif prop_type == 'PBEAM':
             model.add_pbeam(pid, params_copy['mid'], [0.0], ['C'], [params_copy['A']], [params_copy['i1']],
                             [params_copy['i2']], [0.0], [params_copy['j']], comment=comment)
+        elif prop_type == 'PBUSH':
+            model.add_pbush(pid, k=params_copy['k'], b=[], ge=[], comment=comment)
 
     def _set_standard_view(self, view):
         if view == 'top': self.plotter.view_xy()
@@ -2425,6 +3366,45 @@ class MainWindow(QMainWindow):
             self._highlight_entities('Node', [])
             self.active_creation_dialog = None
         
+    
+
+# START: New handler methods in main.py
+    def _create_bush_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator: return
+        
+        # Check if any PBUSH properties exist
+        has_pbush = any(prop.type == 'PBUSH' for prop in self.current_generator.model.properties.values())
+        if not has_pbush:
+            QMessageBox.warning(self, "No Bush Properties", "You must create a PBUSH property before creating a CBUSH element.")
+            return
+
+        next_eid = self.current_generator.get_next_available_id('element')
+        dialog = CreateBushElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_bush_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _on_bush_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                new_eid = self.current_generator.add_cbush(**params)
+                self._update_status(f"Created CBUSH: {new_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+# END: New handler methods in main.py
+
+
+
+
+
+
     def _create_rbes(self):
         if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
         if not self.current_generator or not self.current_generator.model.nodes: QMessageBox.warning(self, "No Nodes", "Create nodes first."); return
@@ -2702,8 +3682,11 @@ class MainWindow(QMainWindow):
             self._update_status(f"Element {dialog.current_eid} modified.")
             self._update_viewer(self.current_generator)
 
-    def _activate_single_node_picker(self, target_callback):
+# Location: main.py, around line 2862
+# --- MODIFY THE METHOD SIGNATURE AND ADD ONE LINE ---
+    def _activate_single_node_picker(self, target_callback, calling_dialog=None):
         self.picking_target_callback = target_callback
+        self.active_sub_dialog = calling_dialog # Store a reference to the dialog
         self._set_picking_mode("Node", True)
         self._update_status("PICKING MODE: Click a single node.")
 
@@ -2759,6 +3742,10 @@ class MainWindow(QMainWindow):
             if self.active_selection_dialog and not self.active_selection_dialog.isVisible():
                 self.active_selection_dialog.show()
                 self.active_selection_dialog.activateWindow()
+            if self.active_sub_dialog and not self.active_sub_dialog.isVisible():
+                self.active_sub_dialog.show()
+                self.active_sub_dialog.activateWindow()
+                self.active_sub_dialog = None # Clear reference after showing
             self.picking_target_callback = None
             if self.current_selection_type is None:
                 self._update_status("Picking mode disabled.")
@@ -2787,8 +3774,10 @@ class MainWindow(QMainWindow):
         if self.active_selection_dialog:
             self.active_selection_dialog.reject()
 
+
+# START: Corrected replacement for _update_viewer method in main.py
     def _update_viewer(self, generator, reset_camera=True):
-        # --- MODIFIED: Explicitly remove all actors, including old load/constraint actors ---
+        self.quality_results = None
         self.plotter.clear()
         self.plotter.add_axes()
         self.axes_actor = self.plotter.renderer.axes_actor
@@ -2801,18 +3790,22 @@ class MainWindow(QMainWindow):
             self.tree_widget.blockSignals(True)
             self._populate_tree()
             self.tree_widget.blockSignals(False)
+            self.current_grid = pv.UnstructuredGrid()
             return
 
         self.current_node_ids_sorted = sorted(model.nodes.keys())
         node_map = {nid: i for i, nid in enumerate(self.current_node_ids_sorted)}
         node_coords = np.array([model.nodes[nid].get_position() for nid in self.current_node_ids_sorted])
 
-        shells_conn, trias_conn, beams_conn, rods_conn = [], [], [], []
+        nodes_used_by_elements = set()
+        shells_conn, trias_conn, beams_conn, rods_conn, bush_conn = [], [], [], [], []
         elem_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
 
         all_elements = {**model.elements, **model.rigid_elements}
         for eid, elem in all_elements.items():
             try:
+                nodes_used_by_elements.update(elem.nodes)
+                
                 if elem.type in ['CQUAD4', 'CMEMBRAN']:
                     shells_conn.append([4] + [node_map[nid] for nid in elem.nodes])
                     elem_data['PID'].append(elem.pid); elem_data['EID'].append(eid); elem_data['type'].append(elem.type); elem_data['is_shell'].append(1)
@@ -2825,22 +3818,49 @@ class MainWindow(QMainWindow):
                 elif elem.type == 'CROD':
                     rods_conn.append([2] + [node_map[nid] for nid in elem.nodes])
                     elem_data['PID'].append(elem.pid); elem_data['EID'].append(eid); elem_data['type'].append(elem.type); elem_data['is_shell'].append(0)
+                elif elem.type == 'CBUSH':
+                    bush_conn.append([2] + [node_map[nid] for nid in elem.nodes])
+                    elem_data['PID'].append(elem.pid); elem_data['EID'].append(eid); elem_data['type'].append(elem.type); elem_data['is_shell'].append(0)
             except KeyError as e:
                 print(f"Warning: Skipping element {eid} due to missing node {e}.")
 
-        all_conns = shells_conn + trias_conn + beams_conn + rods_conn
-        if not all_conns:
-            self.current_grid = pv.UnstructuredGrid(np.array([]), np.array([]), node_coords)
-        else:
+        all_node_ids = set(model.nodes.keys())
+        free_node_ids = all_node_ids - nodes_used_by_elements
+        
+        vertex_conn = []
+        for nid in free_node_ids:
+            if nid in node_map:
+                vertex_conn.append([1, node_map[nid]])
+        
+        for _ in free_node_ids:
+            elem_data['PID'].append(-1)
+            elem_data['EID'].append(-1)
+            elem_data['type'].append('VTK_VERTEX')
+            elem_data['is_shell'].append(0)
+
+        all_conns = shells_conn + trias_conn + beams_conn + rods_conn + bush_conn + vertex_conn
+        
+        if not all_conns and node_coords.any():
+            num_nodes = node_coords.shape[0]
+            cells = np.hstack([np.full((num_nodes, 1), 1), np.arange(num_nodes).reshape(-1, 1)]).ravel()
+            cell_types = np.full(num_nodes, pv.CellType.VERTEX)
+            self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+        elif all_conns:
             flat_cells_list = [value for conn_list in all_conns for value in conn_list]
             cells = np.array(flat_cells_list)
+            # --- THIS IS THE CORRECTED LINE ---
             cell_types = np.concatenate([
-                np.full(len(shells_conn), pv.CellType.QUAD), np.full(len(trias_conn), pv.CellType.TRIANGLE),
-                np.full(len(beams_conn) + len(rods_conn), pv.CellType.LINE)
+                np.full(len(shells_conn), pv.CellType.QUAD),
+                np.full(len(trias_conn), pv.CellType.TRIANGLE),
+                np.full(len(beams_conn) + len(rods_conn) + len(bush_conn), pv.CellType.LINE),
+                np.full(len(vertex_conn), pv.CellType.VERTEX)
             ])
             self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+        else:
+            self.current_grid = pv.UnstructuredGrid()
 
         self.current_grid.point_data['vtkOriginalPointIds'] = np.arange(self.current_grid.n_points)
+        
         if elem_data['EID']:
             for key, value in elem_data.items(): self.current_grid.cell_data[key] = np.array(value)
 
@@ -2852,16 +3872,21 @@ class MainWindow(QMainWindow):
         self._populate_tree()
         self.tree_widget.blockSignals(False)
 
-        # --- MODIFIED: Call new functions to build the actors ONCE per model load ---
+        if model.coords:
+            for cid in sorted(model.coords.keys()):
+                self._create_coord_system_actors(cid)
+
         self._create_all_load_actors()
         self._create_all_constraint_actors()
-        self._update_plot_visibility() # This now just toggles visibility
+        self._update_plot_visibility() 
 
         if reset_camera and self.current_grid and self.current_grid.n_points > 0:
             self.plotter.reset_camera()
             self.plotter.view_isometric()
         else:
             self.plotter.render()
+# END: Corrected replacement for _update_viewer method in main.py
+
 
     def _find_tree_items(self, data_tuple):
         return [it.value() for it in QTreeWidgetItemIterator(self.tree_widget) if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
@@ -2895,6 +3920,29 @@ class MainWindow(QMainWindow):
             item.setData(0, QtCore.Qt.UserRole, data)
             return item
         
+
+        if model.coords:
+            coords_item = create_item(self.tree_widget, "Coordinate Systems", data=('group', 'coords'))
+            for cid in sorted(model.coords.keys()):
+                
+                if cid == 0:
+                    label = "Global Rectangular"
+                elif cid == 1:
+                    label = "Global Cylindrical"
+                elif cid == 2:
+                    label = "Global Spherical"
+                else: 
+                    coord = model.coords[cid]
+                    type_map = {'CORD2R': 'Rectangular', 'CORD2C': 'Cylindrical', 'CORD2S': 'Spherical'}
+                    label = type_map.get(coord.type, coord.type)
+                
+                # --- FIX: Set the default visibility state based on the CID ---
+                # Default systems (0, 1, 2) start OFF. User-created systems start ON.
+                is_checked_by_default = (cid > 2)
+                
+                create_item(coords_item, f"CID {cid}: {label}", data=('coord', cid), checked=is_checked_by_default)
+
+
         nodes_item = create_item(self.tree_widget, "Nodes", data=('group', 'nodes'))
         create_item(nodes_item, f"Total ({len(model.nodes)})", data=('nodes_total', 'all'))
 
@@ -2906,6 +3954,7 @@ class MainWindow(QMainWindow):
 
             by_type_map = {
                 'CBEAM': 'Beams', 'CBAR': 'Bars', 'CROD': 'Rods',
+                'CBUSH': 'Bushes',  # <-- Ensure this line is present
                 'CQUAD4': 'Plates', 'CMEMBRAN': 'Plates', 'CTRIA3': 'Plates',
                 'RBE2': 'Rigid', 'RBE3': 'Rigid',
             }
@@ -2913,7 +3962,7 @@ class MainWindow(QMainWindow):
             for type_name, count in sorted(by_type_counts.items()):
                 create_item(type_item, f"{type_name} ({count})", data=('elem_by_type_group', type_name))
 
-            shape_map = { 'Line': ['CBEAM', 'CBAR', 'CROD'], 'Quad': ['CQUAD4', 'CMEMBRAN'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'] }
+            shape_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH'], 'Quad': ['CQUAD4', 'CMEMBRAN'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'] }
             type_to_shape = {elem_type: shape for shape, types in shape_map.items() for elem_type in types}
             shape_counts = Counter(type_to_shape.get(e.type, 'Other') for e in all_elements.values())
             for shape, count in sorted(shape_counts.items()):
@@ -2922,16 +3971,19 @@ class MainWindow(QMainWindow):
         if model.properties:
             props_item = create_item(self.tree_widget, "Properties", data=('group', 'properties'))
             for pid, p in sorted(model.properties.items()):
-                title = p.comment.strip().lstrip('$').strip() or f'{p.type} {pid}'
+                # --- MODIFY THIS LINE ---
+                title = self._get_entity_title_from_comment(p.comment, p.type, pid)
                 create_item(props_item, f"{pid}: {title}", data=('property', pid))
         
         if model.materials:
             mats_item = create_item(self.tree_widget, "Materials", data=('group', 'materials'))
             for mid, m in sorted(model.materials.items()):
-                title = m.comment.strip().lstrip('$').strip() or f'Material {mid}'
+                # --- MODIFY THIS LINE ---
+                title = self._get_entity_title_from_comment(m.comment, "Material", mid) # Use "Material" as type for default
                 create_item(mats_item, f"{mid}: {title}", data=('material', mid))
         
-        # --- MODIFICATION: Add Loads and Constraints to the tree ---
+        
+
         if model.loads:
             loads_item = create_item(self.tree_widget, "Loads", data=('group', 'loads'))
             for sid, load_list in sorted(model.loads.items()):
@@ -2942,7 +3994,6 @@ class MainWindow(QMainWindow):
         if model.spcs:
             constraints_item = create_item(self.tree_widget, "Constraints", data=('group', 'constraints'))
             for sid, spc_list in sorted(model.spcs.items()):
-                # Assuming SPC1 or SPC, count unique nodes
                 all_nodes = set()
                 for spc in spc_list:
                     all_nodes.update(spc.nodes)
@@ -2972,6 +4023,72 @@ class MainWindow(QMainWindow):
         self.tree_widget.blockSignals(False); self._update_plot_visibility()
         
 
+    def _open_find_entity_tool(self):
+        """Launches a tool to find and zoom to selected entities."""
+        if not self.current_generator or not self.current_generator.model.nodes:
+            self._update_status("No model loaded to find entities in.", is_error=True)
+            return
+
+        entity_types = ["Node", "Element"]
+        entity_type, ok = QInputDialog.getItem(self, "Select Entity Type", 
+                                               "What type of entity do you want to find?", entity_types, 0, False)
+
+        if ok and entity_type:
+            if entity_type == 'Node':
+                all_ids = self.current_generator.model.nodes.keys()
+            else: # Element
+                all_ids = self.current_generator.model.elements.keys()
+
+            self.active_selection_dialog = EntitySelectionDialog(entity_type, all_ids, self)
+            self.active_selection_dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+            self.active_selection_dialog.request_show_selection.connect(self._highlight_entities)
+            self.active_selection_dialog.request_picking_mode.connect(self._set_picking_mode)
+            self.active_selection_dialog.accepted.connect(self._on_find_entities_accept)
+            self.active_selection_dialog.rejected.connect(self._on_selection_dialog_reject)
+            self.active_selection_dialog.show()
+
+    def _on_find_entities_accept(self):
+        """Callback for when the user confirms their selection in the Find tool."""
+        dialog = self.active_selection_dialog
+        if not dialog: return
+
+        selected_ids = dialog.get_selected_ids()
+        entity_type = dialog.entity_type
+        
+        self._end_selection_mode() # Closes dialog and cleans up picking state
+
+        if not selected_ids:
+            # --- FIX: Call the correct highlighting function with an empty list ---
+            # This correctly removes any existing highlight actor from the scene.
+            self._highlight_entities(entity_type, [])
+            self._update_status("Highlight cleared.")
+            return
+        
+        # --- Calculate bounding box of selection and zoom to it ---
+        all_points = []
+        if entity_type == 'Node':
+            for nid in selected_ids:
+                if nid in self.current_generator.model.nodes:
+                    all_points.append(self.current_generator.model.nodes[nid].xyz)
+        else: # Element
+            nodes_to_get = set()
+            for eid in selected_ids:
+                if eid in self.current_generator.model.elements:
+                    nodes_to_get.update(self.current_generator.model.elements[eid].nodes)
+            for nid in nodes_to_get:
+                 if nid in self.current_generator.model.nodes:
+                    all_points.append(self.current_generator.model.nodes[nid].xyz)
+        
+        if all_points:
+            bounds = pv.PolyData(np.array(all_points)).bounds
+            self.plotter.reset_camera(bounds=bounds, render=False)
+            self._highlight_entities(entity_type, selected_ids) # Re-highlight after zoom
+        
+        self._update_status(f"Found and zoomed to {len(selected_ids)} {entity_type.lower()}(s).")
+    
+
+
+
     def _open_fuselage_generator(self):
         mat_model = None
         if self.current_generator:
@@ -2997,17 +4114,116 @@ class MainWindow(QMainWindow):
                 self._update_viewer(generator); self._update_status("Fuselage model generated.")
             except Exception as e: self._update_status(f"Generation failed: {e}", is_error=True); QMessageBox.critical(self, "Error", f"Failed to generate model: {e}")
 
-    def _open_file_dialog(self):
-        if not (filepath := QFileDialog.getOpenFileName(self, "Open Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")[0]): return
+
+
+    def _parse_bdf_to_generator(self, filepath):
+        """
+        Robustly parses a BDF file into a new NastranModelGenerator object.
+        It tries to read as a full deck first, then falls back to a partial/punch deck.
+        
+        Args:
+            filepath (str): The path to the BDF file.
+
+        Returns:
+            NastranModelGenerator: A new generator object with the parsed model.
+        
+        Raises:
+            RuntimeError: If the file cannot be parsed in either mode.
+        """
+        generator = NastranModelGenerator()
+        temp_model = BDF(debug=False)
+        
         try:
-            generator = NastranModelGenerator();
-            with open(filepath, 'r') as f:
-                generator.parse_from_text(f.read())
-            
-            self._update_viewer(generator);
+            # --- MODIFIED: Pass filepath directly to the reader ---
+            # First, try to read it as a complete deck
+            temp_model.read_bdf(filepath, punch=False)
+            generator.model = temp_model # Assign if successful
+        except Exception:
+            # If that fails, fall back to reading it as a partial/punch deck
+            try:
+                # --- MODIFIED: Pass filepath directly to the reader ---
+                temp_model.read_bdf(filepath, punch=True)
+                generator.model = temp_model # Assign if successful
+            except Exception as e:
+                # If both fail, the file is likely invalid.
+                raise RuntimeError(f"pyNastran failed to parse BDF: {e}")
+        return generator
+
+
+
+
+
+
+
+
+
+    def _open_file_dialog(self):
+        filepath, _ = QFileDialog.getOpenFileName(self, "Open Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")
+        if not filepath:
+            return
+        
+        try:
+            # Use the new robust parsing helper
+            generator = self._parse_bdf_to_generator(filepath)
+            self._ensure_default_coords(generator.model)
+            self._update_viewer(generator)
             self._update_status(f"Displayed {os.path.basename(filepath)}")
-        except Exception as e: self._update_status(f"File open failed.", is_error=True); QMessageBox.critical(self, "Error", f"Could not open/parse file: {e}")
-    
+        except Exception as e:
+            self._update_status(f"File open failed.", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not open/parse file: {e}")
+
+
+    def _import_file_dialog(self):
+        """Handles the 'Import' file action, showing an options dialog."""
+        filepath, _ = QFileDialog.getOpenFileName(self, "Import Nastran File", "", "Nastran Files (*.bdf *.dat *.nas);;All Files (*)")
+        if not filepath:
+            self._update_status("Import cancelled.")
+            return
+
+        # If there's no model loaded, the only option is to create a new one.
+        if not self.current_generator or not self.current_generator.model.nodes:
+            option = 'new'
+        else:
+            dialog = ImportOptionsDialog(self)
+            if dialog.exec():
+                option = dialog.get_selected_option()
+            else:
+                self._update_status("Import cancelled.")
+                return
+
+        try:
+            filename = os.path.basename(filepath)
+            if option == 'new':
+                # --- MODIFY THIS BLOCK ---
+                # This logic is now simpler, using the helper function.
+                generator = self._parse_bdf_to_generator(filepath)
+                self._ensure_default_coords(generator.model)
+                self._update_viewer(generator)
+                self._update_status(f"Opened new model from {filename}")
+                # --- END OF MODIFIED BLOCK ---
+            
+            elif option == 'append':
+                # This calls our new backend method
+                summary = self.current_generator.import_and_append_bdf(filepath)
+                
+                self._ensure_default_coords(self.current_generator.model)
+
+                # Create a summary message of what was imported
+                summary_parts = [f"{count} {name}" for name, count in summary.items() if count > 0]
+                if summary_parts:
+                    message = f"Appended {', '.join(summary_parts)} from {filename}."
+                else:
+                    message = f"No new cards were appended from {filename}."
+                
+                self._update_status(message)
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+        except Exception as e:
+            self._update_status(f"File import failed.", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not import file: {e}")
+
+
+
     def _auto_load_materials(self):
         if os.path.exists("materials.bdf"):
             try:
@@ -3069,8 +4285,23 @@ class MainWindow(QMainWindow):
     def _toggle_perspective_view(self, state): 
         self.plotter.camera.SetParallelProjection(not state); self.plotter.render(); self._update_status(f"Perspective view {'ON' if state else 'OFF'}.")
         
-    def _set_coloring_mode(self, mode): 
-        self.color_mode = mode; self._update_plot_visibility(); self._update_status(f"Color mode: {mode}.")
+    # Replace the _set_coloring_mode method
+    def _set_coloring_mode(self, mode):
+        self.color_mode = mode
+        is_quality_mode = (mode == "quality")
+        self.quality_widget.setVisible(is_quality_mode)
+
+        if is_quality_mode and self.current_generator:
+            # Populate the dropdown with available metrics the first time
+            if self.quality_metric_combo.count() == 0:
+                 has_quads = any(e.type in ['CQUAD4', 'CMEMBRAN'] for e in self.current_generator.model.elements.values())
+                 metrics = ["Aspect Ratio", "Skew"]
+                 if has_quads:
+                     metrics.insert(0, "Warping") # Put warping first if available
+                 self.quality_metric_combo.addItems(metrics)
+
+        self._update_plot_visibility()
+        self._update_status(f"Color mode: {mode}.")
         
     def _rebuild_plot(self, visibility_mask=None):
         self.plotter.remove_actor(['nodes_actor', 'shells', 'beams'])
@@ -3094,7 +4325,8 @@ class MainWindow(QMainWindow):
                 self.plotter.render()
                 return
 
-        if grid_to_render and grid_to_render.n_cells > 0:
+        # --- FIX: Check if cell data (like 'is_shell') exists before trying to use it ---
+        if grid_to_render and grid_to_render.n_cells > 0 and 'is_shell' in grid_to_render.cell_data:
             shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
             beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
             show_edges = self.render_style == "surface"
@@ -3117,7 +4349,29 @@ class MainWindow(QMainWindow):
                     cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
                     self.plotter.add_mesh(beams, scalars="PID", cmap=cmap, categories=True,
                                           render_lines_as_tubes=True, line_width=2, name="beams", show_scalar_bar=False)
+            elif self.color_mode == "quality":
+                if self.quality_results is None:
+                    self.quality_results = self.current_generator.calculate_element_quality()
+
+                metric_text = self.quality_metric_combo.currentText()
+                metric_key = metric_text.lower().split(' ')[0]
+
+                if shells.n_cells > 0 and self.quality_results and metric_key:
+                    scalars = np.full(shells.n_cells, 0.0, dtype=float)
+                    
+                    for i, eid in enumerate(shells.cell_data['EID']):
+                        scalars[i] = self.quality_results.get(eid, {}).get(metric_key, 0.0)
+                    
+                    self.plotter.add_mesh(shells, style=self.render_style, show_edges=show_edges,
+                                          opacity=self.shell_opacity, scalars=scalars,
+                                          cmap='viridis', name="shells",
+                                          scalar_bar_args={'title': metric_text})
+                if beams.n_cells > 0:
+                    self.plotter.add_mesh(beams, color=self.type_color_map["Beams"],
+                                          render_lines_as_tubes=True, line_width=2, name="beams")
         else:
+             # If there's no 'is_shell' data, it means there are no elements to draw.
+             # Ensure any old shell/beam actors are removed.
              self.plotter.remove_actor(['shells', 'beams'])
 
 
@@ -3386,6 +4640,255 @@ class MainWindow(QMainWindow):
                 actor = pv.PolyData(np.array(coords))
                 self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
 
+
+
+
+    def _create_element_normals_actor(self):
+        """
+        Calculates and creates a renderable actor for shell element normals by
+        manually performing a cross-product on each element's nodes. This
+        ensures the visualization is a 1:1 match with the model's data.
+        """
+        self.plotter.remove_actor('element_normals_actor', render=False)
+
+        if not self.current_grid or 'is_shell' not in self.current_grid.cell_data:
+            return
+
+        shell_indices = np.where(self.current_grid.cell_data['is_shell'] == 1)[0]
+        if shell_indices.size == 0:
+            return
+        
+        centers = []
+        vectors = []
+
+        # --- FIX: Manually calculate the normal for each shell element ---
+        # This bypasses PyVista's automatic normal "fixing" and guarantees we
+        # visualize the true normal based on the raw node order from the model.
+        for i in shell_indices:
+            cell = self.current_grid.get_cell(i)
+            points = cell.points
+            
+            # Calculate normal using the cross product, respecting Nastran's right-hand rule
+            if cell.type == vtk.VTK_QUAD or cell.type == vtk.VTK_PIXEL: # For CQUAD4
+                # Use the two diagonals for a robust calculation
+                vec1 = points[2] - points[0]
+                vec2 = points[3] - points[1]
+                normal = np.cross(vec1, vec2)
+            elif cell.type == vtk.VTK_TRIANGLE: # For CTRIA3
+                vec1 = points[1] - points[0]
+                vec2 = points[2] - points[0]
+                normal = np.cross(vec1, vec2)
+            else:
+                continue # Should not be possible due to our filter
+
+            # Normalize the vector to get a unit direction
+            norm_len = np.linalg.norm(normal)
+            if norm_len > 1e-9:
+                normal = normal / norm_len
+
+            centers.append(cell.center)
+            vectors.append(normal)
+
+        if not centers:
+            return
+
+        try:
+            scale_percent = float(self.normal_arrow_scale_input.text())
+        except ValueError:
+            scale_percent = 2.5
+        
+        scale = self.current_grid.length * (scale_percent / 100.0)
+        
+        # Create and add the glyphs to the plotter, same as before
+        points_pd = pv.PolyData(np.array(centers))
+        points_pd['vectors'] = np.array(vectors)
+        arrow_geom = pv.Arrow()
+        glyphs = points_pd.glyph(orient='vectors', scale=False, factor=scale, geom=arrow_geom)
+        self.plotter.add_mesh(glyphs, name='element_normals_actor', color='#ffbe0b')
+
+# START: Final replacement for _create_bush_orientation_glyphs in main.py
+    def _create_bush_orientation_glyphs(self, visibility_mask):
+        """Creates and renders orientation triads for visible CBUSH elements."""
+        self.plotter.remove_actor('bush_orientation_glyphs', render=False)
+        if not self.show_bush_orient_check.isChecked() or not self.current_grid or self.current_grid.n_cells == 0:
+            return
+
+        if 'type' not in self.current_grid.cell_data: return
+        all_bush_indices_mask = self.current_grid.cell_data['type'] == 'CBUSH'
+        
+        visible_bush_mask = all_bush_indices_mask & visibility_mask
+        visible_bush_indices = np.where(visible_bush_mask)[0]
+
+        if visible_bush_indices.size == 0:
+            return
+
+        visible_eids = self.current_grid.cell_data['EID'][visible_bush_indices]
+        centers = self.current_grid.cell_centers().points[visible_bush_indices]
+        
+        glyph_points = []
+        glyph_vectors = []
+        glyph_colors = []
+        
+        # --- MODIFIED: Define colors as numerical RGB tuples ---
+        colors = {
+            "x": [255, 0, 0],   # Red
+            "y": [0, 255, 0],   # Green
+            "z": [0, 0, 255]    # Blue
+        }
+        
+        scale = self.current_grid.length * 0.025
+
+        for i, eid in enumerate(visible_eids):
+            matrix = self.current_generator.get_cbush_orientation_matrix(eid)
+            center_point = centers[i]
+            
+            glyph_points.extend([center_point, center_point, center_point])
+            glyph_vectors.extend([matrix[:,0], matrix[:,1], matrix[:,2]])
+            glyph_colors.extend([colors['x'], colors['y'], colors['z']])
+
+        if not glyph_points: return
+
+        polydata = pv.PolyData(np.array(glyph_points))
+        polydata['vectors'] = np.array(glyph_vectors)
+        # --- MODIFIED: Assign colors as a numerical NumPy array ---
+        polydata['colors'] = np.array(glyph_colors, dtype=np.uint8)
+        
+        arrows = polydata.glyph(orient='vectors', scale=False, factor=scale, geom=pv.Arrow(tip_length=0.2, shaft_radius=0.05))
+        self.plotter.add_mesh(arrows, scalars='colors', rgb=True, name='bush_orientation_glyphs')
+# END: Final replacement for _create_bush_orientation_glyphs in main.py
+    
+
+
+# START: New glyph creation method in main.py
+    def _create_beam_orientation_glyphs(self, visibility_mask):
+        """Creates and renders orientation triads for visible CBEAM/CBAR elements."""
+        self.plotter.remove_actor('beam_orientation_glyphs', render=False)
+        if not self.show_beam_orient_check.isChecked() or not self.current_grid or self.current_grid.n_cells == 0:
+            return
+
+        if 'type' not in self.current_grid.cell_data: return
+        beam_types = ['CBEAM', 'CBAR']
+        all_beam_indices_mask = np.isin(self.current_grid.cell_data['type'], beam_types)
+        
+        visible_beam_mask = all_beam_indices_mask & visibility_mask
+        visible_beam_indices = np.where(visible_beam_mask)[0]
+
+        if visible_beam_indices.size == 0:
+            return
+
+        visible_eids = self.current_grid.cell_data['EID'][visible_beam_indices]
+        centers = self.current_grid.cell_centers().points[visible_beam_indices]
+        
+        glyph_points, glyph_vectors, glyph_colors = [], [], []
+        colors = {"x": [255, 0, 0], "y": [0, 255, 0], "z": [0, 0, 255]}
+        scale = self.current_grid.length * 0.025
+
+        for i, eid in enumerate(visible_eids):
+            matrix = self.current_generator.get_beam_orientation_matrix(eid)
+            center_point = centers[i]
+            
+            glyph_points.extend([center_point, center_point, center_point])
+            glyph_vectors.extend([matrix[:,0], matrix[:,1], matrix[:,2]])
+            glyph_colors.extend([colors['x'], colors['y'], colors['z']])
+
+        if not glyph_points: return
+
+        polydata = pv.PolyData(np.array(glyph_points))
+        polydata['vectors'] = np.array(glyph_vectors)
+        polydata['colors'] = np.array(glyph_colors, dtype=np.uint8)
+        
+        arrows = polydata.glyph(orient='vectors', scale=False, factor=scale, geom=pv.Arrow(tip_length=0.2, shaft_radius=0.05))
+        self.plotter.add_mesh(arrows, scalars='colors', rgb=True, name='beam_orientation_glyphs')
+# END: New glyph creation method in main.py
+
+
+
+
+
+
+    def _create_coord_system(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        
+        next_cid = max(list(self.current_generator.model.coords.keys()) + [0]) + 1
+        
+        # Pass the model so the dialog can populate the reference CID list
+        dialog = CreateCoordDialog(next_cid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_coord_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _on_coord_creation_accept(self):
+        dialog = self.active_creation_dialog
+        if not dialog: return
+
+        if params := dialog.get_parameters():
+            cid = params['cid']
+            # If a coord system with this ID already exists, it's an edit.
+            # We must delete the old one before adding the new one.
+            if cid in self.current_generator.model.coords:
+                del self.current_generator.model.coords[cid]
+                self._update_status(f"Updating Coordinate System CID {cid}...")
+            
+            # --- NEW: Call the correct backend method based on UI selection ---
+            if params['method'] == '3 Points':
+                # Use the correct function based on the selected coordinate system type
+                if params['type'] == 'rectangular':
+                    self.current_generator.add_coordinate_system(cid, params['origin'], params['z_axis_point'], params['xz_plane_point'])
+                elif params['type'] == 'cylindrical':
+                    self.current_generator.add_cylindrical_coord_system(cid, params['origin'], params['z_axis_point'], params['xz_plane_point'])
+                elif params['type'] == 'spherical':
+                    self.current_generator.add_spherical_coord_system(cid, params['origin'], params['z_axis_point'], params['xz_plane_point'])
+
+            elif params['method'] == 'Rotate and Translate':
+                self.current_generator.add_coord_by_translate_rotate(
+                    cid, params['ref_cid'], params['translations'], params['rotations'], params['type']
+                )
+            
+            self._update_status(f"Created/Updated Coordinate System CID {cid}.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        
+        self.active_creation_dialog = None
+
+
+    def _create_coord_system_actors(self, cid):
+        """
+        Creates and draws PyVista actors (glyph) for a given coordinate system ID.
+        """
+        if not self.current_generator or cid not in self.current_generator.model.coords:
+            return False
+
+        coord = self.current_generator.model.coords[cid]
+        origin = coord.origin
+        x_axis, y_axis, z_axis = coord.i, coord.j, coord.k
+
+        # --- FIX: Provide a default size when the model is empty or has only one node ---
+        model_size = self.current_grid.length if self.current_generator.model.nodes and self.current_grid.n_points > 1 else 10.0
+        # Ensure we never have a zero scale
+        if np.isclose(model_size, 0.0):
+            model_size = 10.0
+        scale = model_size * 0.05
+
+        # Create and add three colored arrows to the plotter for the axes
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=x_axis, scale=scale),
+                              color='red', name=f"coord_{cid}_x")
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=y_axis, scale=scale),
+                              color='green', name=f"coord_{cid}_y")
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=z_axis, scale=scale),
+                              color='blue', name=f"coord_{cid}_z")
+        
+        # --- NEW: Only add labels for non-default, user-created coordinate systems ---
+        if cid > 2:
+            label_color = 'white' if self.is_dark_theme else 'black'
+            self.plotter.add_point_labels(
+                origin, [f"CID {cid}"], name=f"coord_label_{cid}",
+                font_size=10, text_color=label_color, shape=None, always_visible=True
+            )
+        return True
+
+
+
     def _update_plot_visibility(self):
         """Fast update of actor visibilities based on tree state. Does not rebuild actors."""
         if not self.current_generator or not self.current_grid:
@@ -3436,8 +4939,6 @@ class MainWindow(QMainWindow):
                 if (actor := self.plotter.actors.get(actor_name)) and is_visible:
                     dataset = actor.mapper.dataset
                     if not dataset.n_points: continue
-
-                    # --- FIX: All `add_arrows` calls now use pre-scaled vectors ---
                     if type == 'force':
                         vectors = dataset['vectors']; mags = np.linalg.norm(vectors, axis=1)
                         with np.errstate(divide='ignore', invalid='ignore'):
@@ -3447,7 +4948,6 @@ class MainWindow(QMainWindow):
                         else:
                             scaled_vectors = unit_vectors * base_scale
                         self.plotter.add_arrows(dataset.points, scaled_vectors, color='red', name=glyph_name)
-
                     elif type == 'moment':
                         moment_glyph = pv.DoubleArrow(tip_length=0.2, tip_radius=0.08, shaft_radius=0.03)
                         if use_relative_scaling and max_mag > 1e-9:
@@ -3456,7 +4956,6 @@ class MainWindow(QMainWindow):
                         else:
                             glyphs = dataset.glyph(orient='vectors', scale=False, factor=base_scale, geom=moment_glyph)
                         self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
-
                     elif type == 'pressure':
                         vectors = dataset['vectors']; mags = np.linalg.norm(vectors, axis=1)
                         with np.errstate(divide='ignore', invalid='ignore'):
@@ -3481,7 +4980,19 @@ class MainWindow(QMainWindow):
                 glyph_geom = pv.Cone(direction=(0, 0, 1), height=1.0, radius=0.3); scale_factor = self.current_grid.length * 0.02
                 glyphs = dataset.glyph(scale=False, factor=scale_factor, orient=False, geom=glyph_geom)
                 self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
-                
+
+        # --- NEW: Control visibility of coordinate system actors ---
+        if model.coords:
+            coord_items = {item.data(0, QtCore.Qt.UserRole)[1]: item for item in self._find_tree_items(('group', 'coords'))[0].takeChildren()}
+            self._find_tree_items(('group', 'coords'))[0].addChildren(list(coord_items.values())) # Re-add to iterate safely
+            for cid, item in coord_items.items():
+                is_visible = item.checkState(0) == QtCore.Qt.Checked
+                for actor_name in [f"coord_{cid}_x", f"coord_{cid}_y", f"coord_{cid}_z", f"coord_label_{cid}"]:
+                    if actor := self.plotter.actors.get(actor_name):
+                        actor.SetVisibility(is_visible)
+
+        self._create_bush_orientation_glyphs(visibility_mask)
+        self._create_beam_orientation_glyphs(visibility_mask)
         self.plotter.render()
     
 
