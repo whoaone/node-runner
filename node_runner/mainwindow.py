@@ -1,0 +1,8598 @@
+import sys
+import os
+import json
+import random
+import re
+import numpy as np
+import pyvista as pv
+import vtk
+import copy
+from pyvistaqt import QtInteractor
+
+from PySide6 import QtCore, QtGui
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QFileDialog, QMessageBox, QFormLayout, QGroupBox, QFrame,
+    QLineEdit, QComboBox, QLabel, QCheckBox, QColorDialog, QDialog,
+    QScrollArea, QGridLayout, QTreeWidget, QTreeWidgetItem, QSplitter,
+    QDialogButtonBox, QTreeWidgetItemIterator, QTableWidget, QTableWidgetItem,
+    QHeaderView, QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QRadioButton,
+    QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox,
+)
+from PySide6.QtGui import (QPalette, QColor, QAction, QActionGroup, QDoubleValidator,
+                           QPainter, QPen, QBrush, QPolygonF, QPixmap, QIcon)
+from collections import Counter
+
+from pyNastran.bdf.bdf import BDF
+from node_runner.model import NastranModelGenerator
+from node_runner.utils import get_entity_title_from_comment, PROJECT_ROOT
+from node_runner.theme import dark_palette, light_palette, DARK_STYLESHEET, BACKGROUND_PRESETS
+from node_runner.interactor import ClickAndDragInteractor
+from node_runner.geometry import GeometryStore
+from node_runner.commands import (
+    CommandManager, CompoundCommand,
+    AddNodesCommand, DeleteNodesCommand, TransformNodesCommand, MergeNodesCommand,
+    AddElementCommand, DeleteElementsCommand, FlipNormalsCommand, EditElementCommand,
+    AddMaterialCommand, EditMaterialCommand, DeleteMaterialCommand,
+    AddPropertyCommand, EditPropertyCommand, DeletePropertyCommand,
+    AddLoadCommand, DeleteLoadCommand, AddConstraintCommand, DeleteConstraintCommand,
+    AddCoordCommand, DeleteCoordCommand, AddMassCommand, DeleteMassCommand,
+    AddPlotelCommand, DeletePlotelCommand,
+    CreateGroupCommand, DeleteGroupCommand, RenameGroupCommand, ModifyGroupCommand,
+    ReassignPropertyCommand, ReassignMaterialCommand,
+    AddLoadCombinationCommand, RenumberCommand,
+    AddGeometryPointCommand, AddGeometryLineCommand, AddGeometryArcCommand,
+    AddGeometryCircleCommand, AddGeometrySurfaceCommand,
+    MeshCurveCommand, MeshSurfaceCommand, NodesAtGeometryPointsCommand,
+    DeleteGeometryPointsCommand, DeleteGeometryCurvesCommand,
+    DeleteGeometrySurfacesCommand,
+    AutoOrientNormalsCommand,
+    ImportCADCommand,
+    AddSpiderCommand, AddWeldCommand,
+    EditGeometryPointCommand, EditGeometryCurveCommand,
+    EditGeometrySurfaceBoundariesCommand,
+    TransformGeometryPointsCommand, CopyGeometryCommand,
+    SplitCurveCommand, OffsetCurveCommand, ProjectPointToCurveCommand,
+    FilletCommand,
+    ReplaceLoadSetCommand, ReplaceConstraintSetCommand,
+)
+from node_runner.dialogs import (
+    MaterialEditorDialog, PropertyEditorDialog, ElementEditorDialog,
+    CreateMaterialDialog, CreatePropertyDialog,
+    CreateNodesDialog, CreateLineElementDialog, CreatePlateElementDialog,
+    CreateSolidElementDialog, CreateShearElementDialog, CreateGapElementDialog,
+    CreateBushElementDialog, CreateRbeDialog, CreateConm2Dialog, CreateCoordDialog,
+    CreatePlotelDialog,
+    EntitySelectionDialog,
+    CoincidentNodeDialog, GeneratorDialog, ColorManagerDialog,
+    NodeTransformDialog, ImportOptionsDialog, DuplicateElementDialog,
+    FindReplaceDialog, RenumberDialog, ImportCADDialog,
+    CreateSpiderDialog, CreateWeldDialog,
+    InfoDialog, LenientImportReportDialog, FreeBodyDiagramDialog,
+    MassPropertiesReportDialog, FreeEdgeReportDialog,
+    QualitySummaryReportDialog, OrphanCheckDialog,
+    CreateLoadDialog, CreateConstraintDialog, CreateLoadCombinationDialog,
+    SubcaseEditorDialog,
+    CreateGeometryPointDialog, CreateGeometryLineDialog,
+    CreateGeometryArcDialog, CreateGeometryCircleDialog,
+    CreateGeometrySurfaceDialog, MeshCurveDialog, MeshSurfaceDialog,
+)
+
+
+class SelectionOverlay:
+    """VTK 2D actor overlay for selection feedback: box, circle, polygon.
+
+    Uses vtkActor2D + vtkPolyDataMapper2D so drawing happens inside
+    VTK's own render pipeline — no Qt widget compositing issues.
+    Coordinates are in VTK display space (origin at bottom-left).
+    """
+
+    ACCENT = (0.537, 0.706, 0.980)  # #89b4fa
+
+    def __init__(self, plotter):
+        self._plotter = plotter
+        self._line_actor = None
+        self._vert_actor = None
+        self._active = False
+
+    # ---- internal helpers ------------------------------------------------
+
+    def _ensure_actors(self):
+        """Create the reusable 2D actors on first use."""
+        if self._line_actor is None:
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(vtk.vtkPolyData())
+            self._line_actor = vtk.vtkActor2D()
+            self._line_actor.SetMapper(mapper)
+            self._line_actor.GetProperty().SetColor(*self.ACCENT)
+            self._line_actor.GetProperty().SetLineWidth(2)
+            self._line_actor.GetProperty().SetOpacity(0.85)
+        if self._vert_actor is None:
+            mapper = vtk.vtkPolyDataMapper2D()
+            mapper.SetInputData(vtk.vtkPolyData())
+            self._vert_actor = vtk.vtkActor2D()
+            self._vert_actor.SetMapper(mapper)
+            self._vert_actor.GetProperty().SetColor(*self.ACCENT)
+            self._vert_actor.GetProperty().SetPointSize(8)
+
+    def _show(self):
+        self._ensure_actors()
+        if not self._active:
+            self._plotter.renderer.AddActor2D(self._line_actor)
+            self._plotter.renderer.AddActor2D(self._vert_actor)
+            self._active = True
+        self._line_actor.SetVisibility(True)
+        self._vert_actor.SetVisibility(True)
+
+    @staticmethod
+    def _make_rect_pd(x0, y0, x1, y1):
+        pts = vtk.vtkPoints()
+        for xy in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]:
+            pts.InsertNextPoint(xy[0], xy[1], 0)
+        lines = vtk.vtkCellArray()
+        lines.InsertNextCell(5)
+        for i in range(4):
+            lines.InsertCellPoint(i)
+        lines.InsertCellPoint(0)
+        pd = vtk.vtkPolyData()
+        pd.SetPoints(pts)
+        pd.SetLines(lines)
+        return pd
+
+    @staticmethod
+    def _make_circle_pd(cx, cy, r, n_seg=64):
+        pts = vtk.vtkPoints()
+        lines = vtk.vtkCellArray()
+        lines.InsertNextCell(n_seg + 1)
+        for i in range(n_seg):
+            a = 2 * np.pi * i / n_seg
+            pts.InsertNextPoint(cx + r * np.cos(a), cy + r * np.sin(a), 0)
+            lines.InsertCellPoint(i)
+        lines.InsertCellPoint(0)
+        pd = vtk.vtkPolyData()
+        pd.SetPoints(pts)
+        pd.SetLines(lines)
+        return pd
+
+    # ---- public API ------------------------------------------------------
+
+    def update_box(self, start_vtk, end_vtk):
+        self._show()
+        pd = self._make_rect_pd(
+            float(start_vtk[0]), float(start_vtk[1]),
+            float(end_vtk[0]), float(end_vtk[1]))
+        self._line_actor.GetMapper().SetInputData(pd)
+        self._vert_actor.GetMapper().SetInputData(vtk.vtkPolyData())
+        self._plotter.render()
+
+    def update_circle(self, center_vtk, radius):
+        self._show()
+        pd = self._make_circle_pd(
+            float(center_vtk[0]), float(center_vtk[1]), float(radius))
+        self._line_actor.GetMapper().SetInputData(pd)
+        self._vert_actor.GetMapper().SetInputData(vtk.vtkPolyData())
+        self._plotter.render()
+
+    def update_polygon(self, points_vtk, cursor_vtk=None):
+        self._show()
+        all_pts = list(points_vtk)
+        if cursor_vtk:
+            all_pts.append(cursor_vtk)
+
+        # Lines between consecutive points (+ dashed line to cursor)
+        line_pd = vtk.vtkPolyData()
+        if len(all_pts) >= 2:
+            vpts = vtk.vtkPoints()
+            lines = vtk.vtkCellArray()
+            for px, py in all_pts:
+                vpts.InsertNextPoint(float(px), float(py), 0)
+            for i in range(len(all_pts) - 1):
+                lines.InsertNextCell(2)
+                lines.InsertCellPoint(i)
+                lines.InsertCellPoint(i + 1)
+            line_pd.SetPoints(vpts)
+            line_pd.SetLines(lines)
+        self._line_actor.GetMapper().SetInputData(line_pd)
+
+        # Vertex dots (only committed points, not cursor)
+        vert_pd = vtk.vtkPolyData()
+        if points_vtk:
+            vpts2 = vtk.vtkPoints()
+            verts = vtk.vtkCellArray()
+            for i, (px, py) in enumerate(points_vtk):
+                vpts2.InsertNextPoint(float(px), float(py), 0)
+                verts.InsertNextCell(1)
+                verts.InsertCellPoint(i)
+            vert_pd.SetPoints(vpts2)
+            vert_pd.SetVerts(verts)
+        self._vert_actor.GetMapper().SetInputData(vert_pd)
+        self._plotter.render()
+
+    def hide_overlay(self):
+        if self._active:
+            if self._line_actor:
+                self._line_actor.SetVisibility(False)
+            if self._vert_actor:
+                self._vert_actor.SetVisibility(False)
+            self._active = False
+            self._plotter.render()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Node Runner v2.0.0"); self.setGeometry(100, 100, 1200, 800)
+        self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
+        self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
+        self.node_size, self.node_color = 5, '#00FF00'
+        self.edge_color, self.edge_width = '#000000', 1
+        self.beam_width = 2
+        self.elem_shrink = 0.0
+        self.load_scaling_info = {}
+        self.type_color_map, self.pid_color_map = {"Shells": "#0077be", "Beams": "#f85a40", "RBE2": "#ff3131", "RBE3": "#ffd700", "Masses": "#00cc66", "Solids": "#8b5cf6", "Shear": "#ff8c00", "Gap": "#20b2aa", "Plotel": "#ff69b4"}, {}
+        
+        # --- FIX: Separated chained assignments onto individual lines ---
+        self.active_selection_dialog = None
+        self.current_node_ids_sorted = []
+        self.default_interactor_style = None
+
+        self.picking_target_callback = None
+        self.active_sub_dialog = None
+        self.active_creation_dialog = None
+        self.current_selection_type = None
+        self.quality_results = None
+
+        # --- Measurement tools state ---
+        self._measurement_picks = []
+        self._measurement_pick_count = 0
+        self._measurement_callback = None
+
+        self.command_manager = CommandManager(max_history=20)
+        self.subcases = []  # Case control deck subcase definitions (legacy)
+        self.geometry_store = GeometryStore()
+        self.sol_type = None  # None, 101, 103, 105 (legacy)
+        self.eigrl_cards = []  # [{sid, v1, v2, nd}] (legacy)
+
+        # --- Analysis Set Manager ---
+        from node_runner.dialogs.analysis import AnalysisSet
+        self.analysis_sets: dict[int, AnalysisSet] = {}
+        self.active_analysis_set_id: int | None = None
+        self.op2_results = None
+        self.deformation_scale = 0.0
+        self._anim_override_scale = None
+        self._anim_phase = 0.0
+        self._anim_timer = QtCore.QTimer(self)
+        self._anim_timer.timeout.connect(self._on_animation_tick)
+
+        # --- Phase 8: Group management ---
+        self.groups: dict[str, dict] = {}  # { "name": {"nodes": [], "elements": [], "gid": int} }
+        self._next_group_id: int = 1
+        self._hidden_groups: set[str] = set()
+        self._isolate_mode: str | None = None
+        self._current_selection_eids: list[int] = []
+        self._current_selection_nids: list[int] = []
+        self._highlighted_group: str | None = None
+
+        # --- Enhanced Entity Selection state ---
+        self._previous_node_selection: set = set()
+        self._previous_element_selection: set = set()
+        self._pick_selection_mode: str = 'box'  # persists across picking sessions
+
+        # --- Display settings (persisted via QSettings) ---
+        self._display_settings = self._load_display_settings()
+
+        self.initUI()
+        self._create_new_model()
+        self._auto_load_materials()
+        self.tree_widget.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree_widget.customContextMenuRequested.connect(self._show_tree_context_menu)
+
+
+    @staticmethod
+    def _get_entity_title_from_comment(comment, entity_type, entity_id):
+        return get_entity_title_from_comment(comment, entity_type, entity_id)
+
+
+    def initUI(self):
+        self._create_menu_bar()
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        left_panel_container = QWidget()
+        left_panel_layout = QVBoxLayout(left_panel_container)
+        self.tree_widget = QTreeWidget()
+        self.tree_widget.setHeaderLabels(["Model Tree"])
+
+        # --- Phase 8: Groups tab ---
+        self.groups_list = QTreeWidget()
+        self.groups_list.setHeaderLabels(["Groups"])
+        self.groups_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.groups_list.customContextMenuRequested.connect(self._show_groups_context_menu)
+        self.groups_list.itemChanged.connect(self._on_group_item_changed)
+        self.groups_list.itemDoubleClicked.connect(self._edit_group_contents)
+
+        groups_widget = QWidget()
+        groups_layout = QVBoxLayout(groups_widget)
+        groups_layout.setContentsMargins(4, 4, 4, 4)
+        groups_layout.setSpacing(4)
+        groups_layout.addWidget(self.groups_list, 1)
+
+        # Row 1: Create / Delete / Rename
+        grp_row1 = QHBoxLayout()
+        create_grp_btn = QPushButton("Create")
+        create_grp_btn.clicked.connect(self._create_group)
+        delete_grp_btn = QPushButton("Delete")
+        delete_grp_btn.clicked.connect(self._delete_group)
+        rename_grp_btn = QPushButton("Rename")
+        rename_grp_btn.clicked.connect(self._rename_selected_group)
+        grp_row1.addWidget(create_grp_btn)
+        grp_row1.addWidget(delete_grp_btn)
+        grp_row1.addWidget(rename_grp_btn)
+        groups_layout.addLayout(grp_row1)
+
+        # Row 2: Add Selected / Remove Selected / Clear
+        grp_row2 = QHBoxLayout()
+        add_sel_btn = QPushButton("Add Sel.")
+        add_sel_btn.setToolTip("Add currently selected entities to this group")
+        add_sel_btn.clicked.connect(self._add_selected_to_group)
+        remove_sel_btn = QPushButton("Rem. Sel.")
+        remove_sel_btn.setToolTip("Remove currently selected entities from this group")
+        remove_sel_btn.clicked.connect(self._remove_selected_from_group)
+        clear_grp_btn = QPushButton("Clear")
+        clear_grp_btn.setToolTip("Remove all items from this group")
+        clear_grp_btn.clicked.connect(self._clear_group)
+        grp_row2.addWidget(add_sel_btn)
+        grp_row2.addWidget(remove_sel_btn)
+        grp_row2.addWidget(clear_grp_btn)
+        groups_layout.addLayout(grp_row2)
+
+        # Row 3: Show All / Isolate / Highlight
+        grp_row3 = QHBoxLayout()
+        show_all_btn = QPushButton("Show All")
+        show_all_btn.setToolTip("Show all groups (clear isolation)")
+        show_all_btn.clicked.connect(self._show_all_groups)
+        isolate_btn = QPushButton("Isolate")
+        isolate_btn.clicked.connect(self._isolate_group)
+        highlight_btn = QPushButton("Highlight")
+        highlight_btn.setToolTip("Flash-highlight entities in this group")
+        highlight_btn.clicked.connect(self._highlight_group)
+        grp_row3.addWidget(show_all_btn)
+        grp_row3.addWidget(isolate_btn)
+        grp_row3.addWidget(highlight_btn)
+        groups_layout.addLayout(grp_row3)
+
+        # Row 4: Auto-group
+        grp_row4 = QHBoxLayout()
+        self.auto_group_combo = QComboBox()
+        self.auto_group_combo.addItems(["By Property", "By Material", "By Element Type"])
+        auto_grp_btn = QPushButton("Auto Group")
+        auto_grp_btn.clicked.connect(self._auto_group)
+        grp_row4.addWidget(self.auto_group_combo, 1)
+        grp_row4.addWidget(auto_grp_btn)
+        groups_layout.addLayout(grp_row4)
+
+        self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.addTab(self.tree_widget, "Model")
+
+        # --- Loads Tab (unified tree, mirrors Model tab layout) ---
+        loads_tab = QWidget()
+        loads_tab_layout = QVBoxLayout(loads_tab)
+        loads_tab_layout.setContentsMargins(4, 4, 4, 4)
+        loads_tab_layout.setSpacing(4)
+
+        self.loads_tab_tree = QTreeWidget()
+        self.loads_tab_tree.setHeaderLabels(["Loads / Constraints"])
+        self.loads_tab_tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.loads_tab_tree.customContextMenuRequested.connect(self._show_loads_tab_context_menu)
+        loads_tab_layout.addWidget(self.loads_tab_tree, 1)  # stretch factor 1 = fill space
+
+        # Button row
+        loads_btn_layout = QHBoxLayout()
+        add_load_btn = QPushButton("Add Load")
+        add_load_btn.clicked.connect(self._create_load)
+        add_constr_btn = QPushButton("Add Constraint")
+        add_constr_btn.clicked.connect(self._create_constraint)
+        add_combo_btn = QPushButton("Add Combo")
+        add_combo_btn.clicked.connect(self._create_load_combination)
+        loads_btn_layout.addWidget(add_load_btn)
+        loads_btn_layout.addWidget(add_constr_btn)
+        loads_btn_layout.addWidget(add_combo_btn)
+        loads_tab_layout.addLayout(loads_btn_layout)
+
+        self.sidebar_tabs.addTab(loads_tab, "Loads")
+
+        self.sidebar_tabs.addTab(groups_widget, "Groups")
+
+        # --- Analysis Tab ---
+        analysis_tab = QWidget()
+        analysis_tab_layout = QVBoxLayout(analysis_tab)
+        analysis_tab_layout.setContentsMargins(4, 4, 4, 4)
+        analysis_tab_layout.setSpacing(4)
+
+        self.analysis_tab_tree = QTreeWidget()
+        self.analysis_tab_tree.setHeaderLabels(["Analysis Sets"])
+        self.analysis_tab_tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.analysis_tab_tree.customContextMenuRequested.connect(
+            self._show_analysis_tab_context_menu)
+        analysis_tab_layout.addWidget(self.analysis_tab_tree, 1)
+
+        analysis_btn_layout = QHBoxLayout()
+        new_set_btn = QPushButton("New Set")
+        new_set_btn.clicked.connect(self._new_analysis_set_from_tab)
+        edit_set_btn = QPushButton("Edit Set")
+        edit_set_btn.clicked.connect(self._open_analysis_set_manager)
+        set_active_btn = QPushButton("Set Active")
+        set_active_btn.clicked.connect(self._set_active_from_tab)
+        analysis_btn_layout.addWidget(new_set_btn)
+        analysis_btn_layout.addWidget(edit_set_btn)
+        analysis_btn_layout.addWidget(set_active_btn)
+        analysis_tab_layout.addLayout(analysis_btn_layout)
+
+        self.sidebar_tabs.addTab(analysis_tab, "Analysis")
+
+        left_panel_layout.addWidget(self.sidebar_tabs)
+        # --- Display Options Tab (organized with sections, scrollable) ---
+        display_scroll = QScrollArea()
+        display_scroll.setWidgetResizable(True)
+        display_scroll.setFrameShape(QFrame.NoFrame)
+        display_inner = QWidget()
+        display_tab_layout = QVBoxLayout(display_inner)
+        display_tab_layout.setContentsMargins(6, 6, 6, 6)
+        display_tab_layout.setSpacing(8)
+
+        # Section: Render
+        render_group = QGroupBox("Render")
+        render_layout = QFormLayout(render_group)
+        render_layout.setSpacing(6)
+        self.render_style_combo = QComboBox()
+        self.render_style_combo.addItems(["Surface with Edges", "Wireframe", "Surface Only", "Points"])
+        self.render_style_combo.currentIndexChanged.connect(self._on_render_style_combo_changed)
+        render_layout.addRow("Style:", self.render_style_combo)
+        self.color_mode_combo = QComboBox()
+        self.color_mode_combo.addItems(["Property", "Type", "Quality", "Results"])
+        self.color_mode_combo.currentIndexChanged.connect(self._on_color_mode_combo_changed)
+        render_layout.addRow("Color By:", self.color_mode_combo)
+        self.bg_preset_combo = QComboBox()
+        self.bg_preset_combo.addItems(list(BACKGROUND_PRESETS.keys()))
+        self.bg_preset_combo.currentTextChanged.connect(self._on_bg_preset_changed)
+        render_layout.addRow("Background:", self.bg_preset_combo)
+        display_tab_layout.addWidget(render_group)
+
+        # Section: Labels
+        labels_group = QGroupBox("Labels")
+        labels_layout = QFormLayout(labels_group)
+        labels_layout.setSpacing(6)
+        self.show_node_labels_check = QCheckBox()
+        self.show_elem_labels_check = QCheckBox()
+        labels_layout.addRow("Node IDs:", self.show_node_labels_check)
+        labels_layout.addRow("Element IDs:", self.show_elem_labels_check)
+        display_tab_layout.addWidget(labels_group)
+
+        # Section: Node Display
+        node_disp_group = QGroupBox("Node Display")
+        node_disp_layout = QFormLayout(node_disp_group)
+        node_disp_layout.setSpacing(6)
+        self.node_size_spin = QSpinBox()
+        self.node_size_spin.setRange(1, 20)
+        self.node_size_spin.setValue(self.node_size)
+        self.node_size_spin.valueChanged.connect(self._on_node_size_changed)
+        node_disp_layout.addRow("Node Size:", self.node_size_spin)
+        self.node_color_btn = QPushButton()
+        self.node_color_btn.setFixedSize(60, 22)
+        self.node_color_btn.setStyleSheet(f"background-color: {self.node_color}; border: 1px solid #555;")
+        self.node_color_btn.clicked.connect(self._pick_node_color)
+        node_disp_layout.addRow("Node Color:", self.node_color_btn)
+        display_tab_layout.addWidget(node_disp_group)
+
+        # Section: Element Display
+        elem_disp_group = QGroupBox("Element Display")
+        elem_disp_layout = QFormLayout(elem_disp_group)
+        elem_disp_layout.setSpacing(6)
+        self.shell_opacity_slider = QSlider(QtCore.Qt.Horizontal)
+        self.shell_opacity_slider.setRange(0, 100)
+        self.shell_opacity_slider.setValue(100)
+        self.shell_opacity_slider.setToolTip("Shell element opacity (0-100%)")
+        self.shell_opacity_slider.valueChanged.connect(self._on_shell_opacity_changed)
+        elem_disp_layout.addRow("Shell Opacity:", self.shell_opacity_slider)
+        self.elem_shrink_slider = QSlider(QtCore.Qt.Horizontal)
+        self.elem_shrink_slider.setRange(0, 50)
+        self.elem_shrink_slider.setValue(0)
+        self.elem_shrink_slider.setToolTip("Shrink elements toward centroids (0-50%)")
+        self.elem_shrink_slider.valueChanged.connect(self._on_elem_shrink_changed)
+        elem_disp_layout.addRow("Element Shrink:", self.elem_shrink_slider)
+        self.edge_color_btn = QPushButton()
+        self.edge_color_btn.setFixedSize(60, 22)
+        self.edge_color_btn.setStyleSheet(f"background-color: {self.edge_color}; border: 1px solid #555;")
+        self.edge_color_btn.clicked.connect(self._pick_edge_color)
+        elem_disp_layout.addRow("Edge Color:", self.edge_color_btn)
+        self.edge_width_spin = QSpinBox()
+        self.edge_width_spin.setRange(1, 5)
+        self.edge_width_spin.setValue(self.edge_width)
+        self.edge_width_spin.valueChanged.connect(self._on_edge_width_changed)
+        elem_disp_layout.addRow("Edge Width:", self.edge_width_spin)
+        self.beam_width_spin = QSpinBox()
+        self.beam_width_spin.setRange(1, 10)
+        self.beam_width_spin.setValue(self.beam_width)
+        self.beam_width_spin.valueChanged.connect(self._on_beam_width_changed)
+        elem_disp_layout.addRow("Beam Width:", self.beam_width_spin)
+        display_tab_layout.addWidget(elem_disp_group)
+
+        # Section: Element Visualization
+        elem_viz_group = QGroupBox("Element Visualization")
+        elem_viz_layout = QFormLayout(elem_viz_group)
+        elem_viz_layout.setSpacing(6)
+        self.show_normals_check = QCheckBox()
+        self.normal_arrow_scale_input = QLineEdit("5")
+        self.normal_arrow_scale_input.setValidator(QDoubleValidator(0.1, 100.0, 2, self))
+        self.show_free_edges_check = QCheckBox()
+        elem_viz_layout.addRow("Element Normals:", self.show_normals_check)
+        elem_viz_layout.addRow("Normal Arrow Size (%):", self.normal_arrow_scale_input)
+        elem_viz_layout.addRow("Free Edges:", self.show_free_edges_check)
+        display_tab_layout.addWidget(elem_viz_group)
+
+        # Section: Orientations
+        orient_group = QGroupBox("Orientations")
+        orient_layout = QFormLayout(orient_group)
+        orient_layout.setSpacing(6)
+        self.show_bush_orient_check = QCheckBox()
+        self.show_beam_orient_check = QCheckBox()
+        orient_layout.addRow("Bush Orientations:", self.show_bush_orient_check)
+        orient_layout.addRow("Beam Orientations:", self.show_beam_orient_check)
+        self.show_beam_sections_check = QCheckBox()
+        orient_layout.addRow("Beam 3D Sections:", self.show_beam_sections_check)
+        display_tab_layout.addWidget(orient_group)
+
+        # Section: Coordinate Systems
+        csys_group = QGroupBox("Coordinate Systems")
+        csys_layout = QFormLayout(csys_group)
+        csys_layout.setSpacing(6)
+        self.show_csys_check = QCheckBox()
+        self.show_csys_check.setChecked(True)
+        self.show_global_csys_check = QCheckBox()
+        self.show_global_csys_check.setToolTip("Show/hide CID 0 (Rectangular), 1 (Cylindrical), 2 (Spherical)")
+        self.show_csys_labels_check = QCheckBox()
+        self.show_csys_labels_check.setChecked(True)
+        self.csys_scale_slider = QSlider(QtCore.Qt.Horizontal)
+        self.csys_scale_slider.setRange(1, 30)
+        self.csys_scale_slider.setValue(8)
+        self.csys_scale_slider.setToolTip("Axis arrow size (‰ of model diagonal)")
+        csys_layout.addRow("Show Coord Systems:", self.show_csys_check)
+        csys_layout.addRow("Show Global (0,1,2):", self.show_global_csys_check)
+        csys_layout.addRow("Show Labels:", self.show_csys_labels_check)
+        csys_layout.addRow("Axis Size:", self.csys_scale_slider)
+        display_tab_layout.addWidget(csys_group)
+
+        # Section: Loads & Constraints
+        loads_group = QGroupBox("Loads && Constraints")
+        loads_layout = QFormLayout(loads_group)
+        loads_layout.setSpacing(6)
+        self.arrow_scale_input = QLineEdit("10.0")
+        self.arrow_scale_input.setValidator(QDoubleValidator(0.1, 100.0, 2, self))
+        self.relative_scaling_check = QCheckBox()
+        self.relative_scaling_check.setChecked(True)
+        loads_layout.addRow("Arrow Size (%):", self.arrow_scale_input)
+        loads_layout.addRow("Relative Scaling:", self.relative_scaling_check)
+        display_tab_layout.addWidget(loads_group)
+
+        # Hidden quality metric widget (shown when quality coloring is active)
+        self.quality_widget = QWidget()
+        quality_layout = QFormLayout(self.quality_widget)
+        quality_layout.setContentsMargins(0, 0, 0, 0)
+        self.quality_metric_combo = QComboBox()
+        quality_layout.addRow("Quality Metric:", self.quality_metric_combo)
+        display_tab_layout.addWidget(self.quality_widget)
+        self.quality_widget.setVisible(False)
+
+        # Hidden results widget (shown when OP2 results loaded)
+        self.results_widget = QGroupBox("Results")
+        results_layout = QFormLayout(self.results_widget)
+        results_layout.setContentsMargins(6, 6, 6, 6)
+        results_layout.setSpacing(6)
+        self.results_subcase_combo = QComboBox()
+        results_layout.addRow("Subcase:", self.results_subcase_combo)
+        self.results_type_combo = QComboBox()
+        self.results_type_combo.addItems(["Displacement", "Stress", "Eigenvector", "SPC Forces"])
+        results_layout.addRow("Result Type:", self.results_type_combo)
+        self.results_component_combo = QComboBox()
+        results_layout.addRow("Component:", self.results_component_combo)
+        self.deformation_scale_input = QLineEdit("0.0")
+        self.deformation_scale_input.setValidator(QDoubleValidator(0.0, 1e12, 4, self))
+        results_layout.addRow("Deform Scale:", self.deformation_scale_input)
+        self.results_mode_combo = QComboBox()
+        results_layout.addRow("Mode:", self.results_mode_combo)
+        self.results_mode_combo.setVisible(False)
+        anim_widget = QWidget()
+        anim_layout = QHBoxLayout(anim_widget)
+        anim_layout.setContentsMargins(0, 0, 0, 0)
+        self.anim_play_btn = QPushButton("Play")
+        self.anim_play_btn.setCheckable(True)
+        self.anim_speed_slider = QSlider(QtCore.Qt.Horizontal)
+        self.anim_speed_slider.setRange(10, 200)
+        self.anim_speed_slider.setValue(80)
+        self.anim_speed_slider.setToolTip("Animation speed")
+        self.anim_export_gif_btn = QPushButton("GIF")
+        self.anim_export_gif_btn.setToolTip("Export animation as GIF")
+        anim_layout.addWidget(self.anim_play_btn)
+        anim_layout.addWidget(self.anim_speed_slider, 1)
+        anim_layout.addWidget(self.anim_export_gif_btn)
+        results_layout.addRow("Animate:", anim_widget)
+        display_tab_layout.addWidget(self.results_widget)
+        self.results_widget.setVisible(False)
+        self.results_subcase_combo.currentIndexChanged.connect(self._on_results_changed)
+        self.results_type_combo.currentIndexChanged.connect(self._on_results_type_changed)
+        self.results_component_combo.currentIndexChanged.connect(self._on_results_changed)
+        self.results_mode_combo.currentIndexChanged.connect(self._on_results_changed)
+        self.deformation_scale_input.editingFinished.connect(self._on_results_changed)
+        self.anim_play_btn.toggled.connect(self._toggle_animation)
+        self.anim_speed_slider.valueChanged.connect(self._on_anim_speed_changed)
+        self.anim_export_gif_btn.clicked.connect(self._export_results_gif)
+
+        display_tab_layout.addStretch()
+        display_scroll.setWidget(display_inner)
+        self.sidebar_tabs.addTab(display_scroll, "Display")
+
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background('#1e1e2e')
+        self.plotter.installEventFilter(self)  # Catch ESC for presentation mode
+
+        # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
+        self._selection_overlay = SelectionOverlay(self.plotter)
+
+        self.plotter.add_axes()
+        self.axes_actor = self.plotter.renderer.axes_actor
+        self._set_axes_label_color((0.804, 0.839, 0.957))
+
+        # Apply persisted background settings
+        self._apply_background()
+
+        # Selection bar — floating dialog, created once and shown/hidden per workflow
+        from node_runner.dialogs.selection import EntitySelectionBar
+        self.selection_bar = EntitySelectionBar(self)
+
+        splitter = QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(left_panel_container)
+        splitter.addWidget(self.plotter.interactor)
+        splitter.setSizes([300, 900])
+        main_layout.addWidget(splitter)
+
+        # --- Standard-view quick-access buttons (top-left of 3D viewer) ---
+        self._view_bar = QWidget(self.plotter)
+        self._view_bar.setObjectName("view_bar")
+        self._view_bar.setStyleSheet("""
+            QWidget#view_bar {
+                background: rgba(30, 30, 46, 180);
+                border-radius: 4px;
+                border: 1px solid rgba(137, 180, 250, 60);
+            }
+            QPushButton {
+                background: transparent;
+                border: 1px solid transparent; border-radius: 3px;
+                padding: 2px;
+            }
+            QPushButton:hover {
+                background: rgba(137, 180, 250, 60);
+                border-color: rgba(137, 180, 250, 120);
+            }
+            QPushButton:pressed { background: rgba(137, 180, 250, 100); }
+        """)
+        vb_layout = QHBoxLayout(self._view_bar)
+        vb_layout.setContentsMargins(4, 4, 4, 4)
+        vb_layout.setSpacing(2)
+        icon_sz = 24
+        view_defs = [
+            ("top",    "Top (+Z)",    lambda: self._set_standard_view('top')),
+            ("bottom", "Bottom (-Z)", lambda: self._set_standard_view('bottom')),
+            ("front",  "Front (+X)",  lambda: self._set_standard_view('front')),
+            ("back",   "Back (-X)",   lambda: self._set_standard_view('back')),
+            ("right",  "Right (+Y)",  lambda: self._set_standard_view('right')),
+            ("left",   "Left (-Y)",   lambda: self._set_standard_view('left')),
+            ("iso",    "Isometric",   lambda: (self.plotter.view_isometric(), self._update_status("View set to: Isometric"))),
+        ]
+        for i, (vname, tooltip, cb) in enumerate(view_defs):
+            # Thin separator between paired groups: T/Bo | F/Bk | R/L | Iso
+            if i in (2, 4, 6):
+                sep = QFrame()
+                sep.setFrameShape(QFrame.VLine)
+                sep.setFixedWidth(1)
+                sep.setStyleSheet("color: rgba(137, 180, 250, 40);")
+                vb_layout.addWidget(sep)
+            btn = QPushButton()
+            btn.setIcon(self._make_view_cube_icon(vname, icon_sz))
+            btn.setIconSize(QtCore.QSize(icon_sz, icon_sz))
+            btn.setFixedSize(icon_sz + 6, icon_sz + 6)
+            btn.setToolTip(tooltip)
+            btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            btn.clicked.connect(cb)
+            vb_layout.addWidget(btn)
+        self._view_bar.adjustSize()
+        self._view_bar.move(8, 8)
+        self._view_bar.show()
+
+        # --- Debounced glyph refresh after camera changes ---
+        self._last_visibility_mask = None
+        self._glyph_refresh_timer = QtCore.QTimer(self)
+        self._glyph_refresh_timer.setSingleShot(True)
+        self._glyph_refresh_timer.setInterval(200)
+        self._glyph_refresh_timer.timeout.connect(self._refresh_orientation_glyphs)
+        iren = self.plotter.interactor
+        iren.AddObserver(vtk.vtkCommand.MouseWheelForwardEvent, lambda *_: self._schedule_glyph_refresh())
+        iren.AddObserver(vtk.vtkCommand.MouseWheelBackwardEvent, lambda *_: self._schedule_glyph_refresh())
+        iren.AddObserver(vtk.vtkCommand.EndInteractionEvent, lambda *_: self._schedule_glyph_refresh())
+
+        self.statusBar().showMessage("Ready.")
+
+        # --- Selection bar signal connections (connected once, persist for lifetime) ---
+        self._selection_accept_callback = None
+        self.selection_bar.request_show_selection.connect(self._highlight_entities)
+        self.selection_bar.request_picking_mode.connect(self._set_picking_mode)
+        self.selection_bar.request_advanced_selection.connect(self._on_advanced_selection)
+        self.selection_bar.request_selection_mode.connect(self._on_selection_mode_change)
+        self.selection_bar.request_previous_selection.connect(self._on_previous_selection)
+        self.selection_bar.accepted.connect(self._on_selection_bar_accepted)
+        self.selection_bar.rejected.connect(self._on_selection_bar_rejected)
+
+        self.theme_button.clicked.connect(self._toggle_theme)
+        self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+        self.show_node_labels_check.toggled.connect(self._toggle_node_labels)
+        self.show_elem_labels_check.toggled.connect(self._toggle_element_labels)
+
+        # --- NEW: Connect scaling controls to the redraw function ---
+        self.arrow_scale_input.textChanged.connect(self._update_plot_visibility)
+        self.relative_scaling_check.stateChanged.connect(self._update_plot_visibility)
+
+        #find_button.clicked.connect(self._find_and_zoom_to_entity)
+        #clear_button.clicked.connect(self._clear_entity_highlight)
+
+
+        self.show_normals_check.stateChanged.connect(self._toggle_element_normals_visibility)
+        self.normal_arrow_scale_input.textChanged.connect(self._toggle_element_normals_visibility)
+        self.show_free_edges_check.stateChanged.connect(self._toggle_free_edges_visibility)
+
+        self.quality_metric_combo.currentIndexChanged.connect(self._update_plot_visibility)
+        self.show_csys_check.stateChanged.connect(self._refresh_coord_actors)
+        self.show_global_csys_check.stateChanged.connect(self._refresh_coord_actors)
+        self.show_csys_labels_check.stateChanged.connect(self._refresh_coord_actors)
+        self.csys_scale_slider.valueChanged.connect(self._refresh_coord_actors)
+        self.show_bush_orient_check.stateChanged.connect(self._update_plot_visibility)
+        self.show_beam_orient_check.stateChanged.connect(self._update_plot_visibility)
+        self.show_beam_sections_check.stateChanged.connect(self._update_plot_visibility)
+    
+# START: Replacement for _create_new_model in main.py
+    def _undo(self):
+        model = self.current_generator.model if self.current_generator else None
+        if not model or not self.command_manager.can_undo:
+            self._update_status("Nothing to undo.")
+            return
+        desc = self.command_manager.undo_description
+        self.command_manager.undo(model)
+        self._update_viewer(self.current_generator, reset_camera=False)
+        self._update_status(f"Undo: {desc}")
+
+    def _redo(self):
+        model = self.current_generator.model if self.current_generator else None
+        if not model or not self.command_manager.can_redo:
+            self._update_status("Nothing to redo.")
+            return
+        desc = self.command_manager.redo_description
+        self.command_manager.redo(model)
+        self._update_viewer(self.current_generator, reset_camera=False)
+        self._update_status(f"Redo: {desc}")
+
+    def _create_new_model(self):
+        """Creates a new, empty model with default global coordinate systems."""
+        self.current_generator = NastranModelGenerator()
+        # The helper function now ensures the default coordinate systems are created.
+        self._ensure_default_coords(self.current_generator.model)
+        self.command_manager.clear()
+        self.subcases = []
+        self.geometry_store.clear()
+        self.sol_type = None
+        self.eigrl_cards = []
+        self.analysis_sets.clear()
+        self.active_analysis_set_id = None
+        self.op2_results = None
+        self.results_widget.setVisible(False)
+        # Phase 8: Reset groups on new model
+        self.groups.clear()
+        self._hidden_groups.clear()
+        self._isolate_mode = None
+        self._populate_groups_list()
+        self._update_viewer(self.current_generator)
+        self._update_status("New model created.")
+# END: Replacement for _create_new_model in main.py
+
+
+    # START: New helper method in main.py
+    def _ensure_default_coords(self, model):
+        """
+        Ensures the three default coordinate systems exist in the given model.
+        This will overwrite any user-defined cards at CIDs 1 and 2.
+        """
+        # pyNastran's BDF() object creates CID 0 (Global Rectangular) by default.
+        # We only need to ensure CIDs 1 and 2 are correct.
+        model.add_cord2c(1, rid=0, origin=[0.,0.,0.], zaxis=[0.,0.,1.], xzplane=[1.,0.,0.], comment='$ Global Cylindrical')
+        model.add_cord2s(2, rid=0, origin=[0.,0.,0.], zaxis=[0.,0.,1.], xzplane=[1.,0.,0.], comment='$ Global Spherical')
+# END: New helper method in main.py
+
+
+
+    def _set_axes_label_color(self, color_tuple):
+        if not hasattr(self, 'axes_actor') or not self.axes_actor:
+            return
+        self.axes_actor.GetXAxisCaptionActor2D().GetCaptionTextProperty().SetColor(color_tuple)
+        self.axes_actor.GetYAxisCaptionActor2D().GetCaptionTextProperty().SetColor(color_tuple)
+        self.axes_actor.GetZAxisCaptionActor2D().GetCaptionTextProperty().SetColor(color_tuple)
+
+    def _create_menu_bar(self):
+        menu_bar = self.menuBar()
+
+        file_menu = menu_bar.addMenu("&File")
+        
+        new_action = QAction("&New Model", self)
+        new_action.triggered.connect(self._create_new_model)
+        file_menu.addAction(new_action)
+        file_menu.addSeparator()
+
+        open_action = QAction("&Open BDF/DAT...", self)
+        open_action.triggered.connect(self._open_file_dialog)
+        file_menu.addAction(open_action)
+        
+        # --- NEW: Add the Import menu action ---
+        import_action = QAction("&Import BDF/DAT...", self)
+        import_action.triggered.connect(self._import_file_dialog)
+        file_menu.addAction(import_action)
+        import_cad_action = QAction("Import CAD (STEP/IGES/STL)...", self)
+        import_cad_action.triggered.connect(self._import_cad_file)
+        file_menu.addAction(import_cad_action)
+
+        save_action = QAction("&Save BDF File...", self)
+        save_action.triggered.connect(self._save_file_dialog)
+        file_menu.addAction(save_action)
+
+        file_menu.addSeparator()
+        load_results_action = QAction("Load Results (&OP2)...", self)
+        load_results_action.triggered.connect(self._load_results_dialog)
+        file_menu.addAction(load_results_action)
+
+        file_menu.addSeparator()
+        save_conf_action = QAction("Save Fuselage Config...", self)
+        save_conf_action.triggered.connect(self._save_configuration)
+        file_menu.addAction(save_conf_action)
+        load_conf_action = QAction("Load Fuselage Config...", self)
+        load_conf_action.triggered.connect(self._load_configuration)
+        file_menu.addAction(load_conf_action)
+        file_menu.addSeparator()
+        quit_action = QAction("&Quit", self)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        edit_menu = menu_bar.addMenu("&Edit")
+        undo_action = QAction("&Undo", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self._undo)
+        edit_menu.addAction(undo_action)
+        redo_action = QAction("&Redo", self)
+        redo_action.setShortcut("Ctrl+Y")
+        redo_action.triggered.connect(self._redo)
+        edit_menu.addAction(redo_action)
+        edit_menu.addSeparator()
+        select_entities_action = QAction("Select &Entities...", self)
+        select_entities_action.setShortcut("Ctrl+F")
+        select_entities_action.triggered.connect(self._open_find_entity_tool)
+        edit_menu.addAction(select_entities_action)
+
+        # --- Model menu (merged: old Model + Mesh + Edit items) ---
+        model_menu = menu_bar.addMenu("&Model")
+
+        # Section 1: Create — Nodes, Elements, Properties, Materials, Coords
+        create_nodes_action = QAction("Nodes...", self)
+        create_nodes_action.triggered.connect(self._create_nodes)
+        model_menu.addAction(create_nodes_action)
+        elements_menu = model_menu.addMenu("Elements")
+        create_lines_action = QAction("Line...", self)
+        create_lines_action.triggered.connect(self._create_line_elements)
+        elements_menu.addAction(create_lines_action)
+        create_plates_action = QAction("Plate...", self)
+        create_plates_action.triggered.connect(self._create_plate_elements)
+        elements_menu.addAction(create_plates_action)
+        create_solid_action = QAction("Solid...", self)
+        create_solid_action.triggered.connect(self._create_solid_elements)
+        elements_menu.addAction(create_solid_action)
+        create_bush_action = QAction("Bush...", self)
+        create_bush_action.triggered.connect(self._create_bush_elements)
+        elements_menu.addAction(create_bush_action)
+        create_shear_action = QAction("Shear Panel...", self)
+        create_shear_action.triggered.connect(self._create_shear_elements)
+        elements_menu.addAction(create_shear_action)
+        create_gap_action = QAction("Gap...", self)
+        create_gap_action.triggered.connect(self._create_gap_elements)
+        elements_menu.addAction(create_gap_action)
+        create_rbes_action = QAction("Rigid...", self)
+        create_rbes_action.triggered.connect(self._create_rbes)
+        elements_menu.addAction(create_rbes_action)
+        create_conm2_action = QAction("Concentrated Mass (CONM2)...", self)
+        create_conm2_action.triggered.connect(self._create_conm2)
+        elements_menu.addAction(create_conm2_action)
+        create_plotel_action = QAction("Plot Element (PLOTEL)...", self)
+        create_plotel_action.triggered.connect(self._create_plotels)
+        elements_menu.addAction(create_plotel_action)
+        create_prop_action = QAction("Property...", self)
+        create_prop_action.triggered.connect(self._create_property)
+        model_menu.addAction(create_prop_action)
+        create_mat_action = QAction("Material...", self)
+        create_mat_action.triggered.connect(self._create_material)
+        model_menu.addAction(create_mat_action)
+        create_coord_action = QAction("Coordinate System...", self)
+        create_coord_action.triggered.connect(self._create_coord_system)
+        model_menu.addAction(create_coord_action)
+
+        # Section 2: Loads & Constraints
+        model_menu.addSeparator()
+        create_load_action = QAction("Load...", self)
+        create_load_action.triggered.connect(self._create_load)
+        model_menu.addAction(create_load_action)
+        create_constraint_action = QAction("Constraint...", self)
+        create_constraint_action.triggered.connect(self._create_constraint)
+        model_menu.addAction(create_constraint_action)
+        create_load_combo_action = QAction("Load Combination (LOAD)...", self)
+        create_load_combo_action.triggered.connect(self._create_load_combination)
+        model_menu.addAction(create_load_combo_action)
+
+        # Section 3: Modify (moved from Edit menu)
+        model_menu.addSeparator()
+        modify_menu = model_menu.addMenu("Modify")
+        move_nodes_action = QAction("Transform Nodes...", self)
+        move_nodes_action.triggered.connect(self._open_node_move_tool)
+        modify_menu.addAction(move_nodes_action)
+        edit_element_action = QAction("Element...", self)
+        edit_element_action.triggered.connect(self._open_element_editor)
+        modify_menu.addAction(edit_element_action)
+        edit_props_action = QAction("Properties...", self)
+        edit_props_action.triggered.connect(self._open_property_editor)
+        modify_menu.addAction(edit_props_action)
+        edit_mats_action = QAction("Materials...", self)
+        edit_mats_action.triggered.connect(self._open_material_editor)
+        modify_menu.addAction(edit_mats_action)
+
+        # Section 4: Mesh Operations (moved from Mesh menu)
+        model_menu.addSeparator()
+        flip_normals_action = QAction("Flip Element Normals...", self)
+        flip_normals_action.triggered.connect(self._open_element_flip_tool)
+        model_menu.addAction(flip_normals_action)
+        orient_normals_action = QAction("Orient Normals (Auto)...", self)
+        orient_normals_action.triggered.connect(self._auto_orient_normals)
+        model_menu.addAction(orient_normals_action)
+        split_plates_action = QAction("Split Plates...", self)
+        split_plates_action.triggered.connect(self._open_element_split_tool)
+        model_menu.addAction(split_plates_action)
+
+        # Section 5: Connections (moved from Mesh menu)
+        model_menu.addSeparator()
+        connections_menu = model_menu.addMenu("Connections")
+        spider_action = QAction("Spider Connection (RBE)...", self)
+        spider_action.triggered.connect(self._create_spider_connection)
+        connections_menu.addAction(spider_action)
+        weld_action = QAction("Weld/Fastener (CWELD)...", self)
+        weld_action.triggered.connect(self._create_weld_fastener)
+        connections_menu.addAction(weld_action)
+
+        # Section 6: Geometry Mesh (moved from Mesh menu)
+        model_menu.addSeparator()
+        geom_mesh_menu = model_menu.addMenu("Geometry Mesh")
+        mesh_curve_action = QAction("Mesh Curve...", self)
+        mesh_curve_action.triggered.connect(self._mesh_curve)
+        geom_mesh_menu.addAction(mesh_curve_action)
+        nodes_at_points_action = QAction("Nodes at Points...", self)
+        nodes_at_points_action.triggered.connect(self._nodes_at_geometry_points)
+        geom_mesh_menu.addAction(nodes_at_points_action)
+        mesh_surface_action = QAction("Mesh Surface...", self)
+        mesh_surface_action.triggered.connect(self._mesh_surface)
+        geom_mesh_menu.addAction(mesh_surface_action)
+
+        geom_menu = menu_bar.addMenu("&Geometry")
+        geom_create_menu = geom_menu.addMenu("Create")
+        geom_point_action = QAction("Point...", self)
+        geom_point_action.triggered.connect(self._create_geometry_point)
+        geom_create_menu.addAction(geom_point_action)
+        geom_line_action = QAction("Line...", self)
+        geom_line_action.triggered.connect(self._create_geometry_line)
+        geom_create_menu.addAction(geom_line_action)
+        geom_arc_action = QAction("Arc...", self)
+        geom_arc_action.triggered.connect(self._create_geometry_arc)
+        geom_create_menu.addAction(geom_arc_action)
+        geom_circle_action = QAction("Circle...", self)
+        geom_circle_action.triggered.connect(self._create_geometry_circle)
+        geom_create_menu.addAction(geom_circle_action)
+        geom_surface_action = QAction("Surface...", self)
+        geom_surface_action.triggered.connect(self._create_geometry_surface)
+        geom_create_menu.addAction(geom_surface_action)
+
+        geom_modify_menu = geom_menu.addMenu("Modify")
+        edit_point_action = QAction("Edit Point...", self)
+        edit_point_action.triggered.connect(self._edit_geometry_point)
+        geom_modify_menu.addAction(edit_point_action)
+        edit_curve_action = QAction("Edit Curve...", self)
+        edit_curve_action.triggered.connect(self._edit_geometry_curve)
+        geom_modify_menu.addAction(edit_curve_action)
+        edit_surface_action = QAction("Edit Surface Boundaries...", self)
+        edit_surface_action.triggered.connect(self._edit_geometry_surface)
+        geom_modify_menu.addAction(edit_surface_action)
+
+        geom_transform_menu = geom_menu.addMenu("Transform")
+        translate_geom_action = QAction("Translate...", self)
+        translate_geom_action.triggered.connect(lambda: self._transform_geometry('translate'))
+        geom_transform_menu.addAction(translate_geom_action)
+        rotate_geom_action = QAction("Rotate...", self)
+        rotate_geom_action.triggered.connect(lambda: self._transform_geometry('rotate'))
+        geom_transform_menu.addAction(rotate_geom_action)
+        mirror_geom_action = QAction("Mirror...", self)
+        mirror_geom_action.triggered.connect(lambda: self._transform_geometry('mirror'))
+        geom_transform_menu.addAction(mirror_geom_action)
+        scale_geom_action = QAction("Scale...", self)
+        scale_geom_action.triggered.connect(lambda: self._transform_geometry('scale'))
+        geom_transform_menu.addAction(scale_geom_action)
+        geom_transform_menu.addSeparator()
+        copy_geom_action = QAction("Copy...", self)
+        copy_geom_action.triggered.connect(self._copy_geometry)
+        geom_transform_menu.addAction(copy_geom_action)
+
+        geom_ops_menu = geom_menu.addMenu("Operations")
+        split_curve_action = QAction("Split Curve...", self)
+        split_curve_action.triggered.connect(self._split_curve)
+        geom_ops_menu.addAction(split_curve_action)
+        offset_curve_action = QAction("Offset Curve...", self)
+        offset_curve_action.triggered.connect(self._offset_curve)
+        geom_ops_menu.addAction(offset_curve_action)
+        project_pt_action = QAction("Project Point to Curve...", self)
+        project_pt_action.triggered.connect(self._project_point_to_curve)
+        geom_ops_menu.addAction(project_pt_action)
+        fillet_action = QAction("Fillet...", self)
+        fillet_action.triggered.connect(self._fillet_curves)
+        geom_ops_menu.addAction(fillet_action)
+
+        delete_menu = menu_bar.addMenu("&Delete")
+        delete_nodes_action = QAction("Nodes...", self)
+        delete_nodes_action.triggered.connect(self._delete_nodes)
+        delete_menu.addAction(delete_nodes_action)
+        delete_elements_action = QAction("Elements...", self)
+        delete_elements_action.triggered.connect(self._delete_elements)
+        delete_menu.addAction(delete_elements_action)
+        delete_coords_action = QAction("Coordinate Systems...", self)
+        delete_coords_action.triggered.connect(self._delete_coord_system_menu)
+        delete_menu.addAction(delete_coords_action)
+        delete_menu.addSeparator()
+        delete_geom_pts_action = QAction("Geometry Points...", self)
+        delete_geom_pts_action.triggered.connect(self._delete_geometry_points)
+        delete_menu.addAction(delete_geom_pts_action)
+        delete_geom_curves_action = QAction("Geometry Curves...", self)
+        delete_geom_curves_action.triggered.connect(self._delete_geometry_curves)
+        delete_menu.addAction(delete_geom_curves_action)
+        delete_geom_surfs_action = QAction("Geometry Surfaces...", self)
+        delete_geom_surfs_action.triggered.connect(self._delete_geometry_surfaces)
+        delete_menu.addAction(delete_geom_surfs_action)
+
+        list_menu = menu_bar.addMenu("&List")
+        list_node_action = QAction("Node Information...", self)
+        list_node_action.triggered.connect(self._list_node_info)
+        list_menu.addAction(list_node_action)
+        list_element_action = QAction("Element Information...", self)
+        list_element_action.triggered.connect(self._list_element_info)
+        list_menu.addAction(list_element_action)
+        list_menu.addSeparator()
+        model_summary_action = QAction("Model Summary...", self)
+        model_summary_action.triggered.connect(self._show_model_summary)
+        list_menu.addAction(model_summary_action)
+        mass_summary_action = QAction("Mass && CG Summary...", self)
+        mass_summary_action.triggered.connect(self._show_mass_summary)
+        list_menu.addAction(mass_summary_action)
+
+        analysis_menu = menu_bar.addMenu("&Analysis")
+        analysis_set_mgr_action = QAction("Analysis Set Manager...", self)
+        analysis_set_mgr_action.triggered.connect(self._open_analysis_set_manager)
+        analysis_menu.addAction(analysis_set_mgr_action)
+        analysis_menu.addSeparator()
+        sol_menu = analysis_menu.addMenu("Solution Type")
+        sol_none_action = QAction("None (Punch)", self, checkable=True, checked=True)
+        sol_101_action = QAction("SOL 101 - Linear Statics", self, checkable=True)
+        sol_103_action = QAction("SOL 103 - Normal Modes", self, checkable=True)
+        sol_105_action = QAction("SOL 105 - Buckling", self, checkable=True)
+        sol_106_action = QAction("SOL 106 - Nonlinear Static", self, checkable=True)
+        sol_group = QActionGroup(self)
+        for action in [sol_none_action, sol_101_action, sol_103_action, sol_105_action, sol_106_action]:
+            sol_group.addAction(action)
+            sol_menu.addAction(action)
+        sol_none_action.triggered.connect(lambda: self._set_sol_type(None))
+        sol_101_action.triggered.connect(lambda: self._set_sol_type(101))
+        sol_103_action.triggered.connect(lambda: self._set_sol_type(103))
+        sol_105_action.triggered.connect(lambda: self._set_sol_type(105))
+        sol_106_action.triggered.connect(lambda: self._set_sol_type(106))
+        analysis_menu.addSeparator()
+        subcase_action = QAction("Subcases (Case Control)...", self)
+        subcase_action.triggered.connect(self._open_subcase_editor)
+        analysis_menu.addAction(subcase_action)
+        eigrl_action = QAction("EIGRL (Eigenvalue Extraction)...", self)
+        eigrl_action.triggered.connect(self._create_eigrl)
+        analysis_menu.addAction(eigrl_action)
+        analysis_menu.addSeparator()
+        output_req_action = QAction("Output Requests...", self)
+        output_req_action.triggered.connect(self._open_output_requests_dialog)
+        analysis_menu.addAction(output_req_action)
+
+        tools_menu = menu_bar.addMenu("&Tools")
+        fuselage_gen_action = QAction("Fuselage Generator...", self)
+        fuselage_gen_action.triggered.connect(self._open_fuselage_generator)
+        tools_menu.addAction(fuselage_gen_action)
+        tools_menu.addSeparator()
+        coincident_node_action = QAction("Coincident Node Checker...", self)
+        coincident_node_action.triggered.connect(self._open_coincident_node_checker)
+        tools_menu.addAction(coincident_node_action)
+        duplicate_elem_action = QAction("Duplicate Element Checker...", self)
+        duplicate_elem_action.triggered.connect(self._open_duplicate_element_checker)
+        tools_menu.addAction(duplicate_elem_action)
+        tools_menu.addSeparator()
+        measure_dist_action = QAction("Measure Distance...", self)
+        measure_dist_action.triggered.connect(self._measure_distance)
+        tools_menu.addAction(measure_dist_action)
+        measure_angle_action = QAction("Measure Angle...", self)
+        measure_angle_action.triggered.connect(self._measure_angle)
+        tools_menu.addAction(measure_angle_action)
+        tools_menu.addSeparator()
+        find_replace_action = QAction("Find/Replace Property/Material...", self)
+        find_replace_action.triggered.connect(self._open_find_replace_dialog)
+        tools_menu.addAction(find_replace_action)
+        renumber_action = QAction("Renumber Nodes/Elements...", self)
+        renumber_action.triggered.connect(self._open_renumber_dialog)
+        tools_menu.addAction(renumber_action)
+        tools_menu.addSeparator()
+        fbd_action = QAction("Free Body Diagram...", self)
+        fbd_action.triggered.connect(self._show_free_body_diagram)
+        tools_menu.addAction(fbd_action)
+        tools_menu.addSeparator()
+        model_check_menu = tools_menu.addMenu("Model Check")
+        mass_props_action = QAction("Mass Properties...", self)
+        mass_props_action.triggered.connect(self._show_mass_properties)
+        model_check_menu.addAction(mass_props_action)
+        free_edge_action = QAction("Free Edge Report...", self)
+        free_edge_action.triggered.connect(self._show_free_edge_report)
+        model_check_menu.addAction(free_edge_action)
+        quality_summary_action = QAction("Quality Summary...", self)
+        quality_summary_action.triggered.connect(self._show_quality_summary)
+        model_check_menu.addAction(quality_summary_action)
+        orphan_check_action = QAction("Orphan Check...", self)
+        orphan_check_action.triggered.connect(self._show_orphan_check)
+        model_check_menu.addAction(orphan_check_action)
+        model_check_menu.addSeparator()
+        orient_normals_action2 = QAction("Orient Normals (Auto)...", self)
+        orient_normals_action2.triggered.connect(self._auto_orient_normals)
+        model_check_menu.addAction(orient_normals_action2)
+
+        groups_menu = menu_bar.addMenu("&Groups")
+        groups_select_action = QAction("Select Entities...", self)
+        groups_select_action.triggered.connect(self._open_find_entity_tool)
+        groups_menu.addAction(groups_select_action)
+        groups_menu.addSeparator()
+        create_group_action = QAction("Create Group...", self)
+        create_group_action.triggered.connect(self._create_group)
+        groups_menu.addAction(create_group_action)
+        delete_group_action = QAction("Delete Group", self)
+        delete_group_action.triggered.connect(self._delete_group)
+        groups_menu.addAction(delete_group_action)
+        add_to_group_action = QAction("Add Selected to Group", self)
+        add_to_group_action.triggered.connect(self._add_selected_to_group)
+        groups_menu.addAction(add_to_group_action)
+        isolate_group_action = QAction("Isolate Group", self)
+        isolate_group_action.triggered.connect(self._isolate_group)
+        groups_menu.addAction(isolate_group_action)
+        groups_menu.addSeparator()
+        group_by_prop_action = QAction("Group by Property", self)
+        group_by_prop_action.triggered.connect(self._group_by_property)
+        groups_menu.addAction(group_by_prop_action)
+
+        view_menu = menu_bar.addMenu("&View")
+
+        # --- NEW: Add the "Find Entities" tool to the View menu ---
+        find_entities_action = QAction("Find Entities...", self)
+        find_entities_action.triggered.connect(self._open_find_entity_tool)
+        view_menu.addAction(find_entities_action)
+        view_menu.addSeparator()
+
+        self.show_origin_action = QAction("Show Origin", self, checkable=True)
+        self.show_origin_action.toggled.connect(self._toggle_origin)
+        view_menu.addAction(self.show_origin_action)
+        self.shading_action = QAction("Shading", self, checkable=True, checked=True)
+        self.shading_action.toggled.connect(self._toggle_shading)
+        view_menu.addAction(self.shading_action)
+        view_menu.addSeparator()
+        views_menu = view_menu.addMenu("Standard Views")
+        view_top = QAction("Top (+Z)", self); view_top.triggered.connect(lambda: self._set_standard_view('top')); views_menu.addAction(view_top)
+        view_bottom = QAction("Bottom (-Z)", self); view_bottom.triggered.connect(lambda: self._set_standard_view('bottom')); views_menu.addAction(view_bottom)
+        view_front = QAction("Front (+X)", self); view_front.triggered.connect(lambda: self._set_standard_view('front')); views_menu.addAction(view_front)
+        view_back = QAction("Back (-X)", self); view_back.triggered.connect(lambda: self._set_standard_view('back')); views_menu.addAction(view_back)
+        view_right = QAction("Right (+Y)", self); view_right.triggered.connect(lambda: self._set_standard_view('right')); views_menu.addAction(view_right)
+        view_left = QAction("Left (-Y)", self); view_left.triggered.connect(lambda: self._set_standard_view('left')); views_menu.addAction(view_left)
+        camera_menu = view_menu.addMenu("Camera")
+        self.perspective_action = QAction("Perspective View", self, checkable=True, checked=True)
+        self.perspective_action.toggled.connect(self._toggle_perspective_view)
+        camera_menu.addAction(self.perspective_action)
+        zoom_menu = view_menu.addMenu("Zoom")
+        zoom_model_action = QAction("Zoom to Model", self)
+        zoom_model_action.triggered.connect(self._zoom_to_model)
+        zoom_menu.addAction(zoom_model_action)
+        zoom_all_action = QAction("Zoom to All", self)
+        zoom_all_action.triggered.connect(self._zoom_to_all)
+        zoom_menu.addAction(zoom_all_action)
+        style_menu = view_menu.addMenu("Style")
+        style_group = QActionGroup(self)
+        self.style_wire_action = QAction("Wireframe", self, checkable=True); self.style_wire_action.triggered.connect(lambda: self._set_render_style("wireframe")); style_group.addAction(self.style_wire_action)
+        self.style_surf_action = QAction("Surface with Edges", self, checkable=True, checked=True); self.style_surf_action.triggered.connect(lambda: self._set_render_style("surface")); style_group.addAction(self.style_surf_action)
+        style_menu.addAction(self.style_wire_action); style_menu.addAction(self.style_surf_action)
+        color_menu = view_menu.addMenu("Color By")
+        color_group = QActionGroup(self)
+        color_type = QAction("Element Type", self, checkable=True); color_type.triggered.connect(lambda: self._set_coloring_mode("type")); color_group.addAction(color_type)
+        color_prop = QAction("Property ID", self, checkable=True, checked=True); color_prop.triggered.connect(lambda: self._set_coloring_mode("property")); color_group.addAction(color_prop)
+        color_qual = QAction("Quality", self, checkable=True); color_qual.triggered.connect(lambda: self._set_coloring_mode("quality")); color_group.addAction(color_qual)
+        color_results = QAction("Results", self, checkable=True); color_results.triggered.connect(lambda: self._set_coloring_mode("results")); color_group.addAction(color_results)
+        color_menu.addAction(color_type); color_menu.addAction(color_prop); color_menu.addAction(color_qual); color_menu.addAction(color_results)
+        self.transparent_shells_action = QAction("Transparent Shells", self, checkable=True)
+        self.transparent_shells_action.toggled.connect(self._toggle_shell_transparency)
+        view_menu.addAction(self.transparent_shells_action)
+        self.show_normals_action = QAction("Show Element Normals", self, checkable=True)
+        self.show_normals_action.toggled.connect(self._toggle_element_normals_visibility)
+        view_menu.addAction(self.show_normals_action)
+        self.show_free_edges_action = QAction("Show Free Edges", self, checkable=True)
+        self.show_free_edges_action.toggled.connect(self._toggle_free_edges_visibility)
+        view_menu.addAction(self.show_free_edges_action)
+        view_menu.addSeparator()
+        display_settings_action = QAction("Display Settings...", self)
+        display_settings_action.triggered.connect(self._open_display_settings)
+        view_menu.addAction(display_settings_action)
+        capture_screenshot_action = QAction("Capture Screenshot...", self)
+        capture_screenshot_action.triggered.connect(self._capture_screenshot)
+        view_menu.addAction(capture_screenshot_action)
+        self.presentation_action = QAction("Presentation Mode", self, checkable=True)
+        self.presentation_action.setShortcut("F11")
+        self.presentation_action.toggled.connect(self._toggle_presentation_mode)
+        view_menu.addAction(self.presentation_action)
+        view_menu.addSeparator()
+        edit_colors_action = QAction("Edit Colors...", self)
+        edit_colors_action.triggered.connect(self._open_color_manager)
+        view_menu.addAction(edit_colors_action)
+
+        help_menu = menu_bar.addMenu("&Help")
+        about_action = QAction("&About...", self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_menu.addAction(about_action)
+        license_action = QAction("&License...", self)
+        license_action.triggered.connect(self._show_license_dialog)
+        help_menu.addAction(license_action)
+
+        self.theme_button = QPushButton("Switch to Light Mode")
+        self.theme_button.setFlat(True)
+        menu_bar.setCornerWidget(self.theme_button, QtCore.Qt.TopRightCorner)
+
+
+
+
+# --- NEW: Handler for the "Save BDF File..." menu action ---
+    def _save_file_dialog(self):
+        if not self.current_generator:
+            self._update_status("No model to save.", is_error=True)
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(self, "Save Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")
+        if not filepath:
+            self._update_status("Save cancelled.")
+            return
+        
+        try:
+            self._apply_case_control()
+            self.current_generator.model.write_bdf(filepath, size=8, is_double=False)
+            self._update_status(f"Model saved to {os.path.basename(filepath)}")
+        except Exception as e:
+            self._update_status(f"File save failed: {e}", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not save file: {e}")
+
+    # --- NEW: Handler for the "License..." menu action ---
+    def _show_license_dialog(self):
+        license_text = """
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+   1. Definitions.
+
+      "License" shall mean the terms and conditions for use, reproduction,
+      and distribution as defined by Sections 1 through 9 of this document.
+
+      "Licensor" shall mean the copyright owner or entity authorized by
+      the copyright owner that is granting the License.
+
+      "Legal Entity" shall mean the union of the acting entity and all
+      other entities that control, are controlled by, or are under common
+      control with that entity. For the purposes of this definition,
+      "control" means (i) the power, direct or indirect, to cause the
+      direction or management of such entity, whether by contract or
+      otherwise, or (ii) ownership of fifty percent (50%) or more of the
+      outstanding shares, or (iii) beneficial ownership of such entity.
+
+      "You" (or "Your") shall mean an individual or Legal Entity
+      exercising permissions granted by this License.
+
+      "Source" form shall mean the preferred form for making modifications,
+      including but not limited to software source code, documentation
+      source, and configuration files.
+
+      "Object" form shall mean any form resulting from mechanical
+      transformation or translation of a Source form, including but
+      not limited to compiled object code, generated documentation,
+      and conversions to other media types.
+
+      "Work" shall mean the work of authorship, whether in Source or
+      Object form, made available under the License, as indicated by a
+      copyright notice that is included in or attached to the work
+      (an example is provided in the Appendix below).
+
+      "Derivative Works" shall mean any work, whether in Source or Object
+      form, that is based on (or derived from) the Work and for which the
+      editorial revisions, annotations, elaborations, or other modifications
+      represent, as a whole, an original work of authorship. For the purposes
+      of this License, Derivative Works shall not include works that remain
+      separable from, or merely link (or bind by name) to the interfaces of,
+      the Work and Derivative Works thereof.
+
+      "Contribution" shall mean any work of authorship, including
+      the original version of the Work and any modifications or additions
+      to that Work or Derivative Works thereof, that is intentionally
+      submitted to Licensor for inclusion in the Work by the copyright owner
+      or by an individual or Legal Entity authorized to submit on behalf of
+      the copyright owner. For the purposes of this definition, "submitted"
+      means any form of electronic, verbal, or written communication sent
+
+      to the Licensor or its representatives, including but not limited to
+      communication on electronic mailing lists, source code control systems,
+      and issue tracking systems that are managed by, or on behalf of, the
+      Licensor for the purpose of discussing and improving the Work, but
+      excluding communication that is conspicuously marked or otherwise
+      designated in writing by the copyright owner as "Not a Contribution."
+
+      "Contributor" shall mean Licensor and any individual or Legal Entity
+      on behalf of whom a Contribution has been received by Licensor and
+      subsequently incorporated within the Work.
+
+   2. Grant of Copyright License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      copyright license to reproduce, prepare Derivative Works of,
+      publicly display, publicly perform, sublicense, and distribute the
+      Work and such Derivative Works in Source or Object form.
+
+   3. Grant of Patent License. Subject to the terms and conditions of
+      this License, each Contributor hereby grants to You a perpetual,
+      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+      (except as stated in this section) patent license to make, have made,
+      use, offer to sell, sell, import, and otherwise transfer the Work,
+      where such license applies only to those patent claims licensable
+      by such Contributor that are necessarily infringed by their
+      Contribution(s) alone or by combination of their Contribution(s)
+      with the Work to which such Contribution(s) was submitted. If You
+      institute patent litigation against any entity (including a
+      cross-claim or counterclaim in a lawsuit) alleging that the Work
+      or a Contribution incorporated within the Work constitutes direct
+      or contributory patent infringement, then any patent licenses
+      granted to You under this License for that Work shall terminate
+      as of the date such litigation is filed.
+
+   4. Redistribution. You may reproduce and distribute copies of the
+      Work or Derivative Works thereof in any medium, with or without
+      modifications, and in Source or Object form, provided that You
+      meet the following conditions:
+
+      (a) You must give any other recipients of the Work or
+          Derivative Works a copy of this License; and
+
+      (b) You must cause any modified files to carry prominent notices
+          stating that You changed the files; and
+
+      (c) You must retain, in the Source form of any Derivative Works
+          that You distribute, all copyright, patent, trademark, and
+          attribution notices from the Source form of the Work,
+          excluding those notices that do not pertain to any part of
+          the Derivative Works; and
+
+      (d) If the Work includes a "NOTICE" text file as part of its
+          distribution, then any Derivative Works that You distribute must
+          include a readable copy of the attribution notices contained
+          within such NOTICE file, excluding those notices that do not
+          pertain to any part of the Derivative Works, in at least one
+          of the following places: within a NOTICE text file distributed
+          as part of the Derivative Works; within the Source form or
+          documentation, if provided along with the Derivative Works; or,
+          within a display generated by the Derivative Works, if and
+          wherever such third-party notices normally appear. The contents
+          of the NOTICE file are for informational purposes only and
+          do not modify the License. You may add Your own attribution
+          notices within Derivative Works that You distribute, alongside
+          or as an addendum to the NOTICE text from the Work, provided
+          that such additional attribution notices cannot be construed
+          as modifying the License.
+
+      You may add Your own copyright statement to Your modifications and
+      may provide additional or different license terms and conditions
+      for use, reproduction, or distribution of Your modifications, or
+      for any such Derivative Works as a whole, provided Your use,
+      reproduction, and distribution of the Work otherwise complies with
+      the conditions stated in this License.
+
+   5. Submission of Contributions. Unless You explicitly state otherwise,
+      any Contribution intentionally submitted for inclusion in the Work
+      by You to the Licensor shall be under the terms and conditions of
+      this License, without any additional terms or conditions.
+      Notwithstanding the above, nothing herein shall supersede or modify
+      the terms of any separate license agreement you may have executed
+      with Licensor regarding such Contributions.
+
+   6. Trademarks. This License does not grant permission to use the trade
+      names, trademarks, service marks, or product names of the Licensor,
+      except as required for reasonable and customary use in describing the
+      origin of the Work and reproducing the content of the NOTICE file.
+
+   7. Disclaimer of Warranty. Unless required by applicable law or
+      agreed to in writing, Licensor provides the Work (and each
+      Contributor provides its Contributions) on an "AS IS" BASIS,
+      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+      implied, including, without limitation, any warranties or conditions
+      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
+      PARTICULAR PURPOSE. You are solely responsible for determining the
+      appropriateness of using or redistributing the Work and assume any
+      risks associated with Your exercise of permissions under this License.
+
+   8. Limitation of Liability. In no event and under no legal theory,
+      whether in tort (including negligence), contract, or otherwise,
+      unless required by applicable law (such as deliberate and grossly
+      negligent acts) or agreed to in writing, shall any Contributor be
+      liable to You for damages, including any direct, indirect, special,
+      incidental, or consequential damages of any character arising as a
+      result of this License or out of the use or inability to use the
+      Work (including but not limited to damages for loss of goodwill,
+      work stoppage, computer failure or malfunction, or any and all
+      other commercial damages or losses), even if such Contributor
+      has been advised of the possibility of such damages.
+
+   9. Accepting Warranty or Additional Liability. While redistributing
+      the Work or Derivative Works thereof, You may choose to offer,
+      and charge a fee for, acceptance of support, warranty, indemnity,
+      or other liability obligations and/or rights consistent with this
+      License. However, in accepting such obligations, You may act only
+      on Your own behalf and on Your sole responsibility, not on behalf
+      of any other Contributor, and only if You agree to indemnify,
+      defend, and hold each Contributor harmless for any liability
+      incurred by, or claims asserted against, such Contributor by reason
+      of your accepting any such warranty or additional liability.
+
+   END OF TERMS AND CONDITIONS
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("License Information")
+        dialog.setMinimumSize(600, 500)
+        layout = QVBoxLayout(dialog)
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setText(license_text)
+        text_edit.setFontFamily("monospace")
+        layout.addWidget(text_edit)
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
+        layout.addWidget(button_box)
+        dialog.exec()
+
+    # --- BUG FIX: Implement the missing method to add material cards ---
+    def _add_material_card_from_params(self, params):
+        """Adds a MAT1, MAT8, or MAT9 card to the model from a parameters dict."""
+        params_copy = params.copy()
+        mat_type = params_copy.pop('type')
+        mid = params_copy.pop('mid')
+        comment = params_copy.pop('comment')
+        model = self.current_generator.model
+
+        try:
+            if mat_type == 'MAT1':
+                model.add_mat1(mid, params_copy['E'], params_copy['G'], params_copy['nu'],
+                               rho=params_copy.get('rho', 0.0), a=params_copy.get('a', 0.0),
+                               tref=params_copy.get('tref', 0.0), ge=params_copy.get('ge', 0.0), comment=comment)
+            elif mat_type == 'MAT8':
+                model.add_mat8(mid, params_copy['E1'], params_copy['E2'], params_copy['nu12'],
+                               g12=params_copy.get('G12', 0.0), g1z=params_copy.get('G1z', 0.0), g2z=params_copy.get('G2z', 0.0),
+                               rho=params_copy.get('rho', 0.0), a1=params_copy.get('a1', 0.0), a2=params_copy.get('a2', 0.0),
+                               tref=params_copy.get('tref', 0.0), comment=comment)
+            elif mat_type == 'MAT9':
+                g_values = {key.lower(): val for key, val in params_copy.items() if key.startswith('G')}
+                model.add_mat9(mid,
+                               rho=params_copy.get('rho', 0.0), 
+                               tref=params_copy.get('tref', 0.0),
+                               comment=comment, **g_values)
+        except KeyError as e:
+            QMessageBox.warning(self, "Creation Error", f"Could not create material. Missing parameter: {e}")
+
+    def _edit_material(self, mid, new_params):
+        """Edit a material via undo-able command. Called by MaterialEditorDialog."""
+        cmd = EditMaterialCommand(mid, new_params)
+        self.command_manager.execute(cmd, self.current_generator.model)
+
+    def _edit_property(self, pid, new_params):
+        """Edit a property via undo-able command. Called by PropertyEditorDialog."""
+        cmd = EditPropertyCommand(pid, new_params)
+        self.command_manager.execute(cmd, self.current_generator.model)
+
+    def _open_coincident_node_checker(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            self._update_status("No model loaded to check.", is_error=True)
+            QMessageBox.warning(self, "No Model", "Please load a model before checking for coincident nodes.")
+            return
+
+        dialog = CoincidentNodeDialog(main_window=self, parent=self)
+        
+        # The dialog's exec() method is blocking. Code will only continue here after the
+        # user has clicked "Merge Selected" (which calls accept()) or "Close".
+        if dialog.exec() == QDialog.Accepted:
+            groups_to_merge = dialog.get_groups_to_merge()
+
+            if not groups_to_merge:
+                self._update_status("Merge cancelled: No groups were selected.", is_error=True)
+                return
+
+            # Wrap the merge in a command for undo/redo
+            cmd = MergeNodesCommand(groups_to_merge)
+            self.command_manager.execute(cmd, self.current_generator.model)
+
+            merged_count = len(cmd._deleted_nodes)
+            group_count = len(groups_to_merge)
+            QMessageBox.information(self, "Merge Complete",
+                                    f"Successfully merged {merged_count} node(s) from {group_count} group(s).")
+            
+            self._update_status(f"Merged {merged_count} coincident nodes.")
+            
+            # Refresh the entire viewer and model tree to reflect the changes
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_duplicate_element_checker(self):
+        if not self.current_generator or not self.current_generator.model.elements:
+            self._update_status("No model loaded to check.", is_error=True)
+            QMessageBox.warning(self, "No Model", "Please load a model before checking for duplicate elements.")
+            return
+
+        dialog = DuplicateElementDialog(main_window=self, parent=self)
+
+        if dialog.exec() == QDialog.Accepted:
+            eids_to_delete = dialog.get_eids_to_delete()
+
+            if not eids_to_delete:
+                self._update_status("Delete cancelled: No duplicates were selected.", is_error=True)
+                return
+
+            cmd = DeleteElementsCommand(eids_to_delete)
+            self.command_manager.execute(cmd, self.current_generator.model)
+
+            QMessageBox.information(self, "Delete Complete",
+                                    f"Successfully deleted {len(eids_to_delete)} duplicate element(s).")
+
+            self._update_status(f"Deleted {len(eids_to_delete)} duplicate elements.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+    # ─── Measurement Tools ───────────────────────────────────────────────
+
+    def _activate_multi_node_picker(self, count, callback):
+        """Activates a sequential multi-node picker.
+
+        Args:
+            count: Number of nodes to pick.
+            callback: Function to call with list of picked node IDs.
+        """
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            return
+        self._measurement_picks = []
+        self._measurement_pick_count = count
+        self._measurement_callback = callback
+        self.picking_target_callback = self._on_measurement_node_picked
+        self._set_picking_mode("Node", True)
+        self._update_status(f"Pick node 1 of {count}...")
+
+    def _on_measurement_node_picked(self, nid_str):
+        """Called by the interactor when a node is picked during measurement."""
+        nid = int(nid_str)
+        self._measurement_picks.append(nid)
+        picked_so_far = len(self._measurement_picks)
+
+        # Highlight all picked nodes so far
+        self._highlight_entities('Node', self._measurement_picks)
+
+        if picked_so_far < self._measurement_pick_count:
+            # Need more picks — re-arm on next event loop tick
+            # (interactor.py lines 89-90 auto-disable picking after each pick)
+            remaining = self._measurement_pick_count - picked_so_far
+            self._update_status(f"Pick node {picked_so_far + 1} of {self._measurement_pick_count}...")
+            QtCore.QTimer.singleShot(0, self._rearm_measurement_picker)
+        else:
+            # All picks collected — invoke the callback
+            callback = self._measurement_callback
+            self._measurement_callback = None
+            self._measurement_pick_count = 0
+            callback(list(self._measurement_picks))
+            self._measurement_picks = []
+
+    def _rearm_measurement_picker(self):
+        """Re-enters picking mode for the next measurement node pick."""
+        self.picking_target_callback = self._on_measurement_node_picked
+        self._set_picking_mode("Node", True)
+
+    def _measure_distance(self):
+        """Activates 2-node distance measurement."""
+        self._activate_multi_node_picker(2, self._compute_distance)
+
+    def _compute_distance(self, nids):
+        """Computes and displays distance between two picked nodes."""
+        model = self.current_generator.model
+        p1 = np.array(model.nodes[nids[0]].get_position())
+        p2 = np.array(model.nodes[nids[1]].get_position())
+        dx, dy, dz = p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]
+        dist = np.linalg.norm(p2 - p1)
+
+        # Draw a yellow line between the two points
+        line = pv.Line(p1, p2)
+        self.plotter.add_mesh(line, color='yellow', line_width=3,
+                              name='measurement_line', reset_camera=False)
+
+        sep = "-" * 30
+        text = "\n".join([
+            sep,
+            f"  Node A:    {nids[0]}",
+            f"  Node B:    {nids[1]}",
+            sep,
+            f"  Distance:  {dist:.6f}",
+            sep,
+            f"  dX:        {dx:+.6f}",
+            f"  dY:        {dy:+.6f}",
+            f"  dZ:        {dz:+.6f}",
+            sep,
+        ])
+        self._update_status(f"Distance: {dist:.6f}  (Node {nids[0]} to Node {nids[1]})")
+        InfoDialog("Measure Distance", text, self).exec()
+
+    def _measure_angle(self):
+        """Activates 3-node angle measurement (angle at middle node)."""
+        self._activate_multi_node_picker(3, self._compute_angle)
+
+    def _compute_angle(self, nids):
+        """Computes and displays the angle at the middle node (node 2)."""
+        model = self.current_generator.model
+        p1 = np.array(model.nodes[nids[0]].get_position())
+        p2 = np.array(model.nodes[nids[1]].get_position())  # vertex
+        p3 = np.array(model.nodes[nids[2]].get_position())
+
+        v1 = p1 - p2
+        v2 = p3 - p2
+        len1 = np.linalg.norm(v1)
+        len2 = np.linalg.norm(v2)
+
+        if len1 < 1e-12 or len2 < 1e-12:
+            self._update_status("Cannot compute angle: two nodes are coincident.", is_error=True)
+            return
+
+        cos_angle = np.clip(np.dot(v1, v2) / (len1 * len2), -1.0, 1.0)
+        angle_rad = np.arccos(cos_angle)
+        angle_deg = np.degrees(angle_rad)
+
+        # Draw lines from vertex to endpoints
+        line1 = pv.Line(p2, p1)
+        line2 = pv.Line(p2, p3)
+        merged = line1 + line2
+        self.plotter.add_mesh(merged, color='yellow', line_width=3,
+                              name='measurement_line', reset_camera=False)
+
+        sep = "-" * 30
+        text = "\n".join([
+            sep,
+            f"  Node A:     {nids[0]}",
+            f"  Vertex B:   {nids[1]}",
+            f"  Node C:     {nids[2]}",
+            sep,
+            f"  Angle:      {angle_deg:.4f} deg",
+            sep,
+        ])
+        self._update_status(f"Angle at Node {nids[1]}: {angle_deg:.4f} deg")
+        InfoDialog("Measure Angle", text, self).exec()
+
+
+     # --- NEW: Handler to open the Element Normals Flip tool (Phase 4) ---
+
+    def _open_element_flip_tool(self):
+        """Launches the entity selection dialog to choose shell elements to flip."""
+        if self.selection_bar.isVisible():
+            return
+
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model contains no elements to flip.")
+            return
+
+        all_shell_eids = [
+            eid for eid, elem in self.current_generator.model.elements.items()
+            if elem.type in ['CQUAD4', 'CTRIA3', 'CMEMBRAN']
+        ]
+        if not all_shell_eids:
+            QMessageBox.information(self, "No Shells", "No shell elements found in the model.")
+            return
+
+        self._start_selection('Element', all_shell_eids,
+                              self._on_flip_elements_accept,
+                              self._build_select_by_data())
+
+
+
+
+    def _on_flip_elements_accept(self):
+        selected_eids = self.selection_bar.get_selected_ids()
+        normals_were_visible = self.show_normals_check.isChecked()
+        self._end_selection_mode()
+
+        # --- The filtering logic that was here is now removed ---
+
+        if not selected_eids:
+            self._update_status("Flip operation cancelled: No elements selected.")
+            return
+
+        # Wrap the flip in a command for undo/redo
+        cmd = FlipNormalsCommand(selected_eids)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        # Count how many were actually flipped (filter to shells)
+        flipped_count = sum(1 for eid in selected_eids
+                           if eid in self.current_generator.model.elements
+                           and self.current_generator.model.elements[eid].type in ('CQUAD4', 'CTRIA3', 'CMEMBRAN'))
+
+        # The confirmation message will now be correct because the flipped_count is correct.
+        if flipped_count > 0:
+            QMessageBox.information(self, "Operation Complete", f"Successfully flipped normals for {flipped_count} of {len(selected_eids)} selected element(s).")
+            self._update_status(f"Flipped normals for {flipped_count} elements.")
+        else:
+            QMessageBox.warning(self, "No Valid Elements", f"You selected {len(selected_eids)} element(s), but none were flippable plates.")
+            self._update_status("Flip operation cancelled: No valid shell elements were selected.")
+
+
+        # Viewer update logic remains the same
+        self._update_viewer(self.current_generator, reset_camera=False)
+        if normals_were_visible:
+            self._toggle_element_normals_visibility()
+
+    def _auto_orient_normals(self):
+        """Run BFS auto-orient on all shell elements for consistent normals."""
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model has no elements.")
+            return
+
+        gen = self.current_generator
+        shell_count = sum(1 for e in gen.model.elements.values()
+                         if e.type in ('CQUAD4', 'CTRIA3', 'CMEMBRAN'))
+        if shell_count == 0:
+            QMessageBox.information(self, "No Shells",
+                                    "No shell elements found in the model.")
+            return
+
+        to_flip = gen.compute_auto_orient_flips()
+        if not to_flip:
+            QMessageBox.information(self, "Already Consistent",
+                                    f"All {shell_count} shell element normals "
+                                    "are already consistently oriented.")
+            return
+
+        normals_were_visible = self.show_normals_check.isChecked()
+
+        cmd = AutoOrientNormalsCommand(list(to_flip))
+        self.command_manager.execute(cmd, gen.model)
+
+        QMessageBox.information(
+            self, "Normals Oriented",
+            f"Flipped {len(to_flip)} of {shell_count} shell elements "
+            "for consistent normal orientation.")
+        self._update_status(
+            f"Auto-oriented normals: {len(to_flip)} elements flipped.")
+
+        self._update_viewer(gen, reset_camera=False)
+        if normals_were_visible:
+            self._toggle_element_normals_visibility()
+
+    def _on_advanced_selection(self, mode, angle):
+        """Handle Select Adjacent / Connected / Grow / Shrink from selection dialog."""
+        dialog = self.active_selection_dialog
+        if not dialog or dialog.entity_type != 'Element':
+            return
+        if not self.current_generator:
+            return
+        seed_eids = list(dialog.selected_ids)
+        if not seed_eids:
+            self._update_status("Select at least one element first.")
+            return
+        gen = self.current_generator
+        if mode == 'adjacent':
+            result = gen.select_adjacent_elements(seed_eids, angle)
+            dialog.add_selection(result)
+            self._update_status(
+                f"Adjacent selection: {len(result)} elements (angle ≤ {angle:.0f}°)")
+        elif mode == 'connected':
+            result = gen.select_connected_elements(seed_eids)
+            dialog.add_selection(result)
+            self._update_status(
+                f"Connected selection: {len(result)} elements")
+        elif mode == 'grow':
+            result = gen.grow_element_selection(seed_eids, angle)
+            dialog.replace_selection(result)
+            added = len(result) - len(seed_eids)
+            self._update_status(
+                f"Grow selection: {len(result)} elements (+{max(0, added)}, angle ≤ {angle:.0f}°)")
+        elif mode == 'shrink':
+            result = gen.shrink_element_selection(seed_eids)
+            dialog.replace_selection(result)
+            removed = len(seed_eids) - len(result)
+            self._update_status(
+                f"Shrink selection: {len(result)} elements (-{max(0, removed)})")
+
+    def _on_selection_mode_change(self, mode):
+        """Handle selection mode change (box/polygon/circle) from dialog."""
+        self._pick_selection_mode = mode  # Always store for next picking session
+        style = self.plotter.interactor.GetInteractorStyle()
+        if isinstance(style, ClickAndDragInteractor):
+            style.set_selection_mode(mode)
+        else:
+            self._update_status(f"Pick mode: {mode.capitalize()}")
+
+    def _on_previous_selection(self, entity_type):
+        """Supply previous selection to the active selection dialog."""
+        dialog = self.active_selection_dialog
+        if not dialog:
+            return
+        if entity_type == 'Node':
+            prev = self._previous_node_selection
+        elif entity_type == 'Element':
+            prev = self._previous_element_selection
+        else:
+            prev = set()
+
+        if not prev:
+            self._update_status("No previous selection available.")
+            return
+        dialog.add_selection(prev)
+        self._update_status(f"Restored {len(prev)} previous {entity_type.lower()}(s)")
+
+    # --- Model Check handlers ---
+
+    def _show_mass_properties(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        mass_data = self.current_generator.calculate_mass_summary()
+        dlg = MassPropertiesReportDialog(mass_data, self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dlg.show()
+
+    def _show_free_edge_report(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        free_edges = self.current_generator.find_free_edges()
+        node_coords = {nid: node.xyz for nid, node
+                       in self.current_generator.model.nodes.items()}
+        dlg = FreeEdgeReportDialog(free_edges, node_coords, self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+
+        def zoom_to(n1, n2):
+            try:
+                p1 = np.array(node_coords[n1])
+                p2 = np.array(node_coords[n2])
+                mid = (p1 + p2) / 2.0
+                length = float(np.linalg.norm(p2 - p1))
+                radius = max(length * 3, 1.0)
+                self.plotter.camera.focal_point = mid.tolist()
+                self.plotter.camera.position = (mid + np.array([0, 0, radius])).tolist()
+                self.plotter.render()
+            except (KeyError, TypeError):
+                pass
+
+        dlg.zoom_to_edge = zoom_to
+        dlg.show()
+
+    def _show_quality_summary(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        quality_data = self.current_generator.calculate_element_quality()
+        if not quality_data:
+            QMessageBox.information(self, "No Data",
+                                    "No shell elements with quality metrics found.")
+            return
+        dlg = QualitySummaryReportDialog(quality_data, self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+
+        def select_failing(eids):
+            if eids:
+                self._highlight_entities('Element', eids)
+                self._update_status(
+                    f"Highlighted {len(eids)} failing elements.")
+
+        dlg.select_failing_callback = select_failing
+        dlg.show()
+
+    def _show_orphan_check(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        orphan_data = self.current_generator.find_orphans()
+        dlg = OrphanCheckDialog(orphan_data, self)
+        dlg.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dlg.show()
+
+    # --- Connection Modeling handlers ---
+
+    def _create_spider_connection(self):
+        """Create a spider connection (center node + RBE2/RBE3)."""
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+
+        dlg = CreateSpiderDialog(self)
+        if not dlg.exec():
+            return
+
+        settings = dlg.get_settings()
+        ring_nids = settings['ring_nids']
+        if len(ring_nids) < 2:
+            QMessageBox.warning(self, "Not Enough Nodes",
+                                "Select at least 2 ring nodes.")
+            return
+
+        # Validate all ring nodes exist
+        model = self.current_generator.model
+        missing = [n for n in ring_nids if n not in model.nodes]
+        if missing:
+            QMessageBox.warning(self, "Invalid Nodes",
+                                f"Nodes not found: {missing[:10]}")
+            return
+
+        try:
+            cmd = AddSpiderCommand(ring_nids, settings['rbe_type'],
+                                   settings['dof'])
+            self.command_manager.execute(cmd, model)
+            QMessageBox.information(
+                self, "Spider Created",
+                f"Created {settings['rbe_type']} spider with center node "
+                f"{cmd._center_nid} and {len(ring_nids)} ring nodes.")
+            self._update_status(
+                f"Spider {settings['rbe_type']}: center N{cmd._center_nid}")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _create_weld_fastener(self):
+        """Create a weld/fastener connection (CWELD-like) between two nodes."""
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+
+        available_pids = list(self.current_generator.model.properties.keys())
+        dlg = CreateWeldDialog(available_pids, self)
+        if not dlg.exec():
+            return
+
+        settings = dlg.get_settings()
+        model = self.current_generator.model
+
+        if settings['nid_a'] not in model.nodes:
+            QMessageBox.warning(self, "Invalid Node",
+                                f"Node A ({settings['nid_a']}) not found.")
+            return
+        if settings['nid_b'] not in model.nodes:
+            QMessageBox.warning(self, "Invalid Node",
+                                f"Node B ({settings['nid_b']}) not found.")
+            return
+
+        try:
+            cmd = AddWeldCommand(settings['nid_a'], settings['nid_b'],
+                                 settings['diameter'], settings['pid'])
+            self.command_manager.execute(cmd, model)
+            QMessageBox.information(
+                self, "Weld Created",
+                f"Created weld connector between nodes "
+                f"{settings['nid_a']} and {settings['nid_b']}.")
+            self._update_status(
+                f"Weld: N{settings['nid_a']}-N{settings['nid_b']}")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _open_element_split_tool(self):
+        """Launches the entity selection dialog to choose shell elements to split."""
+        if self.selection_bar.isVisible():
+            return
+
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Plates", "The model contains no plates to split.")
+            return
+
+        all_shell_eids = [
+            eid for eid, elem in self.current_generator.model.elements.items()
+            if elem.type in ['CQUAD4', 'CTRIA3']
+        ]
+        if not all_shell_eids:
+            QMessageBox.information(self, "No Plates",
+                                    "There are no CQUAD4 or CTRIA3 plates to split.")
+            return
+
+        self._start_selection('Element', all_shell_eids,
+                              self._on_split_elements_accept,
+                              self._build_select_by_data())
+
+    def _on_split_elements_accept(self):
+        """Handle the accept signal from the split elements selection dialog."""
+        selected_eids = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+
+        if not selected_eids:
+            self._update_status("Split cancelled: No elements selected.")
+            return
+
+        # Pure calculation — no model mutation yet
+        result = self.current_generator.split_shell_elements(selected_eids)
+
+        if not result['valid_eids']:
+            QMessageBox.warning(self, "No Valid Elements",
+                                "None of the selected elements could be split.")
+            return
+
+        # Build compound command: delete originals → add nodes → add elements
+        sub_cmds = [DeleteElementsCommand(result['valid_eids'])]
+        sub_cmds.append(AddNodesCommand(result['new_node_data']))
+        for params in result['new_element_params']:
+            sub_cmds.append(AddElementCommand('plate', params))
+
+        n_orig = len(result['valid_eids'])
+        n_new = len(result['new_element_params'])
+        compound = CompoundCommand(sub_cmds, f"Split {n_orig} element(s) into {n_new}")
+        self.command_manager.execute(compound, self.current_generator.model)
+
+        self._update_status(f"Split {n_orig} element(s) into {n_new}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _toggle_element_normals_visibility(self):
+        """
+        Shows, hides, or redraws the element normals actor based on UI controls.
+        This single handler manages the checkbox, menu item, and size input.
+        """
+        # --- 1. Synchronize the UI controls (Checkbox and Menu Item) ---
+        # We block signals to prevent a recursive loop where a change to one
+        # control triggers a signal that then tries to change the first one back.
+        self.show_normals_action.blockSignals(True)
+        self.show_normals_check.blockSignals(True)
+
+        # Determine the correct checked state. The widget that sent the signal
+        # (the sender) dictates the new state.
+        is_checked = self.show_normals_check.isChecked()
+        if self.sender() in [self.show_normals_action, self.show_normals_check]:
+            is_checked = self.sender().isChecked()
+
+        # Set both controls to the same state
+        self.show_normals_check.setChecked(is_checked)
+        self.show_normals_action.setChecked(is_checked)
+        
+        # Unblock signals now that they are in sync
+        self.show_normals_action.blockSignals(False)
+        self.show_normals_check.blockSignals(False)
+        
+        # --- 2. Update the 3D Plot ---
+        # The simplest and most robust way to handle both visibility and size changes
+        # is to always remove the old actor and recreate it if needed.
+        self.plotter.remove_actor('element_normals_actor', render=False)
+
+        # If the controls are checked on, call the method to create the new actor.
+        if is_checked:
+            self._create_element_normals_actor()
+
+        # Render the final scene
+        self.plotter.render()
+
+    def _toggle_free_edges_visibility(self):
+        """Shows or hides the free edge overlay. Syncs checkbox and menu action."""
+        self.show_free_edges_action.blockSignals(True)
+        self.show_free_edges_check.blockSignals(True)
+
+        is_checked = self.show_free_edges_check.isChecked()
+        if self.sender() in [self.show_free_edges_action, self.show_free_edges_check]:
+            is_checked = self.sender().isChecked()
+
+        self.show_free_edges_check.setChecked(is_checked)
+        self.show_free_edges_action.setChecked(is_checked)
+
+        self.show_free_edges_action.blockSignals(False)
+        self.show_free_edges_check.blockSignals(False)
+
+        self.plotter.remove_actor('free_edges_actor', render=False)
+        if is_checked:
+            self._create_free_edges_actor()
+        self.plotter.render()
+
+    def _show_about_dialog(self):
+        title = "About Node Runner"
+        text = """
+        <style>
+            body { font-family: Segoe UI, sans-serif; }
+            p, li {
+                font-size: 13px;
+                line-height: 1.3;
+            }
+            td {
+                font-size: 13px;
+                line-height: 1.3;
+                vertical-align: top;
+                padding: 2px 6px;
+            }
+            h2 {
+                color: #f38ba8;
+                margin-bottom: 4px;
+                margin-top: 18px;
+                font-size: 16px;
+            }
+            h3 {
+                color: #89b4fa;
+                margin-bottom: 4px;
+                margin-top: 14px;
+                border-bottom: 1px solid #45475a;
+                padding-bottom: 3px;
+                font-size: 14px;
+            }
+            h4 {
+                color: #a6e3a1;
+                margin-bottom: 2px;
+                margin-top: 10px;
+                font-size: 13px;
+            }
+            .section { margin-left: 12px; margin-bottom: 6px; }
+            .subtle { font-size: 12px; color: #a6adc8; }
+            .tag {
+                background-color: #313244;
+                border: 1px solid #45475a;
+                border-radius: 3px;
+                padding: 1px 5px;
+                font-size: 12px;
+                color: #cdd6f4;
+            }
+            .warn { color: #fab387; }
+            .card {
+                background-color: #1e1e2e;
+                border: 1px solid #45475a;
+                border-radius: 4px;
+                padding: 6px 10px;
+                margin: 3px 0;
+            }
+            ul { margin-top: 2px; margin-bottom: 4px; }
+            li { margin-bottom: 1px; }
+        </style>
+
+        <pre style="color: #cdd6f4; font-size: 11px; line-height: 1.1; margin: 0; font-family: 'Cascadia Code', 'Consolas', monospace;">
+    _   __          __        ____
+   / | / /___  ____/ /__     / __ \__  ______  ____  ___  _____
+  /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
+ / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
+/_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
+        <p style="margin-top: 4px;"><span class="tag">v2.0.0</span></p>
+        <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
+        <hr>
+
+        <!-- ============================================================ -->
+        <h2>What Is Node Runner?</h2>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>
+            <b>Node Runner</b> is a standalone, open-source finite element
+            model pre- and post-processor purpose-built for the
+            <b>Nastran</b> solver family. It is designed from the ground up
+            to give stress engineers a fast, visual,
+            keyboard-and-mouse-driven environment for building, inspecting,
+            editing, and exporting Nastran Bulk Data Files
+            (<b>.bdf</b> / <b>.dat</b>), as well as viewing solver results
+            from OP2 files.
+        </p>
+        <p>
+            It is <i>not</i> a solver. It handles pre-processing and
+            post-processing &mdash; and aims to do both well.
+        </p>
+        <p>
+            Node Runner sits in the gap between heavyweight commercial
+            packages (Patran, Femap, HyperMesh) and manual text editing of
+            BDF files. It offers a graphical, interactive experience without
+            the licensing cost, installation complexity, or learning curve
+            of the full-featured tools &mdash; while still being far more
+            productive than hand-editing bulk data cards in a text editor.
+        </p>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Who Is It For?</h2>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>Node Runner is aimed at:</p>
+        <ul>
+            <li><b>Stress engineers</b> in aerospace MRO, OEM, and STC
+                organizations who need to build or modify small-to-medium
+                Nastran models (panels, doublers, repairs, fuselage
+                sections, brackets, fittings).</li>
+            <li><b>Students and researchers</b> learning Nastran who want
+                to visualize what their BDF cards actually produce, without
+                needing a commercial pre-processor license.</li>
+            <li><b>Anyone</b> who regularly edits <tt>.bdf</tt> files by
+                hand and wants a faster, less error-prone workflow with
+                real-time 3D feedback.</li>
+        </ul>
+        <p>
+            If your workflow involves opening a BDF in a text editor,
+            changing a node coordinate, saving, re-running, and hoping
+            the mesh looks right &mdash; Node Runner is for you.
+        </p>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Detailed Capabilities</h2>
+        <!-- ============================================================ -->
+
+        <!-- ---- File I/O ---- -->
+        <h3>File Handling &amp; Solver Compatibility</h3>
+        <div class="section">
+            <table>
+            <tr><td><b>Open / Import:</b></td>
+                <td>Reads standard Nastran Bulk Data Files
+                    (<tt>.bdf</tt>, <tt>.dat</tt>, <tt>.nas</tt>)
+                    in <b>small field</b> (8-char),
+                    <b>large field</b> (16-char), and <b>free field</b>
+                    (comma-delimited) formats. Import can either replace
+                    the current model or append cards to it.</td></tr>
+            <tr><td><b>Save / Export:</b></td>
+                <td>Writes to clean, standard <b>small-field BDF</b>,
+                    optionally including a Case Control Deck with
+                    subcases, output requests, and load/SPC
+                    references.</td></tr>
+            <tr><td><b>Solver Support:</b></td>
+                <td>Output is compatible with both <b>MSC Nastran</b>
+                    and <b>Siemens NX Nastran</b>. No solver-specific
+                    extensions are used.</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Elements ---- -->
+        <h3>Supported Elements</h3>
+        <div class="section">
+            <h4>Shell Elements</h4>
+            <table>
+            <tr><td><span class="tag">CQUAD4</span></td>
+                <td>4-node isoparametric quadrilateral shell</td></tr>
+            <tr><td><span class="tag">CTRIA3</span></td>
+                <td>3-node triangular shell</td></tr>
+            <tr><td><span class="tag">CMEMBRAN</span></td>
+                <td>Membrane element (in-plane only, no bending)</td></tr>
+            </table>
+
+            <h4>Line Elements</h4>
+            <table>
+            <tr><td><span class="tag">CBEAM</span></td>
+                <td>General beam with 6 DOF per node, orientation vector,
+                    and WA/WB end offsets (OFFT)</td></tr>
+            <tr><td><span class="tag">CBAR</span></td>
+                <td>Simple beam/bar element with 6 DOF per node</td></tr>
+            <tr><td><span class="tag">CROD</span></td>
+                <td>Axial rod (tension/compression + torsion only)</td></tr>
+            </table>
+
+            <h4>Solid Elements</h4>
+            <table>
+            <tr><td><span class="tag">CHEXA</span></td>
+                <td>8-node hexahedral solid</td></tr>
+            <tr><td><span class="tag">CTETRA</span></td>
+                <td>4-node tetrahedral solid</td></tr>
+            <tr><td><span class="tag">CPENTA</span></td>
+                <td>6-node pentahedral (wedge) solid</td></tr>
+            </table>
+
+            <h4>Connector &amp; Special Elements</h4>
+            <table>
+            <tr><td><span class="tag">RBE2</span></td>
+                <td>Rigid body element &mdash; single independent node,
+                    multiple dependent nodes</td></tr>
+            <tr><td><span class="tag">RBE3</span></td>
+                <td>Interpolation element &mdash; distributes loads from
+                    dependent to independent nodes by weighted
+                    averaging</td></tr>
+            <tr><td><span class="tag">CBUSH</span></td>
+                <td>Generalized spring/damper element with 6 independent
+                    stiffness components</td></tr>
+            <tr><td><span class="tag">CSHEAR</span></td>
+                <td>4-node shear panel</td></tr>
+            <tr><td><span class="tag">CGAP</span></td>
+                <td>Contact/gap element with axial stiffness and
+                    preload</td></tr>
+            <tr><td><span class="tag">CONM2</span></td>
+                <td>Concentrated mass with optional 6&times;6 inertia
+                    matrix</td></tr>
+            <tr><td><span class="tag">PLOTEL</span></td>
+                <td>Visualization-only element (ignored by solver)</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Properties ---- -->
+        <h3>Supported Properties</h3>
+        <div class="section">
+            <table>
+            <tr><td><span class="tag">PSHELL</span></td>
+                <td>Homogeneous shell &mdash; thickness, material, NSM</td></tr>
+            <tr><td><span class="tag">PCOMP</span></td>
+                <td>Composite layup &mdash; per-ply MID, thickness, fiber
+                    angle, stress output flag. Includes a dedicated
+                    <b>composite layup editor</b> with add/remove/reorder
+                    ply controls and failure theory selection
+                    (Hill, Hoffman, Tsai-Wu, Max Strain).</td></tr>
+            <tr><td><span class="tag">PBEAM</span></td>
+                <td>Beam cross-section &mdash; A, I1, I2, J, MID</td></tr>
+            <tr><td><span class="tag">PBAR</span></td>
+                <td>Bar cross-section &mdash; A, I1, I2, J, MID</td></tr>
+            <tr><td><span class="tag">PROD</span></td>
+                <td>Rod cross-section &mdash; A, J, stress recovery
+                    coefficient</td></tr>
+            <tr><td><span class="tag">PBUSH</span></td>
+                <td>Bush/spring stiffness &mdash; K1&ndash;K6 (3
+                    translational + 3 rotational)</td></tr>
+            <tr><td><span class="tag">PSOLID</span></td>
+                <td>Solid property &mdash; material reference</td></tr>
+            <tr><td><span class="tag">PSHEAR</span></td>
+                <td>Shear panel property &mdash; thickness, MID</td></tr>
+            <tr><td><span class="tag">PGAP</span></td>
+                <td>Gap property &mdash; initial gap, preload, axial/contact
+                    stiffness</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Materials ---- -->
+        <h3>Supported Materials</h3>
+        <div class="section">
+            <table>
+            <tr><td><span class="tag">MAT1</span></td>
+                <td><b>Isotropic</b> &mdash; E, G, &nu;, &rho;, &alpha;,
+                    T<sub>ref</sub>, g<sub>e</sub></td></tr>
+            <tr><td><span class="tag">MAT8</span></td>
+                <td><b>2D Orthotropic</b> (composites) &mdash; E1, E2,
+                    &nu;12, G12, G1z, G2z, &rho;, &alpha;1,
+                    &alpha;2</td></tr>
+            <tr><td><span class="tag">MAT9</span></td>
+                <td><b>3D Anisotropic</b> &mdash; full 6&times;6 symmetric
+                    stiffness matrix (21 independent G<sub>ij</sub>
+                    terms)</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Loads ---- -->
+        <h3>Loads &amp; Constraints</h3>
+        <div class="section">
+            <h4>Loads</h4>
+            <table>
+            <tr><td><span class="tag">FORCE</span></td>
+                <td>Concentrated force at nodes (Fx, Fy, Fz)</td></tr>
+            <tr><td><span class="tag">MOMENT</span></td>
+                <td>Concentrated moment at nodes (Mx, My, Mz)</td></tr>
+            <tr><td><span class="tag">PLOAD4</span></td>
+                <td>Surface pressure on shell elements</td></tr>
+            <tr><td><span class="tag">GRAV</span></td>
+                <td>Gravity / body acceleration &mdash; direction vector
+                    &times; scale, with CID support</td></tr>
+            <tr><td><span class="tag">TEMPD</span></td>
+                <td>Default uniform temperature field</td></tr>
+            <tr><td><span class="tag">LOAD</span></td>
+                <td>Load combination card &mdash; linearly combine
+                    multiple load sets with individual scale factors and
+                    an overall multiplier</td></tr>
+            </table>
+
+            <h4>Constraints</h4>
+            <table>
+            <tr><td><span class="tag">SPC</span></td>
+                <td>Single-point constraint &mdash; fix any combination of
+                    the 6 DOFs (TX, TY, TZ, RX, RY, RZ) on selected
+                    nodes</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Coordinate Systems ---- -->
+        <h3>Coordinate Systems</h3>
+        <div class="section">
+            <table>
+            <tr><td><span class="tag">CORD2R</span></td>
+                <td>Rectangular (Cartesian) coordinate system</td></tr>
+            <tr><td><span class="tag">CORD2C</span></td>
+                <td>Cylindrical coordinate system</td></tr>
+            <tr><td><span class="tag">CORD2S</span></td>
+                <td>Spherical coordinate system</td></tr>
+            </table>
+            <p class="subtle">Define by three points (origin, Z-axis, XZ-plane)
+                or by translate-and-rotate from a reference system. Global
+                Rectangular (CID 0), Cylindrical (CID 1), and Spherical
+                (CID 2) are created automatically.</p>
+        </div>
+
+        <!-- ---- Case Control ---- -->
+        <h3>Case Control &amp; Analysis Setup</h3>
+        <div class="section">
+        <p>
+            Define one or more <b>subcases</b> through the Subcase Editor.
+            Each subcase specifies:
+        </p>
+        <ul>
+            <li>A <b>LOAD</b> set reference (any load SID or LOAD
+                combination)</li>
+            <li>An <b>SPC</b> set reference</li>
+            <li>Output requests: <b>DISPLACEMENT</b>, <b>STRESS</b>,
+                <b>FORCE</b>, <b>STRAIN</b> (each set to NONE or
+                ALL)</li>
+            <li>A <b>METHOD</b> reference (for eigenvalue extraction)</li>
+            <li>A <b>STATSUB</b> reference (for buckling pre-load
+                subcase)</li>
+        </ul>
+
+        <h4>Solution Types</h4>
+        <p>
+            Set the analysis type via the <b>Analysis</b> menu:
+        </p>
+        <ul>
+            <li><span class="tag">SOL 101</span> &mdash; Linear Static</li>
+            <li><span class="tag">SOL 103</span> &mdash; Normal Modes (real eigenvalue)</li>
+            <li><span class="tag">SOL 105</span> &mdash; Linear Buckling
+                (requires a static pre-load subcase referenced via STATSUB
+                and an eigenvalue extraction subcase with METHOD pointing to
+                an EIGRL card)</li>
+        </ul>
+
+        <h4>Eigenvalue Extraction</h4>
+        <table>
+        <tr><td><span class="tag">EIGRL</span></td>
+            <td>Lanczos method eigenvalue extraction card &mdash; define
+                SID, frequency range (V1/V2), and number of desired
+                roots (ND). Create and manage via
+                <b>Analysis &gt; EIGRL</b>.</td></tr>
+        </table>
+
+        <p>
+            The Case Control Deck is automatically written at the top of
+            the BDF file on save. If no subcases are defined, no case
+            control section is written (bulk-data-only output).
+        </p>
+        </div>
+
+        <!-- ---- Editing ---- -->
+        <h3>Editing &amp; Interaction</h3>
+        <div class="section">
+            <b>Full CRUD Lifecycle:</b> Create, view, edit, and delete all
+            major entity types (nodes, elements, properties, materials,
+            loads, constraints, coordinate systems, mass elements, plot
+            elements).<br><br>
+
+            <b>Undo / Redo:</b> All model mutations are tracked by a
+            command-pattern undo system (Ctrl+Z / Ctrl+Y) with a 20-step
+            history. Every operation &mdash; from adding a single node to
+            renumbering the entire model &mdash; can be reversed.<br><br>
+
+            <b>Selection Tools:</b> Pick entities directly from the 3D
+            viewer, or use the Entity Selection Dialog to select by ID,
+            ID range, or a pasted list. Advanced selection modes include
+            <b>By Property</b>, <b>By Material</b>, <b>By Element Type</b>,
+            and <b>By Shape</b>. The Find Entities tool can search and
+            zoom to any entity by ID.<br><br>
+
+            <b>Node Transform Tool:</b> Translate (delta), Move-to-Point,
+            Scale, and Rotate selected nodes. Supports global origin,
+            selection centroid, or a custom point as the transformation
+            center.<br><br>
+
+            <b>Element Editor:</b> Load any element by EID to edit its
+            property assignment, node connectivity, beam orientation
+            (vector / G0 node / CID), and CBEAM end offsets
+            (WA, WB, OFFT).<br><br>
+
+            <b>Find/Replace Property &amp; Material:</b> Bulk-reassign the
+            property ID across all matching elements, or the material ID
+            across all matching properties, with a live preview of affected
+            counts.<br><br>
+
+            <b>Renumber Nodes &amp; Elements:</b> Sequentially renumber all
+            node and/or element IDs starting from a user-defined value.
+            All internal references (element connectivity, loads, SPCs) are
+            automatically remapped. Fully undoable.
+        </div>
+
+        <!-- ---- Visualization ---- -->
+        <h3>3D Visualization</h3>
+        <div class="section">
+            <b>Rendering Engine:</b> Real-time 3D powered by
+            <b>PyVista</b> (VTK). Handles tens of thousands of elements
+            interactively.<br><br>
+
+            <b>Rendering Styles:</b> Wireframe or Surface-with-Edges, with
+            an optional transparent shell mode.<br><br>
+
+            <b>Coloring Modes:</b><br>
+            <ul>
+                <li><b>By Element Type</b> &mdash; shells, beams, RBEs,
+                    masses, etc. each get a distinct color</li>
+                <li><b>By Property ID</b> &mdash; each PID mapped to a
+                    unique color (default mode)</li>
+                <li><b>By Element Quality</b> &mdash; heat-map visualization
+                    of mesh quality metrics (see below)</li>
+                <li><b>Results</b> &mdash; contour plot of loaded OP2
+                    results (displacement, stress, eigenvectors, SPC
+                    forces) with a jet colormap and scalar bar</li>
+            </ul>
+
+            <b>Overlay Actors:</b> Load vectors (with relative or uniform
+            scaling), SPC constraint markers, RBE spider plots, mass
+            element glyphs, beam/bush orientation vectors, element normal
+            arrows, free-edge highlights, and PLOTEL lines &mdash; each
+            independently togglable from the model tree.<br><br>
+
+            <b>Standard Views:</b> Top, Bottom, Front, Back, Left, Right
+            with one-click access. Perspective / Orthographic toggle.<br><br>
+
+            <b>Node &amp; Element Labels:</b> Toggle numeric ID labels
+            on all nodes and/or elements.<br><br>
+
+            <b>Color Manager:</b> Customize or randomize the color
+            palette for any coloring mode.<br><br>
+
+            <b>Themes:</b> Dark mode (Catppuccin Mocha) and Light mode.
+        </div>
+
+        <!-- ---- Quality Metrics ---- -->
+        <h3>Element Quality Metrics</h3>
+        <div class="section">
+        <p>
+            Real-time element quality analysis with per-element heat-map
+            visualization. Select a metric from the dropdown to color
+            the mesh by quality:
+        </p>
+            <h4>Quad Metrics (CQUAD4 / CMEMBRAN)</h4>
+            <table>
+            <tr><td><b>Warping</b></td>
+                <td>Out-of-plane angle between triangle normals of a
+                    split quad. 0&deg; = perfectly planar.</td></tr>
+            <tr><td><b>Aspect Ratio</b></td>
+                <td>Longest edge / shortest edge. 1.0 = square.</td></tr>
+            <tr><td><b>Skew</b></td>
+                <td>Deviation of the diagonal crossing angle from
+                    90&deg;. 0&deg; = perfectly orthogonal
+                    diagonals.</td></tr>
+            <tr><td><b>Jacobian Ratio</b></td>
+                <td>min(J)/max(J) evaluated at the four isoparametric
+                    corners. 1.0 = no distortion.</td></tr>
+            <tr><td><b>Taper</b></td>
+                <td>Ratio of triangle areas when quad is split along
+                    each diagonal. 1.0 = symmetric.</td></tr>
+            <tr><td><b>Min / Max Angle</b></td>
+                <td>Interior corner angles. Ideal quad = 90&deg; at
+                    every corner.</td></tr>
+            </table>
+
+            <h4>Triangle Metrics (CTRIA3)</h4>
+            <table>
+            <tr><td><b>Aspect Ratio</b></td>
+                <td>Longest edge / shortest edge. 1.0 = equilateral.</td></tr>
+            <tr><td><b>Skew</b></td>
+                <td>Max deviation of any interior angle from the ideal
+                    60&deg;.</td></tr>
+            <tr><td><b>Min / Max Angle</b></td>
+                <td>Interior corner angles. Ideal triangle = 60&deg;
+                    at every corner.</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Geometry ---- -->
+        <h3>Geometry Engine</h3>
+        <div class="section">
+        <p>
+            Create and manage parametric geometry primitives that exist
+            independently of the FE mesh. Geometry entities are displayed
+            as colored overlays (orange points, magenta lines, cyan
+            arcs/circles) and can be meshed into nodes and elements.
+        </p>
+            <h4>Primitives</h4>
+            <table>
+            <tr><td><b>Points</b></td>
+                <td>Define by X, Y, Z coordinates. Supports single-point
+                    creation or batch import from Excel
+                    (<b>From Excel</b> button &mdash; columns: ID, CSys,
+                    X, Y, Z). Batch import is a single undoable
+                    operation.</td></tr>
+            <tr><td><b>Lines</b></td>
+                <td>Straight line between two geometry points.</td></tr>
+            <tr><td><b>Arcs</b></td>
+                <td>Circular arc through three geometry points
+                    (start, mid, end).</td></tr>
+            <tr><td><b>Circles</b></td>
+                <td>Full circle defined by a center point and
+                    radius.</td></tr>
+            <tr><td><b>Surfaces</b></td>
+                <td>Bounded region defined by a closed loop of boundary
+                    curves.</td></tr>
+            </table>
+
+            <h4>Geometry Meshing</h4>
+            <table>
+            <tr><td><b>Mesh Curve</b></td>
+                <td>Discretize a line or arc into evenly spaced nodes
+                    connected by line elements (CBAR, CBEAM, or CROD)
+                    with a user-specified number of segments and
+                    property ID.</td></tr>
+            <tr><td><b>Nodes at Points</b></td>
+                <td>Create FE grid nodes at the locations of selected
+                    geometry points.</td></tr>
+            </table>
+
+            <h4>Deletion</h4>
+            <p>
+                Delete geometry points, curves, or surfaces via the
+                <b>Delete</b> menu. Deletion cascades automatically:
+                deleting a point also removes dependent curves and their
+                dependent surfaces. All deletions are fully undoable.
+            </p>
+        </div>
+
+        <!-- ---- Mesh Tools ---- -->
+        <h3>Mesh &amp; Model Tools</h3>
+        <div class="section">
+            <table>
+            <tr><td><b>Coincident Node Checker</b></td>
+                <td>Detect duplicate nodes within a user-defined
+                    tolerance. Review results, remove false positives,
+                    then merge. All connectivity is remapped
+                    automatically.</td></tr>
+            <tr><td><b>Duplicate Element Checker</b></td>
+                <td>Find elements that share the exact same node set.
+                    Review and batch-delete duplicates.</td></tr>
+            <tr><td><b>Flip Element Normals</b></td>
+                <td>Reverse the winding order of selected shell elements
+                    to flip their normal direction.</td></tr>
+            <tr><td><b>Split Plates</b></td>
+                <td>1-to-4 subdivision: CQUAD4&rarr;4 CQUAD4s,
+                    CTRIA3&rarr;4 CTRIA3s. Shared edges reuse midside
+                    nodes.</td></tr>
+            <tr><td><b>Measure Distance</b></td>
+                <td>Pick two nodes to compute and display the
+                    straight-line distance between them, with a visual
+                    line in the 3D viewer.</td></tr>
+            <tr><td><b>Measure Angle</b></td>
+                <td>Pick three nodes to compute and display the angle at
+                    the central node.</td></tr>
+            <tr><td><b>Mass &amp; CG Summary</b></td>
+                <td>Computes total mass, structural vs. CONM2 mass
+                    breakdown, center of gravity, and per-property mass
+                    distribution. Accounts for shells
+                    (area&times;t&times;&rho;), beams/bars
+                    (A&times;L&times;&rho;), rods, and CONM2
+                    elements.</td></tr>
+            <tr><td><b>Model Summary</b></td>
+                <td>Entity count overview: nodes, elements by type,
+                    properties, materials, loads, SPCs, coordinate
+                    systems.</td></tr>
+            <tr><td><b>Free Edge Display</b></td>
+                <td>Highlight shell element edges that belong to only one
+                    element &mdash; useful for finding mesh gaps and
+                    boundaries.</td></tr>
+            </table>
+        </div>
+
+        <!-- ---- Groups ---- -->
+        <h3>Group Management</h3>
+        <div class="section">
+        <p>
+            Organize nodes and elements into named groups for targeted
+            visibility control:
+        </p>
+        <ul>
+            <li><b>Auto-Group by Property</b> &mdash; one-click grouping
+                based on PID assignment</li>
+            <li><b>Manual Groups</b> &mdash; create, rename, delete, and
+                populate groups from the current selection</li>
+            <li><b>Isolate Mode</b> &mdash; hide everything except the
+                selected group, then restore with one click</li>
+            <li><b>Visibility Checkboxes</b> &mdash; toggle individual
+                groups on/off in the model tree</li>
+        </ul>
+        </div>
+
+        <!-- ---- Post-Processing ---- -->
+        <h3>Post-Processing (OP2 Results)</h3>
+        <div class="section">
+        <p>
+            Load Nastran OP2 result files via <b>File &gt; Load Results
+            (OP2)</b> to visualize solver output directly on the model.
+        </p>
+            <h4>Supported Result Types</h4>
+            <table>
+            <tr><td><b>Displacement</b></td>
+                <td>Translational (T1, T2, T3) and rotational (R1, R2, R3)
+                    displacements per node. Components: X, Y, Z, magnitude,
+                    RX, RY, RZ.</td></tr>
+            <tr><td><b>Stress</b></td>
+                <td>Element-centroid shell stresses for CQUAD4 and CTRIA3.
+                    Components: Von Mises, max/min principal,
+                    &sigma;<sub>xx</sub>, &sigma;<sub>yy</sub>,
+                    &tau;<sub>xy</sub>.</td></tr>
+            <tr><td><b>Eigenvector</b></td>
+                <td>Modal displacement shapes from SOL 103 or SOL 105,
+                    with eigenvalue and frequency metadata.</td></tr>
+            <tr><td><b>SPC Forces</b></td>
+                <td>Reaction forces at constrained nodes (6 DOF).</td></tr>
+            </table>
+
+            <h4>Visualization Features</h4>
+            <ul>
+                <li><b>Contour plots</b> with jet colormap and scalar bar
+                    showing min/max values</li>
+                <li><b>Deformed shape display</b> with adjustable
+                    deformation scale factor</li>
+                <li><b>Subcase selector</b> to switch between load cases
+                    or modes</li>
+                <li><b>Component selector</b> to choose which result
+                    component to display</li>
+            </ul>
+        </div>
+
+        <!-- ---- Fuselage Generator ---- -->
+        <h3>Fuselage Generator</h3>
+        <div class="section">
+        <p>
+            A parametric tool that generates a complete cylindrical fuselage
+            finite element model from a small set of inputs:
+        </p>
+        <ul>
+            <li>Fuselage radius, number of bays, frame spacing</li>
+            <li>Skin element type (CQUAD4 or CMEMBRAN), thickness, and
+                material</li>
+            <li>Stringer count, element type (CBEAM/CBAR/CROD), section
+                shape (L/T/Z/J) with dimension inputs, and material</li>
+            <li>Frame element type, section shape, and material</li>
+            <li>Optional <b>floor structure</b> with floor beams and
+                stanchions, using either snap-to-node or mesh-modify
+                connection methods</li>
+        </ul>
+        <p>
+            Section properties (A, I1, I2, J) are computed automatically
+            from the cross-section dimensions. Generator configurations can
+            be saved to and loaded from JSON files.
+        </p>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Current Limitations</h2>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>The following are current limitations or explicitly
+            <b>out of scope</b>:</p>
+        <ul>
+            <li class="warn"><b>No solver.</b> Node Runner does not run
+                Nastran or any other FEA solver. It produces input files
+                only.</li>
+            <li class="warn"><b>Post-processing is OP2-only.</b> F06, H5,
+                and PCH result files are not supported. Only OP2
+                is read.</li>
+            <li class="warn"><b>Limited surface meshing.</b> Geometry
+                curves can be meshed into line elements and nodes can be
+                created at geometry points, but there is no automatic
+                surface mesher, tet mesher, or mapped meshing algorithm.
+                Shell elements are created individually or via the
+                fuselage generator.</li>
+            <li class="warn"><b>No nonlinear cards.</b> SOL 400 / SOL 600
+                specific cards (MATS1, MATEP, BCTABLE, etc.) are not
+                supported.</li>
+            <li class="warn"><b>No thermal analysis cards.</b> CHBDYE,
+                PHBDY, CONV, QBDY, and related thermal cards are not
+                supported.</li>
+            <li class="warn"><b>Limited dynamic analysis.</b> EIGRL is
+                supported for SOL 103 and SOL 105 (buckling). EIGB,
+                FREQ, TSTEP, DLOAD, RLOAD, TLOAD, and related
+                transient/frequency-response cards are not
+                supported.</li>
+            <li class="warn"><b>Solid element mass</b> is not included in
+                the Mass &amp; CG summary (volume integration not
+                implemented).</li>
+            <li class="warn"><b>Fuselage generator</b> produces only
+                cylindrical (constant-radius) sections. Tapered,
+                double-bubble, or complex fuselage shapes are not
+                supported.</li>
+            <li class="warn"><b>Large models</b> (100k+ elements) may
+                experience slower rendering. Node Runner is optimized
+                for small-to-medium models typical of detail stress
+                analysis.</li>
+        </ul>
+        </div>
+
+        <!-- ============================================================ -->
+        <h2>Technology Stack</h2>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <table>
+            <tr><td><b>Language:</b></td><td>Python 3.11+</td></tr>
+            <tr><td><b>GUI Framework:</b></td><td>PySide6 (Qt 6)</td></tr>
+            <tr><td><b>3D Rendering:</b></td><td>PyVista / VTK</td></tr>
+            <tr><td><b>Nastran I/O:</b></td>
+                <td>pyNastran (BDF read/write + OP2 results reader)</td></tr>
+            <tr><td><b>Numerics:</b></td><td>NumPy</td></tr>
+            <tr><td><b>Excel Import:</b></td><td>openpyxl (optional, for geometry point import)</td></tr>
+        </table>
+        </div>
+
+        <hr>
+        <p class="subtle" style="text-align: center;">
+            Licensed under the Apache License 2.0<br>
+            &copy; 2025&ndash;2026 Angel Linares / Escape Velocity Ventures, LLC<br>
+            <a href="https://escvelocity.space" style="color: #5dade2;">escvelocity.space</a>
+        </p>
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+
+        text_edit = QTextEdit(text)
+        text_edit.setReadOnly(True)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        button_box.accepted.connect(dialog.accept)
+
+        layout.addWidget(text_edit)
+        layout.addWidget(button_box)
+
+        dialog.setMinimumSize(700, 800)
+        dialog.exec()
+    
+    
+    
+    
+# START: Replacement for _show_tree_context_menu in main.py
+    def _show_tree_context_menu(self, position):
+        item = self.tree_widget.itemAt(position)
+        if not item:
+            return
+
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple) or len(item_data) < 2:
+            return
+
+        entity_type, entity_id = item_data
+        menu = QMenu()
+
+        if entity_type in ['property', 'material', 'load_set', 'constraint_set', 'coord']:
+            # --- MODIFIED LOGIC: Prevent editing of default coordinate systems ---
+            is_default_coord = (entity_type == 'coord' and entity_id in [0, 1, 2])
+            
+            if not is_default_coord:
+                action_text = f"Edit {entity_type.replace('_', ' ').capitalize()} {entity_id}..."
+                edit_action = QAction(action_text, self)
+                edit_action.triggered.connect(lambda: self._handle_edit_from_tree(entity_type, entity_id))
+                menu.addAction(edit_action)
+
+        if entity_type == 'load_set':
+            add_to_set_action = QAction(f"Add to Load Set {entity_id}...", self)
+            add_to_set_action.triggered.connect(
+                lambda: self._add_to_load_set(entity_id))
+            menu.addAction(add_to_set_action)
+
+        if entity_type in ['load_set', 'constraint_set']:
+            if menu.actions():
+                menu.addSeparator()
+            delete_action = QAction(f"Delete Set {entity_id}...", self)
+            delete_action.triggered.connect(lambda: self._handle_delete_from_tree(entity_type, entity_id))
+            menu.addAction(delete_action)
+
+        if entity_type in ['property', 'material']:
+            if menu.actions():
+                menu.addSeparator()
+            delete_action = QAction(f"Delete {entity_type.capitalize()} {entity_id}...", self)
+            delete_action.triggered.connect(lambda: self._handle_delete_from_tree(entity_type, entity_id))
+            menu.addAction(delete_action)
+
+        if entity_type == 'coord' and entity_id not in [0, 1, 2]:
+            if menu.actions():
+                menu.addSeparator()
+            delete_action = QAction(f"Delete Coord System {entity_id}...", self)
+            delete_action.triggered.connect(lambda: self._handle_delete_from_tree(entity_type, entity_id))
+            menu.addAction(delete_action)
+
+
+        if menu.actions():
+            menu.exec(self.tree_widget.viewport().mapToGlobal(position))
+# END: Replacement for _show_tree_context_menu in main.py
+
+    def _handle_delete_from_tree(self, entity_type, entity_id):
+        if not self.current_generator: return
+        model = self.current_generator.model
+
+        if entity_type == 'load_set':
+            reply = QMessageBox.question(self, "Confirm Deletion", f"Are you sure you want to delete Load Set {entity_id}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteLoadCommand(entity_id)
+                self.command_manager.execute(cmd, model)
+                self._create_all_load_actors()
+                self._update_status(f"Deleted Load Set {entity_id}.")
+                self._populate_tree(); self._update_plot_visibility()
+
+        elif entity_type == 'constraint_set':
+            reply = QMessageBox.question(self, "Confirm Deletion", f"Are you sure you want to delete Constraint Set {entity_id}?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteConstraintCommand(entity_id)
+                self.command_manager.execute(cmd, model)
+                self._create_all_constraint_actors()
+                self._update_status(f"Deleted Constraint Set {entity_id}.")
+                self._populate_tree(); self._update_plot_visibility()
+
+        elif entity_type == 'property':
+            using_eids = [eid for eid, elem in model.elements.items() if hasattr(elem, 'pid') and elem.pid == entity_id]
+            msg = f"Are you sure you want to delete Property {entity_id}?"
+            if using_eids:
+                msg += f"\n\nWarning: {len(using_eids)} element(s) reference this property."
+            reply = QMessageBox.question(self, "Confirm Deletion", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeletePropertyCommand(entity_id)
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Deleted Property {entity_id}.")
+                self._populate_tree()
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+        elif entity_type == 'material':
+            using_pids = [pid for pid, prop in model.properties.items() if hasattr(prop, 'mid') and prop.mid == entity_id]
+            msg = f"Are you sure you want to delete Material {entity_id}?"
+            if using_pids:
+                msg += f"\n\nWarning: {len(using_pids)} property/properties reference this material."
+            reply = QMessageBox.question(self, "Confirm Deletion", msg, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteMaterialCommand(entity_id)
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Deleted Material {entity_id}.")
+                self._populate_tree()
+
+        elif entity_type == 'coord':
+            reply = QMessageBox.question(self, "Confirm Deletion",
+                f"Are you sure you want to delete Coordinate System {entity_id}?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteCoordCommand(entity_id)
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Deleted Coordinate System {entity_id}.")
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+    # ------------------------------------------------------------------
+    # Phase 8 – Group management
+    # ------------------------------------------------------------------
+
+    def _next_gid(self):
+        """Return the next available group ID number."""
+        existing = {g.get("gid", 0) for g in self.groups.values()}
+        gid = self._next_group_id
+        while gid in existing:
+            gid += 1
+        self._next_group_id = gid + 1
+        return gid
+
+    def _populate_groups_list(self):
+        """Rebuild the groups tree widget from self.groups."""
+        self.groups_list.blockSignals(True)
+        self.groups_list.clear()
+        for name, data in sorted(self.groups.items(),
+                                 key=lambda kv: kv[1].get("gid", 0)):
+            gid = data.get("gid", 0)
+            n_e = len(data.get("elements", []))
+            n_n = len(data.get("nodes", []))
+            item = QTreeWidgetItem(
+                self.groups_list,
+                [f"{gid}: {name}  ({n_e} elems, {n_n} nodes)"])
+            item.setData(0, QtCore.Qt.UserRole, ("group_entry", name))
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                0, QtCore.Qt.Unchecked if name in self._hidden_groups else QtCore.Qt.Checked
+            )
+        self.groups_list.blockSignals(False)
+
+    def _create_group(self):
+        name, ok = QInputDialog.getText(self, "Create Group", "Group name:")
+        if ok and name:
+            if name in self.groups:
+                QMessageBox.warning(self, "Duplicate", f"Group '{name}' already exists.")
+                return
+            gid = self._next_gid()
+            cmd = CreateGroupCommand(self.groups, name, gid=gid)
+            model = self.current_generator.model if self.current_generator else None
+            self.command_manager.execute(cmd, model)
+            self._populate_groups_list()
+            self._update_status(f"Created group {gid}: '{name}'.")
+
+    def _delete_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group to delete.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        cmd = DeleteGroupCommand(self.groups, name)
+        model = self.current_generator.model if self.current_generator else None
+        self.command_manager.execute(cmd, model)
+        self._hidden_groups.discard(name)
+        self._populate_groups_list()
+        self._update_plot_visibility()
+        self._update_status(f"Deleted group '{name}'.")
+
+    def _add_selected_to_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group first.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        selected_eids = list(self._get_selected_element_ids())
+        selected_nids = list(self._get_selected_node_ids())
+        if not selected_eids and not selected_nids:
+            QMessageBox.information(
+                self, "Nothing Selected",
+                "Select elements or nodes first (use Edit > Select Entities, or Ctrl+F)."
+            )
+            return
+        cmd = ModifyGroupCommand(
+            self.groups, name,
+            add_nodes=selected_nids, add_elements=selected_eids,
+        )
+        model = self.current_generator.model if self.current_generator else None
+        self.command_manager.execute(cmd, model)
+        self._populate_groups_list()
+        self._update_status(
+            f"Added {len(selected_eids)} elements, {len(selected_nids)} nodes to '{name}'."
+        )
+
+    def _isolate_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group to isolate.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        self._isolate_group_by_name(item_data[1])
+
+    def _isolate_group_by_name(self, name):
+        """Isolate: show only the given group's elements."""
+        self.groups_list.blockSignals(True)
+        for i in range(self.groups_list.topLevelItemCount()):
+            grp_item = self.groups_list.topLevelItem(i)
+            grp_data = grp_item.data(0, QtCore.Qt.UserRole)
+            if not isinstance(grp_data, tuple):
+                continue
+            grp_name = grp_data[1]
+            if grp_name == name:
+                grp_item.setCheckState(0, QtCore.Qt.Checked)
+                self._hidden_groups.discard(grp_name)
+            else:
+                grp_item.setCheckState(0, QtCore.Qt.Unchecked)
+                self._hidden_groups.add(grp_name)
+        self.groups_list.blockSignals(False)
+        self._isolate_mode = name
+        self._update_plot_visibility()
+        self._isolate_mode = None
+        self._update_status(f"Isolated group '{name}'.")
+
+    def _group_by_property(self):
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        # Remove existing auto-generated PID groups
+        for name in [n for n in self.groups if n.startswith("PID ")]:
+            self.groups.pop(name)
+        for pid in sorted(model.properties.keys()):
+            eids = [
+                eid for eid, elem in model.elements.items()
+                if hasattr(elem, "pid") and elem.pid == pid
+            ]
+            nids: set[int] = set()
+            for eid in eids:
+                elem = model.elements[eid]
+                if hasattr(elem, "nodes"):
+                    nids.update(n for n in elem.nodes if n)
+            gid = self._next_gid()
+            self.groups[f"PID {pid}"] = {"nodes": list(nids), "elements": eids, "gid": gid}
+        self._populate_groups_list()
+        self._update_status(f"Created {len(model.properties)} property groups.")
+
+    def _get_selected_element_ids(self):
+        """Return set of currently highlighted/selected element IDs."""
+        return set(self._current_selection_eids)
+
+    def _get_selected_node_ids(self):
+        """Return set of currently highlighted/selected node IDs."""
+        return set(self._current_selection_nids)
+
+    def _show_groups_context_menu(self, position):
+        item = self.groups_list.itemAt(position)
+        if not item:
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        menu = QMenu()
+        rename_action = QAction(f"Rename '{name}'...", self)
+        rename_action.triggered.connect(lambda checked=False, n=name: self._rename_group(n))
+        menu.addAction(rename_action)
+        edit_action = QAction(f"Edit Contents...", self)
+        edit_action.triggered.connect(lambda checked=False, i=item: self._edit_group_contents(i))
+        menu.addAction(edit_action)
+        list_action = QAction("List Contents", self)
+        list_action.triggered.connect(lambda checked=False, n=name: self._list_group_contents(n))
+        menu.addAction(list_action)
+        export_bdf_action = QAction("Export as BDF...", self)
+        export_bdf_action.triggered.connect(lambda checked=False, n=name: self._export_group_as_bdf(n))
+        menu.addAction(export_bdf_action)
+        export_set_action = QAction("Export as SET...", self)
+        export_set_action.triggered.connect(lambda checked=False, n=name: self._export_group_as_set(n))
+        menu.addAction(export_set_action)
+        menu.addSeparator()
+        highlight_action = QAction("Highlight", self)
+        highlight_action.triggered.connect(self._highlight_group)
+        menu.addAction(highlight_action)
+        isolate_action = QAction(f"Isolate '{name}'", self)
+        isolate_action.triggered.connect(lambda checked=False, n=name: self._isolate_group_by_name(n))
+        menu.addAction(isolate_action)
+        select_action = QAction("Select in Viewport", self)
+        select_action.triggered.connect(lambda checked=False, n=name: self._select_group_in_viewport(n))
+        menu.addAction(select_action)
+        menu.addSeparator()
+        delete_action = QAction(f"Delete '{name}'...", self)
+        delete_action.triggered.connect(lambda checked=False, n=name: self._delete_group_by_name(n))
+        menu.addAction(delete_action)
+        menu.exec(self.groups_list.viewport().mapToGlobal(position))
+
+    def _rename_group(self, old_name):
+        new_name, ok = QInputDialog.getText(self, "Rename Group", "New name:", text=old_name)
+        if ok and new_name and new_name != old_name:
+            if new_name in self.groups:
+                QMessageBox.warning(self, "Duplicate", f"Group '{new_name}' already exists.")
+                return
+            cmd = RenameGroupCommand(self.groups, old_name, new_name)
+            model = self.current_generator.model if self.current_generator else None
+            self.command_manager.execute(cmd, model)
+            if old_name in self._hidden_groups:
+                self._hidden_groups.discard(old_name)
+                self._hidden_groups.add(new_name)
+            self._populate_groups_list()
+            self._update_status(f"Renamed group '{old_name}' to '{new_name}'.")
+
+    def _delete_group_by_name(self, name):
+        cmd = DeleteGroupCommand(self.groups, name)
+        model = self.current_generator.model if self.current_generator else None
+        self.command_manager.execute(cmd, model)
+        self._hidden_groups.discard(name)
+        self._populate_groups_list()
+        self._update_plot_visibility()
+        self._update_status(f"Deleted group '{name}'.")
+
+    def _on_group_item_changed(self, item, column):
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        if item.checkState(0) == QtCore.Qt.Checked:
+            self._hidden_groups.discard(name)
+        else:
+            self._hidden_groups.add(name)
+        self._update_plot_visibility()
+
+    def _rename_selected_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group to rename.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if isinstance(item_data, tuple):
+            self._rename_group(item_data[1])
+
+    def _remove_selected_from_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group first.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        selected_eids = list(self._get_selected_element_ids())
+        selected_nids = list(self._get_selected_node_ids())
+        if not selected_eids and not selected_nids:
+            QMessageBox.information(self, "Nothing Selected",
+                                    "Select elements or nodes first (use Edit > Select Entities, or Ctrl+F).")
+            return
+        cmd = ModifyGroupCommand(
+            self.groups, name,
+            remove_nodes=selected_nids, remove_elements=selected_eids,
+        )
+        model = self.current_generator.model if self.current_generator else None
+        self.command_manager.execute(cmd, model)
+        self._populate_groups_list()
+        self._update_plot_visibility()
+        self._update_status(f"Removed {len(selected_eids)} elements, {len(selected_nids)} nodes from '{name}'.")
+
+    def _clear_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group to clear.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        group_data = self.groups.get(name, {})
+        all_nodes = list(group_data.get("nodes", []))
+        all_elements = list(group_data.get("elements", []))
+        if not all_nodes and not all_elements:
+            QMessageBox.information(self, "Empty", f"Group '{name}' is already empty.")
+            return
+        cmd = ModifyGroupCommand(
+            self.groups, name,
+            remove_nodes=all_nodes, remove_elements=all_elements,
+        )
+        model = self.current_generator.model if self.current_generator else None
+        self.command_manager.execute(cmd, model)
+        self._populate_groups_list()
+        self._update_plot_visibility()
+        self._update_status(f"Cleared group '{name}'.")
+
+    def _show_all_groups(self):
+        self._isolate_mode = None
+        self._hidden_groups.clear()
+        self.groups_list.blockSignals(True)
+        for i in range(self.groups_list.topLevelItemCount()):
+            self.groups_list.topLevelItem(i).setCheckState(0, QtCore.Qt.Checked)
+        self.groups_list.blockSignals(False)
+        self._update_plot_visibility()
+        self._update_status("Showing all groups.")
+
+    def _highlight_group(self):
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection", "Select a group to highlight.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        # Toggle: if already highlighting this group, clear it
+        if getattr(self, '_highlighted_group', None) == name:
+            self._clear_highlight()
+            return
+        group_data = self.groups.get(name, {})
+        nids = group_data.get("nodes", [])
+        eids = group_data.get("elements", [])
+        if eids:
+            self._highlight_entities('Element', eids)
+        elif nids:
+            self._highlight_entities('Node', nids)
+        self._highlighted_group = name
+        self._update_status(f"Highlighted group '{name}' ({len(eids)} elements, {len(nids)} nodes).")
+
+    def _clear_highlight(self):
+        """Remove all selection highlight actors and reset state."""
+        self.plotter.remove_actor('selection_highlight', render=False)
+        self._highlighted_group = None
+        self.plotter.render()
+        self._update_status("Highlight cleared.")
+
+    def _edit_group_contents(self, item, column=0):
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        name = item_data[1]
+        group_data = self.groups.get(name, {})
+        model = self.current_generator.model if self.current_generator else None
+        from node_runner.dialogs.info import GroupEditorDialog
+        dialog = GroupEditorDialog(name, group_data, model, self)
+        if dialog.exec():
+            added_n, added_e, removed_n, removed_e = dialog.get_changes()
+            if added_n or added_e or removed_n or removed_e:
+                cmd = ModifyGroupCommand(
+                    self.groups, name,
+                    add_nodes=added_n, add_elements=added_e,
+                    remove_nodes=removed_n, remove_elements=removed_e,
+                )
+                self.command_manager.execute(cmd, model)
+                self._populate_groups_list()
+                self._update_plot_visibility()
+                self._update_status(f"Updated group '{name}'.")
+
+    def _auto_group(self):
+        if not self.current_generator:
+            return
+        mode = self.auto_group_combo.currentText()
+        if mode == "By Property":
+            self._group_by_property()
+        elif mode == "By Material":
+            self._group_by_material()
+        elif mode == "By Element Type":
+            self._group_by_element_type()
+
+    def _group_by_material(self):
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        for name in [n for n in self.groups if n.startswith("MAT ")]:
+            self.groups.pop(name)
+        for mid in sorted(model.materials.keys()):
+            pids_for_mid = set()
+            for pid, prop in model.properties.items():
+                for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                    if getattr(prop, attr, None) == mid:
+                        pids_for_mid.add(pid)
+                        break
+            eids = [eid for eid, elem in model.elements.items()
+                    if hasattr(elem, "pid") and elem.pid in pids_for_mid]
+            nids: set[int] = set()
+            for eid in eids:
+                elem = model.elements[eid]
+                if hasattr(elem, "nodes"):
+                    nids.update(n for n in elem.nodes if n)
+            gid = self._next_gid()
+            self.groups[f"MAT {mid}"] = {"nodes": list(nids), "elements": eids, "gid": gid}
+        self._populate_groups_list()
+        self._update_status(f"Created {len(model.materials)} material groups.")
+
+    def _group_by_element_type(self):
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        for name in [n for n in self.groups if n.startswith("TYPE ")]:
+            self.groups.pop(name)
+        type_groups: dict[str, dict] = {}
+        for eid, elem in model.elements.items():
+            etype = elem.type
+            if etype not in type_groups:
+                type_groups[etype] = {"nodes": set(), "elements": []}
+            type_groups[etype]["elements"].append(eid)
+            if hasattr(elem, "nodes"):
+                type_groups[etype]["nodes"].update(n for n in elem.nodes if n)
+        for etype, data in sorted(type_groups.items()):
+            gid = self._next_gid()
+            self.groups[f"TYPE {etype}"] = {"nodes": list(data["nodes"]), "elements": data["elements"], "gid": gid}
+        self._populate_groups_list()
+        self._update_status(f"Created {len(type_groups)} element type groups.")
+
+    def _select_group_in_viewport(self, name):
+        group_data = self.groups.get(name, {})
+        eids = group_data.get("elements", [])
+        nids = group_data.get("nodes", [])
+        self._current_selection_eids = list(eids)
+        self._current_selection_nids = list(nids)
+        if eids:
+            self._highlight_entities('Element', eids)
+        elif nids:
+            self._highlight_entities('Node', nids)
+        self._highlighted_group = name
+        self._update_status(f"Selected group '{name}' ({len(eids)} elements, {len(nids)} nodes).")
+
+    def _list_group_contents(self, name):
+        """Show group contents in a tabular info dialog."""
+        group_data = self.groups.get(name, {})
+        model = self.current_generator.model if self.current_generator else None
+        if not model:
+            return
+        from node_runner.dialogs.info import NodeElementInfoDialog
+
+        nids = group_data.get("nodes", [])
+        eids = group_data.get("elements", [])
+        all_elements = {**model.elements, **model.rigid_elements}
+
+        # Build node rows
+        node_rows = []
+        node_columns = ['NID', 'X', 'Y', 'Z', 'CP', 'CD']
+        node_tooltips = {
+            'NID': 'Node ID', 'X': 'X coordinate', 'Y': 'Y coordinate', 'Z': 'Z coordinate',
+            'CP': 'Position Coordinate System (0 = basic rectangular)',
+            'CD': 'Displacement Coordinate System (0 = basic rectangular)',
+        }
+        for nid in sorted(nids):
+            if nid in model.nodes:
+                node = model.nodes[nid]
+                node_rows.append({
+                    'NID': node.nid,
+                    'X': round(node.xyz[0], 6), 'Y': round(node.xyz[1], 6), 'Z': round(node.xyz[2], 6),
+                    'CP': node.cp, 'CD': node.cd,
+                })
+
+        # Build element rows
+        elem_rows = []
+        elem_columns = ['EID', 'Type', 'PID', 'MID', 'Nodes']
+        elem_tooltips = {
+            'EID': 'Element ID', 'Type': 'Element type',
+            'PID': 'Property ID', 'MID': 'Material ID',
+            'Nodes': 'Grid point connectivity',
+        }
+        for eid in sorted(eids):
+            if eid in all_elements:
+                elem = all_elements[eid]
+                pid = getattr(elem, 'pid', '')
+                mid = ''
+                if pid and pid in model.properties:
+                    prop = model.properties[pid]
+                    mid = getattr(prop, 'mid', None) or getattr(prop, 'mid1', None) or ''
+                nodes_str = ', '.join(str(n) for n in elem.nodes) if hasattr(elem, 'nodes') else ''
+                elem_rows.append({
+                    'EID': elem.eid, 'Type': elem.type,
+                    'PID': pid, 'MID': mid, 'Nodes': nodes_str,
+                })
+
+        # Show nodes if available, otherwise elements
+        if node_rows:
+            title = f"Group '{name}' — Nodes ({len(node_rows)})"
+            dlg = NodeElementInfoDialog(title, node_rows, node_columns, self, column_tooltips=node_tooltips)
+            dlg.exec()
+        if elem_rows:
+            title = f"Group '{name}' — Elements ({len(elem_rows)})"
+            dlg = NodeElementInfoDialog(title, elem_rows, elem_columns, self, column_tooltips=elem_tooltips)
+            dlg.exec()
+        if not node_rows and not elem_rows:
+            QMessageBox.information(self, "Empty Group", f"Group '{name}' has no contents.")
+
+    def _export_group_as_bdf(self, name):
+        """Export the group's nodes, elements, properties, and materials as a standalone BDF."""
+        group_data = self.groups.get(name, {})
+        model = self.current_generator.model if self.current_generator else None
+        if not model:
+            return
+        nids = group_data.get("nodes", [])
+        eids = group_data.get("elements", [])
+        if not nids and not eids:
+            QMessageBox.information(self, "Empty Group", f"Group '{name}' has no contents to export.")
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, f"Export Group '{name}' as BDF", f"{name}.bdf",
+            "Nastran Files (*.bdf *.dat);;All Files (*)")
+        if not filepath:
+            return
+
+        try:
+            new_model = BDF(debug=False)
+            all_elements = {**model.elements, **model.rigid_elements}
+
+            # Copy nodes
+            for nid in nids:
+                if nid in model.nodes:
+                    new_model.nodes[nid] = model.nodes[nid]
+
+            # Copy elements and collect PIDs
+            pids_needed = set()
+            for eid in eids:
+                if eid in all_elements:
+                    elem = all_elements[eid]
+                    if eid in model.elements:
+                        new_model.elements[eid] = elem
+                    else:
+                        new_model.rigid_elements[eid] = elem
+                    pid = getattr(elem, 'pid', None)
+                    if pid and isinstance(pid, int):
+                        pids_needed.add(pid)
+
+            # Copy properties and collect MIDs
+            mids_needed = set()
+            for pid in pids_needed:
+                if pid in model.properties:
+                    prop = model.properties[pid]
+                    new_model.properties[pid] = prop
+                    for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                        val = getattr(prop, attr, None)
+                        if val and isinstance(val, int):
+                            mids_needed.add(val)
+
+            # Copy materials
+            for mid in mids_needed:
+                if mid in model.materials:
+                    new_model.materials[mid] = model.materials[mid]
+
+            # Copy coordinate systems referenced by nodes
+            cids_needed = set()
+            for nid in nids:
+                if nid in model.nodes:
+                    node = model.nodes[nid]
+                    if node.cp and node.cp > 0:
+                        cids_needed.add(node.cp)
+                    if node.cd and node.cd > 0:
+                        cids_needed.add(node.cd)
+            for cid in cids_needed:
+                if cid in model.coords:
+                    new_model.coords[cid] = model.coords[cid]
+
+            new_model.write_bdf(filepath, size=8, is_double=False)
+            self._update_status(f"Exported group '{name}' as BDF: {os.path.basename(filepath)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export group as BDF:\n{e}")
+
+    def _export_group_as_set(self, name):
+        """Export the group's node/element IDs as Nastran SET1 cards."""
+        group_data = self.groups.get(name, {})
+        nids = sorted(group_data.get("nodes", []))
+        eids = sorted(group_data.get("elements", []))
+        if not nids and not eids:
+            QMessageBox.information(self, "Empty Group", f"Group '{name}' has no contents to export.")
+            return
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, f"Export Group '{name}' as SET", f"{name}_sets.bdf",
+            "Nastran Files (*.bdf *.dat);;Text Files (*.txt);;All Files (*)")
+        if not filepath:
+            return
+
+        def compress_with_thru(ids):
+            """Compress consecutive ID ranges using THRU notation."""
+            if not ids:
+                return []
+            result = []
+            start = ids[0]
+            prev = ids[0]
+            for val in ids[1:]:
+                if val == prev + 1:
+                    prev = val
+                else:
+                    if prev - start >= 2:
+                        result.extend([start, 'THRU', prev])
+                    elif prev - start == 1:
+                        result.extend([start, prev])
+                    else:
+                        result.append(start)
+                    start = val
+                    prev = val
+            # Flush last range
+            if prev - start >= 2:
+                result.extend([start, 'THRU', prev])
+            elif prev - start == 1:
+                result.extend([start, prev])
+            else:
+                result.append(start)
+            return result
+
+        def write_set1_card(f, sid, ids, comment):
+            """Write a SET1 card in small-field format (8-char fields)."""
+            compressed = compress_with_thru(ids)
+            f.write(f"$ {comment}\n")
+            # First line: SET1 + SID + up to 6 values
+            fields_per_first_line = 6
+            fields_per_cont_line = 7
+            line = f"{'SET1':8s}{sid:>8d}"
+            count = 0
+            for item in compressed:
+                if count < fields_per_first_line and count == 0 or count < fields_per_first_line:
+                    line += f"{str(item):>8s}"
+                    count += 1
+                else:
+                    f.write(line + "\n")
+                    line = f"{'':8s}{str(item):>8s}"
+                    count = 1
+            if line.strip():
+                f.write(line + "\n")
+
+        try:
+            with open(filepath, 'w') as f:
+                f.write(f"$ SET cards exported from group: {name}\n")
+                f.write(f"$ Generated by Node Runner\n")
+                sid = 1
+                if nids:
+                    write_set1_card(f, sid, nids, f"Nodes for group: {name} ({len(nids)} nodes)")
+                    sid += 1
+                if eids:
+                    write_set1_card(f, sid, eids, f"Elements for group: {name} ({len(eids)} elements)")
+            self._update_status(f"Exported group '{name}' as SET: {os.path.basename(filepath)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export group as SET:\n{e}")
+
+    def _handle_edit_from_tree(self, entity_type, entity_id):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator: return
+        
+        dialog = None
+        if entity_type == 'load_set':
+            # Open the Load Set Manager for editing existing sets
+            self._open_load_set_manager(entity_id)
+            return
+        elif entity_type == 'constraint_set':
+            dialog = CreateConstraintDialog(self.current_generator.model, self, existing_sid=entity_id)
+            dialog.selection_requested.connect(self._handle_sub_dialog_selection_request)
+            dialog.accepted.connect(self._on_constraint_creation_accept)
+            dialog.rejected.connect(self._on_creation_reject)
+        elif entity_type == 'coord':
+            coord_to_edit = self.current_generator.model.coords.get(entity_id)
+            if coord_to_edit:
+                dialog = CreateCoordDialog(entity_id, self.current_generator.model, self, existing_coord=coord_to_edit)
+                dialog.accepted.connect(self._on_coord_creation_accept)
+                dialog.rejected.connect(self._on_creation_reject)
+        elif entity_type == 'property':
+            prop_to_edit = self.current_generator.model.properties.get(entity_id)
+            if prop_to_edit:
+                edit_dialog = CreatePropertyDialog(entity_id, self.current_generator.model, self, prop_to_edit)
+                if edit_dialog.exec():
+                    if params := edit_dialog.get_parameters():
+                        self._edit_property(entity_id, params)
+                        self._populate_tree()
+                        self._update_viewer(self.current_generator, reset_camera=False)
+            return
+        elif entity_type == 'material':
+            mat_to_edit = self.current_generator.model.materials.get(entity_id)
+            if mat_to_edit:
+                edit_dialog = CreateMaterialDialog(entity_id, self, mat_to_edit)
+                if edit_dialog.exec():
+                    if params := edit_dialog.get_parameters():
+                        self._edit_material(entity_id, params)
+                        self._populate_tree()
+            return
+
+        if dialog:
+            dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+            dialog.show()
+            self.active_creation_dialog = dialog
+
+    def _create_material(self):
+        if not self.current_generator:
+            self.current_generator = NastranModelGenerator()
+            self._ensure_default_coords(self.current_generator.model)
+
+        next_mid = max(self.current_generator.model.materials.keys()) + 1 if self.current_generator.model.materials else 1
+        
+        dialog = CreateMaterialDialog(next_mid, self)
+        dialog.import_requested.connect(self._import_materials_from_bdf)
+        if dialog.exec():
+            if params := dialog.get_parameters():
+                mat_type = params['type']
+                cmd = AddMaterialCommand(params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created Material MID {params['mid']} ({mat_type}).")
+                self._populate_tree()
+
+    @staticmethod
+    def _mat_object_to_params(mat):
+        """Convert a pyNastran material object to the params dict used by AddMaterialCommand."""
+        comment = mat.comment.strip() if mat.comment else ''
+        params = {'mid': mat.mid, 'comment': comment}
+        if mat.type == 'MAT1':
+            params.update({
+                'type': 'MAT1',
+                'E': mat.e, 'G': mat.g, 'nu': mat.nu,
+                'rho': mat.rho, 'a': mat.a, 'tref': mat.tref, 'ge': mat.ge,
+            })
+        elif mat.type == 'MAT8':
+            params.update({
+                'type': 'MAT8',
+                'E1': mat.e1, 'E2': mat.e2, 'nu12': mat.nu12,
+                'G12': mat.g12, 'G1z': mat.g1z, 'G2z': mat.g2z,
+                'rho': mat.rho, 'a1': mat.a1, 'a2': mat.a2, 'tref': mat.tref,
+            })
+        elif mat.type == 'MAT9':
+            params['type'] = 'MAT9'
+            for label in [
+                'G11', 'G12', 'G13', 'G14', 'G15', 'G16',
+                'G22', 'G23', 'G24', 'G25', 'G26',
+                'G33', 'G34', 'G35', 'G36',
+                'G44', 'G45', 'G46',
+                'G55', 'G56', 'G66',
+            ]:
+                params[label] = getattr(mat, label.lower(), 0.0)
+            params.update({'rho': mat.rho, 'tref': mat.tref})
+        else:
+            return None  # Unsupported material type
+        return params
+
+    def _import_materials_from_bdf(self):
+        """Import materials from an external BDF file into the current model."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Import Materials from BDF", "",
+            "Nastran Files (*.bdf *.dat *.nas);;All Files (*)")
+        if not filepath:
+            return
+
+        if not self.current_generator:
+            self.current_generator = NastranModelGenerator()
+            self._ensure_default_coords(self.current_generator.model)
+
+        # Parse the BDF file using the existing lenient pipeline
+        try:
+            temp_model, lenient_result = NastranModelGenerator._read_bdf_robust(filepath)
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Import Failed", str(e))
+            return
+
+        if not temp_model.materials:
+            QMessageBox.information(self, "No Materials Found",
+                                   "The selected file does not contain any material cards.")
+            return
+
+        existing_mids = set(self.current_generator.model.materials.keys())
+        imported = []       # list of params dicts
+        skipped_dup = []    # list of (mid, mat_type) for MID conflicts
+        skipped_type = []   # list of (mid, mat_type_str) for unsupported types
+
+        for mid, mat in temp_model.materials.items():
+            if mid in existing_mids:
+                skipped_dup.append((mid, mat.type))
+                continue
+            params = self._mat_object_to_params(mat)
+            if params is None:
+                skipped_type.append((mid, mat.type))
+                continue
+            imported.append(params)
+
+        if not imported:
+            QMessageBox.information(self, "Nothing to Import",
+                                   "No new materials to import (all MIDs already exist or unsupported types).")
+            return
+
+        # Build compound command for single undo step
+        import os
+        fname = os.path.basename(filepath)
+        cmds = [AddMaterialCommand(p) for p in imported]
+        compound = CompoundCommand(cmds, f"Import {len(cmds)} materials from {fname}")
+        self.command_manager.execute(compound, self.current_generator.model)
+
+        self._populate_tree()
+        self._rebuild_plot()
+
+        # Build and show report
+        from node_runner.dialogs.info import MaterialImportReportDialog
+        parse_failures = []
+        if lenient_result and lenient_result.skipped:
+            for sc in lenient_result.skipped:
+                if sc.card.startswith('MAT'):
+                    parse_failures.append(sc)
+
+        report = MaterialImportReportDialog(
+            fname, imported, skipped_dup, skipped_type,
+            parse_failures, parent=self)
+        report.exec()
+
+        total = len(imported)
+        self._update_status(f"Imported {total} material{'s' if total != 1 else ''} from {fname}.")
+
+    def _create_property(self):
+        if not self.current_generator:
+            self.current_generator = NastranModelGenerator()
+            self._ensure_default_coords(self.current_generator.model)
+
+        if not self.current_generator.model.materials:
+            QMessageBox.warning(self, "No Materials", "You must create a material before creating a property.")
+            return
+
+        next_pid = max(self.current_generator.model.properties.keys()) + 1 if self.current_generator.model.properties else 1
+        
+        dialog = CreatePropertyDialog(next_pid, self.current_generator.model, self)
+        if dialog.exec():
+            if params := dialog.get_parameters():
+                cmd = AddPropertyCommand(params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created Property PID {params['pid']} ({params['type']}).")
+                self._populate_tree()
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_coord(self):
+        QMessageBox.information(self, "Not Implemented", "Coordinate system creation will be added in a future update.")
+
+    def _add_property_card_from_params(self, params):
+        params_copy = params.copy()
+        prop_type = params_copy.pop('type')
+        model = self.current_generator.model
+        pid = params_copy.pop('pid')
+        comment = params_copy.pop('comment')
+
+        if prop_type == 'PSHELL':
+            model.add_pshell(pid, mid1=params_copy['mid1'], t=params_copy['t'], nsm=params_copy['nsm'], comment=comment)
+        elif prop_type == 'PCOMP':
+            plies = params_copy['plies']
+            if plies:
+                mids, thicknesses, thetas, souts = zip(*plies)
+                model.add_pcomp(pid, list(mids), list(thicknesses), list(thetas), souts=list(souts),
+                                nsm=params_copy['nsm'], ft=params_copy['ft'], comment=comment)
+            else:
+                model.add_pcomp(pid, [], [], [], nsm=params_copy['nsm'], ft=params_copy['ft'], comment=comment)
+
+        elif prop_type == 'PBAR':
+            model.add_pbar(pid, params_copy['mid'], params_copy['A'], params_copy['i1'], params_copy['i2'], params_copy['j'], comment=comment)
+        elif prop_type == 'PBEAM':
+            model.add_pbeam(pid, params_copy['mid'], [0.0], ['C'], [params_copy['A']], [params_copy['i1']],
+                            [params_copy['i2']], [0.0], [params_copy['j']], comment=comment)
+        elif prop_type == 'PBUSH':
+            model.add_pbush(pid, k=params_copy['k'], b=[], ge=[], comment=comment)
+
+    def _set_standard_view(self, view):
+        if view == 'top': self.plotter.view_xy()
+        elif view == 'bottom': self.plotter.view_xy(negative=True)
+        elif view == 'front': self.plotter.view_yz()
+        elif view == 'back': self.plotter.view_yz(negative=True)
+        elif view == 'right': self.plotter.view_xz()
+        elif view == 'left': self.plotter.view_xz(negative=True)
+        self._update_status(f"View set to: {view.capitalize()}")
+
+    # ------------------------------------------------------------------
+    # View-cube icon generation (CATIA / SolidWorks style)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_view_cube_icon(view_name, size=24):
+        """Generate a small isometric 3D-cube icon with one face highlighted.
+
+        Blue highlight = positive direction (top/front/right).
+        Orange highlight = negative direction (bottom/back/left).
+        Isometric = all faces tinted equally.
+        """
+        from PySide6.QtCore import QPointF
+
+        pixmap = QPixmap(size, size)
+        pixmap.fill(QColor(0, 0, 0, 0))
+
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        cx, cy = size * 0.5, size * 0.5
+        w = size * 0.34       # horizontal half-extent of the hexagon
+        h = size * 0.19       # vertical step per axis
+
+        # Six vertices of the hexagonal isometric-cube projection
+        vtop = QPointF(cx, cy - 2 * h)
+        vul  = QPointF(cx - w, cy - h)
+        vur  = QPointF(cx + w, cy - h)
+        vctr = QPointF(cx, cy)
+        vll  = QPointF(cx - w, cy + h)
+        vlr  = QPointF(cx + w, cy + h)
+        vbot = QPointF(cx, cy + 2 * h)
+
+        top_face   = QPolygonF([vtop, vur, vctr, vul])
+        left_face  = QPolygonF([vul, vctr, vbot, vll])
+        right_face = QPolygonF([vur, vlr, vbot, vctr])
+
+        # Which projected face corresponds to each real-world view
+        # (standard isometric from +X, +Y, +Z octant):
+        #   top diamond  → Z+ (top)      / Z- (bottom)
+        #   right quad   → X+ (front)    / X- (back)
+        #   left quad    → Y+ (right)    / Y- (left)
+        face_key = {
+            'top': 'top', 'bottom': 'top',
+            'front': 'right', 'back': 'right',
+            'right': 'left', 'left': 'left',
+            'iso': 'all',
+        }
+        active = face_key.get(view_name, 'all')
+        is_neg = view_name in ('bottom', 'back', 'left')
+
+        # Highlight colour per direction
+        hi_blue   = QColor(100, 165, 255, 215)
+        hi_orange = QColor(248, 163, 76, 215)
+        hi = hi_orange if is_neg else hi_blue
+
+        # Dim face shades (top lightest, right mid, left darkest)
+        dim_top   = QColor(78, 83, 112, 175)
+        dim_right = QColor(62, 67, 97, 165)
+        dim_left  = QColor(50, 55, 82, 155)
+
+        # Isometric: pleasant blue tints
+        iso_top   = QColor(92, 152, 215, 195)
+        iso_right = QColor(72, 122, 190, 180)
+        iso_left  = QColor(58, 102, 170, 170)
+
+        if active == 'all':
+            colors = {'top': iso_top, 'right': iso_right, 'left': iso_left}
+        else:
+            colors = {
+                'top':   hi if active == 'top'   else dim_top,
+                'right': hi if active == 'right' else dim_right,
+                'left':  hi if active == 'left'  else dim_left,
+            }
+
+        edge_pen = QPen(QColor(170, 190, 230, 195), 1.0)
+
+        # Draw faces back-to-front: left, right, top
+        for fname, poly in [('left', left_face),
+                            ('right', right_face),
+                            ('top', top_face)]:
+            p.setPen(edge_pen)
+            p.setBrush(QBrush(colors[fname]))
+            p.drawPolygon(poly)
+
+        p.end()
+        return QIcon(pixmap)
+
+    def _toggle_origin(self, state):
+        if state: self.plotter.add_mesh(pv.Sphere(center=(0,0,0), radius=0.01 * self.current_grid.length if self.current_grid else 0.05), color='cyan', name='origin_actor', reset_camera=False)
+        else: self.plotter.remove_actor('origin_actor')
+
+    def _toggle_shading(self, state):
+        for actor in self.plotter.renderer.actors.values():
+            if hasattr(actor, 'prop') and actor.prop is not None:
+                if state:
+                    actor.prop.lighting = True
+                    actor.prop.interpolation = 'phong'
+                    actor.prop.ambient = 0.0
+                    actor.prop.diffuse = 1.0
+                else:
+                    actor.prop.lighting = False
+                    actor.prop.ambient = 1.0
+                    actor.prop.diffuse = 0.0
+
+        self._update_status(f"Shading {'ON' if state else 'OFF'}.")
+        self.plotter.render()
+        
+    def _zoom_to_model(self):
+        if self.current_grid: self.plotter.reset_camera(bounds=self.current_grid.bounds)
+        
+    def _zoom_to_all(self):
+        if self.current_grid:
+            # --- FIX: Manually calculate the expanded bounding box ---
+            # Get the original bounds (xmin, xmax, ymin, ymax, zmin, zmax)
+            bounds = np.array(self.current_grid.bounds).reshape(3, 2)
+            
+            # Calculate the center and size (extent) of the box
+            center = np.mean(bounds, axis=1)
+            extents = bounds[:, 1] - bounds[:, 0]
+            
+            # Increase the extents by a 1.1x factor
+            new_extents = extents * 1.1
+            
+            # Calculate the new min/max points from the new center and extents
+            new_bounds_arr = np.vstack([
+                center - new_extents / 2,
+                center + new_extents / 2
+            ]).T.ravel()
+            
+            # Apply the new, expanded bounds to the camera
+            self.plotter.reset_camera(bounds=new_bounds_arr)
+        
+    def _create_nodes(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator:
+            self.current_generator = NastranModelGenerator()
+            self._ensure_default_coords(self.current_generator.model)
+        next_id = self.current_generator.get_next_available_id('node'); dialog = CreateNodesDialog(next_id, self)
+        dialog.accepted.connect(self._on_node_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+        
+    def _on_node_creation_accept(self):
+        if not self.active_creation_dialog: return
+        params = self.active_creation_dialog.get_creation_parameters()
+        if params:
+            model = self.current_generator.model
+            if params['type'] == 'single':
+                nid = params['id'] or self.current_generator.get_next_available_id('node')
+                cmd = AddNodesCommand([(nid, *params['coords'])])
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Created Node: {nid}")
+            elif params['type'] == 'between':
+                # Pre-compute the interpolated positions so we can wrap them
+                start = model.nodes[params['start_nid']].get_position()
+                end = model.nodes[params['end_nid']].get_position()
+                num = params['num_nodes']
+                node_data = []
+                for i in range(1, num + 1):
+                    frac = i / (num + 1.0)
+                    coord = start + frac * (end - start)
+                    nid = self.current_generator.get_next_available_id('node')
+                    node_data.append((nid, float(coord[0]), float(coord[1]), float(coord[2])))
+                cmd = AddNodesCommand(node_data)
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Created {len(node_data)} nodes.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        self.active_creation_dialog = None
+        
+    def _create_line_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "Create properties first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreateLineElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_line_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+        
+    def _on_line_creation_accept(self):
+        if not self.active_creation_dialog: return
+        params = self.active_creation_dialog.get_parameters()
+        if params:
+            if not params.get('eid'):
+                params['eid'] = self.current_generator.get_next_available_id('element')
+            cmd = AddElementCommand('line', params)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            self._update_status(f"Created {params['type']}: {cmd._created_eid}")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        self._highlight_nodes([])
+        self.active_creation_dialog = None
+        
+    def _create_plate_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "Create properties first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreatePlateElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_plate_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+        
+
+    def _on_plate_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddElementCommand('plate', params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created {params['type']}: {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+        
+    
+
+# START: New handler methods in main.py
+    def _create_bush_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator: return
+        
+        # Check if any PBUSH properties exist
+        has_pbush = any(prop.type == 'PBUSH' for prop in self.current_generator.model.properties.values())
+        if not has_pbush:
+            QMessageBox.warning(self, "No Bush Properties", "You must create a PBUSH property before creating a CBUSH element.")
+            return
+
+        next_eid = self.current_generator.get_next_available_id('element')
+        dialog = CreateBushElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_bush_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _on_bush_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddElementCommand('bush', params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created CBUSH: {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+# END: New handler methods in main.py
+
+
+
+
+
+
+    def _create_rbes(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.nodes: QMessageBox.warning(self, "No Nodes", "Create nodes first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreateRbeDialog(next_eid, self.current_generator.model.nodes.keys(), self)
+        dialog.accepted.connect(self._on_rbe_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _delete_nodes(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Model", "No nodes to delete.")
+            return
+        if self.selection_bar.isVisible():
+            return
+        all_node_ids = self.current_generator.model.nodes.keys()
+        self._start_selection('Node', all_node_ids, self._on_delete_nodes_accept)
+
+    def _on_delete_nodes_accept(self):
+        node_ids = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not node_ids: return
+
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                   f"Are you sure you want to delete {len(node_ids)} selected node(s)? "
+                                   "All connected elements will also be deleted.",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            cmd = DeleteNodesCommand(node_ids)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            n_nodes = len(cmd._deleted_nodes)
+            n_elems = len(cmd._deleted_elements) + len(cmd._deleted_rigid_elements)
+            self._update_status(f"Deleted {n_nodes} nodes and {n_elems} elements.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _delete_elements(self):
+        if not self.current_generator or not self.current_grid or self.current_grid.n_cells == 0:
+            QMessageBox.warning(self, "No Model", "No elements to delete.")
+            return
+        if self.selection_bar.isVisible():
+            return
+        all_eids = self.current_grid.cell_data['EID']
+        self._start_selection('Element', all_eids,
+                              self._on_delete_elements_accept,
+                              self._build_select_by_data())
+
+    def _on_delete_elements_accept(self):
+        eids_to_delete = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not eids_to_delete: return
+        
+        reply = QMessageBox.question(self, "Confirm Deletion",
+                                f"Are you sure you want to delete {len(eids_to_delete)} element(s)?",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            cmd = DeleteElementsCommand(eids_to_delete)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            deleted_count = len(cmd._deleted_elements) + len(cmd._deleted_rigid_elements)
+            self._update_status(f"Deleted {deleted_count} elements.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _delete_mesh(self):
+        if not self.current_generator: return
+        reply = QMessageBox.question(self, "Confirm Delete Mesh",
+                                   "Are you sure you want to delete all nodes and elements?",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.current_generator.model = BDF(debug=False)
+            self._ensure_default_coords(self.current_generator.model)
+            self._update_viewer(self.current_generator)
+            self._update_status("Mesh deleted.")
+
+    def _delete_coord_system_menu(self):
+        """Opens a dialog to select and delete a user-created coordinate system."""
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "No model loaded.")
+            return
+        model = self.current_generator.model
+        user_cids = [cid for cid in sorted(model.coords.keys()) if cid > 2]
+        if not user_cids:
+            QMessageBox.information(self, "No Coordinate Systems", "There are no user-created coordinate systems to delete.")
+            return
+        from PySide6.QtWidgets import QInputDialog
+        items = [f"CID {cid}" for cid in user_cids]
+        item, ok = QInputDialog.getItem(self, "Delete Coordinate System", "Select coordinate system to delete:", items, 0, False)
+        if ok and item:
+            cid = int(item.split()[1])
+            reply = QMessageBox.question(self, "Confirm Deletion",
+                f"Are you sure you want to delete Coordinate System {cid}?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteCoordCommand(cid)
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Deleted Coordinate System {cid}.")
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _show_model_summary(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please load or create a model first.")
+            return
+        model = self.current_generator.model
+
+        # --- Nodes ---
+        num_nodes = len(model.nodes)
+
+        # --- Elements by type ---
+        all_elems = {**model.elements, **model.rigid_elements}
+        elem_counts = Counter(e.type for e in all_elems.values())
+
+        # --- Properties, Materials, Coords ---
+        num_props = len(model.properties)
+        num_mats = len(model.materials)
+        num_coords = len(model.coords) - 1  # exclude default CID 0
+
+        # --- Loads & Constraints ---
+        load_sids = sorted(model.loads.keys()) if model.loads else []
+        spc_sids = sorted(model.spcs.keys()) if model.spcs else []
+
+        # --- Masses (CONM2) ---
+        total_mass = sum(m.mass for m in model.masses.values()) if model.masses else 0.0
+
+        # --- Build text ---
+        sep = "-" * 34
+        lines = []
+        lines.append(sep)
+        lines.append(f"  Nodes          {num_nodes:>10d}")
+        lines.append(f"  Elements       {len(all_elems):>10d}")
+        lines.append(sep)
+
+        if elem_counts:
+            for etype, count in sorted(elem_counts.items()):
+                lines.append(f"    {etype:<16s}{count:>8d}")
+            lines.append(sep)
+
+        lines.append(f"  Properties     {num_props:>10d}")
+        lines.append(f"  Materials      {num_mats:>10d}")
+        lines.append(f"  Coord Systems  {max(num_coords, 0):>10d}")
+
+        if model.masses:
+            lines.append(sep)
+            lines.append(f"  Mass Elements  {len(model.masses):>10d}")
+            lines.append(f"  Total Mass     {total_mass:>14.4f}")
+
+        if load_sids or spc_sids:
+            lines.append(sep)
+            if load_sids:
+                lines.append(f"  Load SIDs:  {', '.join(str(s) for s in load_sids)}")
+            if spc_sids:
+                lines.append(f"  SPC SIDs:   {', '.join(str(s) for s in spc_sids)}")
+
+        lines.append(sep)
+
+        InfoDialog("Model Summary", "\n".join(lines), self).exec()
+
+    def _show_mass_summary(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please load or create a model first.")
+            return
+        model = self.current_generator.model
+        if not model.elements and not model.masses:
+            QMessageBox.warning(self, "No Data", "Model has no elements or mass elements.")
+            return
+
+        result = self.current_generator.calculate_mass_summary()
+        sep = "-" * 38
+        lines = []
+        lines.append(sep)
+        lines.append(f"  Total Mass       {result['total_mass']:>14.4f}")
+        lines.append(sep)
+        lines.append(f"  Structural Mass  {result['structural_mass']:>14.4f}")
+        lines.append(f"  CONM2 Mass       {result['conm2_mass']:>14.4f}")
+        lines.append(sep)
+        cg = result['cg']
+        lines.append(f"  CG  X            {cg[0]:>14.4f}")
+        lines.append(f"  CG  Y            {cg[1]:>14.4f}")
+        lines.append(f"  CG  Z            {cg[2]:>14.4f}")
+
+        if result['by_pid']:
+            lines.append(sep)
+            lines.append("  Mass by Property:")
+            for pid in sorted(result['by_pid'].keys()):
+                lines.append(f"    PID {pid:<8d}   {result['by_pid'][pid]:>14.4f}")
+
+        if result['notes']:
+            lines.append(sep)
+            for note in result['notes']:
+                lines.append(f"  * {note}")
+
+        lines.append(sep)
+        InfoDialog("Mass & CG Summary", "\n".join(lines), self).exec()
+
+    # ─── F16: Find/Replace Property/Material ─────────────────────────────
+
+    def _open_find_replace_dialog(self):
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Model", "Please load a model with elements first.")
+            return
+
+        model = self.current_generator.model
+        dialog = FindReplaceDialog(model, self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_parameters()
+            if params is None:
+                return
+
+            if params['mode'] == 'property':
+                # Find all elements with matching PID
+                eids = [eid for eid, e in model.elements.items()
+                        if hasattr(e, 'pid') and e.pid == params['from_id']]
+                if not eids:
+                    self._update_status("No elements found with that property.", is_error=True)
+                    return
+                cmd = ReassignPropertyCommand(eids, params['to_id'])
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Reassigned {len(eids)} elements from PID {params['from_id']} to PID {params['to_id']}.")
+            else:
+                # Find all properties with matching MID
+                pids = [pid for pid, p in model.properties.items()
+                        if (hasattr(p, 'mid') and p.mid == params['from_id']) or
+                           (hasattr(p, 'mid1') and p.mid1 == params['from_id'])]
+                if not pids:
+                    self._update_status("No properties found with that material.", is_error=True)
+                    return
+                cmd = ReassignMaterialCommand(pids, params['to_id'])
+                self.command_manager.execute(cmd, model)
+                self._update_status(f"Reassigned {len(pids)} properties from MID {params['from_id']} to MID {params['to_id']}.")
+
+            self._update_viewer(self.current_generator, reset_camera=False)
+            self._populate_tree()
+
+    # ─── F8: LOAD Combination ────────────────────────────────────────────
+
+    def _create_load_combination(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            return
+        model = self.current_generator.model
+        if not model.loads:
+            QMessageBox.warning(self, "No Loads", "No load sets exist to combine.")
+            return
+
+        dialog = CreateLoadCombinationDialog(model, self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_parameters()
+            if params is None:
+                return
+            cmd = AddLoadCombinationCommand(params)
+            self.command_manager.execute(cmd, model)
+            self._populate_tree()
+            self._update_status(f"Created LOAD combination SID {params['sid']}.")
+
+    # ─── F5: Subcase / Case Control ──────────────────────────────────────
+
+    def _open_subcase_editor(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            return
+        model = self.current_generator.model
+        eigrl_sids = [e['sid'] for e in self.eigrl_cards]
+        dialog = SubcaseEditorDialog(model, self.subcases, eigrl_sids=eigrl_sids, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            result = dialog.get_subcases()
+            if result is not None:
+                self.subcases = result
+                self._update_status(f"Defined {len(self.subcases)} subcase(s) for case control.")
+
+    def _apply_case_control(self):
+        """Applies the subcase definitions to the model's case control deck before saving."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+
+        # Check if we have an active analysis set — use it if available
+        active_set = self.analysis_sets.get(self.active_analysis_set_id)
+        if active_set:
+            return self._apply_case_control_from_set(model, active_set)
+
+        # --- Legacy behavior (no analysis set) ---
+
+        # Set SOL type
+        if self.sol_type:
+            model.sol = self.sol_type
+
+        # Add EIGRL cards to bulk data
+        for eigrl in self.eigrl_cards:
+            try:
+                model.add_eigrl(eigrl['sid'], v1=eigrl.get('v1'),
+                                v2=eigrl.get('v2'), nd=eigrl.get('nd'))
+            except Exception:
+                pass  # May already exist from previous save
+
+        if not self.subcases:
+            model.case_control_deck = None
+            return
+
+        from pyNastran.bdf.case_control_deck import CaseControlDeck
+        lines = ['CEND']
+        model.case_control_deck = CaseControlDeck(lines, log=None)
+        for sc in self.subcases:
+            subcase = model.case_control_deck.create_new_subcase(sc['id'])
+            if sc.get('load_sid'):
+                subcase.add('LOAD', sc['load_sid'], [], 'STRESS-type')
+            if sc.get('spc_sid'):
+                subcase.add('SPC', sc['spc_sid'], [], 'STRESS-type')
+            if sc.get('method_sid'):
+                subcase.add('METHOD', sc['method_sid'], [], 'STRESS-type')
+            if sc.get('statsub_id'):
+                subcase.add('STATSUB', sc['statsub_id'], [], 'STRESS-type')
+            # Output requests
+            for req_key, req_name in [('disp', 'DISPLACEMENT'), ('stress', 'STRESS'),
+                                       ('force', 'FORCE'), ('strain', 'STRAIN')]:
+                val = sc.get(req_key, 'NONE')
+                if val == 'ALL':
+                    subcase.add(req_name, 'ALL', ['SORT1'], 'STRESS-type')
+
+    def _apply_case_control_from_set(self, model, active_set):
+        """Apply case control from an AnalysisSet object."""
+        # 1. SOL type
+        if active_set.sol_type:
+            model.sol = active_set.sol_type
+
+        # 2. EIGRL card
+        if active_set.eigrl:
+            try:
+                model.add_eigrl(
+                    active_set.eigrl['sid'],
+                    v1=active_set.eigrl.get('v1'),
+                    v2=active_set.eigrl.get('v2'),
+                    nd=active_set.eigrl.get('nd'))
+            except Exception:
+                pass
+
+        # 3. PARAM cards
+        for param_name, param_value in active_set.params.items():
+            try:
+                model.add_card(['PARAM', param_name, param_value], 'PARAM')
+            except Exception:
+                pass
+
+        # 4. Case control deck
+        subcases = active_set.subcases
+        if not subcases:
+            # No subcases — write global output requests only
+            from pyNastran.bdf.case_control_deck import CaseControlDeck
+            lines = ['CEND']
+            model.case_control_deck = CaseControlDeck(lines, log=None)
+            # Global output requests
+            output_map = {
+                'displacement': 'DISPLACEMENT', 'velocity': 'VELOCITY',
+                'acceleration': 'ACCELERATION', 'stress': 'STRESS',
+                'strain': 'STRAIN', 'force': 'FORCE',
+                'spcforce': 'SPCFORCES', 'mpcforce': 'MPCFORCES',
+                'gpforce': 'GPFORCE', 'oload': 'OLOAD',
+            }
+            for key, cc_name in output_map.items():
+                val = active_set.output_requests.get(key, 'NONE')
+                if val == 'ALL':
+                    model.case_control_deck.add_parameter_to_global_subcase(
+                        f'{cc_name}(PLOT) = ALL')
+            return
+
+        from pyNastran.bdf.case_control_deck import CaseControlDeck
+        lines = ['CEND']
+        model.case_control_deck = CaseControlDeck(lines, log=None)
+
+        for sc in subcases:
+            subcase = model.case_control_deck.create_new_subcase(sc['id'])
+            if sc.get('load_sid'):
+                subcase.add('LOAD', sc['load_sid'], [], 'STRESS-type')
+            if sc.get('spc_sid'):
+                subcase.add('SPC', sc['spc_sid'], [], 'STRESS-type')
+            if sc.get('method_sid'):
+                subcase.add('METHOD', sc['method_sid'], [], 'STRESS-type')
+            if sc.get('statsub_id'):
+                subcase.add('STATSUB', sc['statsub_id'], [], 'STRESS-type')
+
+            # Per-subcase output requests (from subcase dict if present)
+            for req_key, req_name in [('disp', 'DISPLACEMENT'), ('stress', 'STRESS'),
+                                       ('force', 'FORCE'), ('strain', 'STRAIN')]:
+                val = sc.get(req_key, 'NONE')
+                if val == 'ALL':
+                    subcase.add(req_name, 'ALL', ['SORT1'], 'STRESS-type')
+
+            # Additional global output requests from the analysis set
+            extra_map = {
+                'velocity': 'VELOCITY', 'acceleration': 'ACCELERATION',
+                'spcforce': 'SPCFORCES', 'mpcforce': 'MPCFORCES',
+                'gpforce': 'GPFORCE', 'oload': 'OLOAD',
+            }
+            for key, cc_name in extra_map.items():
+                val = active_set.output_requests.get(key, 'NONE')
+                if val == 'ALL':
+                    subcase.add(cc_name, 'ALL', ['SORT1'], 'STRESS-type')
+
+    # ─── F6: Renumber Nodes/Elements ─────────────────────────────────────
+
+    def _open_renumber_dialog(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            return
+
+        model = self.current_generator.model
+        dialog = RenumberDialog(model, self)
+        if dialog.exec() == QDialog.Accepted:
+            params = dialog.get_parameters()
+            if params is None:
+                return
+            if not params['do_nodes'] and not params['do_elements']:
+                self._update_status("Nothing selected to renumber.", is_error=True)
+                return
+
+            cmd = RenumberCommand(
+                params['start_nid'], params['start_eid'],
+                params['do_nodes'], params['do_elements']
+            )
+            self.command_manager.execute(cmd, model)
+            # Clear groups since all IDs changed
+            self.groups.clear()
+            self._hidden_groups.clear()
+            self._isolate_mode = None
+            self._populate_groups_list()
+            self._update_viewer(self.current_generator, reset_camera=False)
+            self._populate_tree()
+            self._update_status("IDs renumbered successfully.")
+
+    def _list_node_info(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Model", "No nodes to list.")
+            return
+        if self.selection_bar.isVisible():
+            return
+        all_node_ids = self.current_generator.model.nodes.keys()
+        self._start_selection('Node', all_node_ids, self._on_list_nodes_accept)
+
+    def _list_element_info(self):
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Model", "No elements to list.")
+            return
+        if self.selection_bar.isVisible():
+            return
+        all_elements = {**self.current_generator.model.elements, **self.current_generator.model.rigid_elements}
+        if not all_elements:
+            QMessageBox.warning(self, "No Model", "No elements to list.")
+            return
+        self._start_selection('Element', all_elements.keys(),
+                              self._on_list_elements_accept,
+                              self._build_select_by_data())
+
+    def _on_rbe_creation_accept(self):
+        if not self.active_creation_dialog: return
+        params = self.active_creation_dialog.get_parameters()
+        if params:
+            if not params.get('eid'):
+                params['eid'] = self.current_generator.get_next_available_id('element')
+            cmd = AddElementCommand('rbe', params)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            self._update_status(f"Created {params.get('elem_type', 'RBE')}: {cmd._created_eid}")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        self.active_creation_dialog = None
+
+    def _create_conm2(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Nodes", "Create nodes first."); return
+        next_eid = self.current_generator.get_next_available_id('element')
+        dialog = CreateConm2Dialog(next_eid, self.current_generator.model.nodes.keys(), self)
+        dialog.accepted.connect(self._on_conm2_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _on_conm2_creation_accept(self):
+        if not self.active_creation_dialog: return
+        params = self.active_creation_dialog.get_parameters()
+        if params:
+            if not params.get('eid'):
+                params['eid'] = self.current_generator.get_next_available_id('element')
+            cmd = AddMassCommand(params)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            self._update_status(f"Created CONM2 (mass={params['mass']}) at node {params['nid']}: EID {cmd._created_eid}")
+            self._update_viewer(self.current_generator, reset_camera=False)
+        self.active_creation_dialog = None
+
+    def _create_solid_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "Create properties first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreateSolidElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_solid_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _on_solid_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddElementCommand('solid', params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created {params['type']}: EID {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+
+    def _create_shear_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "Create properties first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreateShearElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_shear_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _on_shear_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddElementCommand('shear', params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created CSHEAR: EID {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+
+    def _create_gap_elements(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "Create properties first."); return
+        next_eid = self.current_generator.get_next_available_id('element'); dialog = CreateGapElementDialog(next_eid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_gap_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _on_gap_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddElementCommand('gap', params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created CGAP: EID {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+
+    def _create_plotels(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Nodes", "Create nodes first."); return
+        next_eid = self.current_generator.get_next_available_id('element')
+        dialog = CreatePlotelDialog(next_eid, self.current_generator.model.nodes.keys(), self)
+        dialog.accepted.connect(self._on_plotel_creation_accept); dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose); dialog.show(); self.active_creation_dialog = dialog
+
+    def _on_plotel_creation_accept(self):
+        if not self.active_creation_dialog: return
+        try:
+            params = self.active_creation_dialog.get_parameters()
+            if params:
+                if not params.get('eid'):
+                    params['eid'] = self.current_generator.get_next_available_id('element')
+                cmd = AddPlotelCommand(params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_status(f"Created PLOTEL: Nodes {params['nodes'][0]}-{params['nodes'][1]}, EID {cmd._created_eid}")
+                self._update_viewer(self.current_generator, reset_camera=False)
+        finally:
+            self._highlight_entities('Node', [])
+            self.active_creation_dialog = None
+
+    def _on_creation_reject(self):
+        self._update_status("Creation cancelled.")
+        self._highlight_entities('Node', [])
+        self.active_creation_dialog = None
+
+    def _open_node_move_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Model", "Load a model first.")
+            return
+        all_node_ids = self.current_generator.model.nodes.keys()
+        self._start_selection('Node', all_node_ids, self._on_move_nodes_accept)
+
+    # ------------------------------------------------------------------
+    # Selection bar helpers
+    # ------------------------------------------------------------------
+
+    def _start_selection(self, entity_type, all_ids, accept_callback,
+                         select_by_data=None):
+        """Start a selection workflow using the floating selection window."""
+        if self.selection_bar.isVisible():
+            return  # already in a selection workflow
+        self.current_selection_type = entity_type
+        self.selection_bar.configure(
+            entity_type, all_ids,
+            select_by_data=select_by_data,
+            groups=self.groups)
+        self.selection_bar.show()
+        self.active_selection_dialog = self.selection_bar
+        self._selection_accept_callback = accept_callback
+
+    def _on_selection_bar_accepted(self):
+        """Route the bar's OK signal to the stored callback."""
+        if self._selection_accept_callback:
+            self._selection_accept_callback()
+
+    def _on_selection_bar_rejected(self):
+        """Handle the bar's Cancel signal."""
+        # If we were selecting for a creation dialog, re-show it
+        if getattr(self, '_selection_reject_restore_creation', False):
+            self._selection_reject_restore_creation = False
+            if self.active_creation_dialog:
+                self.active_creation_dialog.show()
+        self._update_status("Selection cancelled.")
+        self._end_selection_mode()
+
+    def _end_selection_mode(self):
+        """Hide the selection bar and clean up selection state."""
+        bar = self.selection_bar
+        if bar.isVisible():
+            entity_type = bar.entity_type
+            if entity_type == 'Node' and bar.selected_ids:
+                self._previous_node_selection = set(bar.selected_ids)
+            elif entity_type == 'Element' and bar.selected_ids:
+                self._previous_element_selection = set(bar.selected_ids)
+            bar.hide()
+
+        self.active_selection_dialog = None
+        self._selection_accept_callback = None
+
+        if self.current_selection_type:
+            self._highlight_entities(self.current_selection_type, [])
+            self._set_picking_mode(self.current_selection_type, False)
+
+        self.current_selection_type = None
+
+    def _on_list_nodes_accept(self):
+        selected_ids = self.selection_bar.get_selected_ids()
+        if selected_ids:
+            from node_runner.dialogs.info import NodeElementInfoDialog
+            columns = ['NID', 'X', 'Y', 'Z', 'CP', 'CD', 'PS', 'SEID']
+            tooltips = {
+                'NID': 'Node ID — unique identifier for this grid point',
+                'X': 'X coordinate in the position coordinate system (CP)',
+                'Y': 'Y coordinate in the position coordinate system (CP)',
+                'Z': 'Z coordinate in the position coordinate system (CP)',
+                'CP': 'Position Coordinate System — the coordinate system in which X, Y, Z are defined. 0 = basic rectangular.',
+                'CD': 'Displacement Coordinate System — the coordinate system for displacement, force, and constraint output. 0 = basic rectangular.',
+                'PS': 'Permanent Single-point Constraints — DOFs permanently constrained at this node (digits 1-6 map to T1, T2, T3, R1, R2, R3).',
+                'SEID': 'Superelement ID — 0 means the node belongs to the residual structure.',
+            }
+            rows = []
+            for nid in selected_ids:
+                if nid in self.current_generator.model.nodes:
+                    node = self.current_generator.model.nodes[nid]
+                    rows.append({
+                        'NID': node.nid,
+                        'X': round(node.xyz[0], 8), 'Y': round(node.xyz[1], 8), 'Z': round(node.xyz[2], 8),
+                        'CP': node.cp, 'CD': node.cd,
+                        'PS': str(node.ps) if node.ps else '',
+                        'SEID': node.seid,
+                    })
+            title = f"Node Information ({len(rows)} node{'s' if len(rows) != 1 else ''})"
+            info_dialog = NodeElementInfoDialog(title, rows, columns, self, column_tooltips=tooltips)
+            info_dialog.exec()
+
+        self._end_selection_mode()
+
+    def _on_list_elements_accept(self):
+        selected_ids = self.selection_bar.get_selected_ids()
+        if selected_ids:
+            from node_runner.dialogs.info import NodeElementInfoDialog
+            all_elements = {**self.current_generator.model.elements, **self.current_generator.model.rigid_elements}
+            columns = ['EID', 'Type', 'PID', 'MID', 'Nodes']
+            tooltips = {
+                'EID': 'Element ID — unique identifier for this element',
+                'Type': 'Element type (e.g. CQUAD4, CTRIA3, CBEAM, CBUSH, RBE2)',
+                'PID': 'Property ID — references the property card that defines element thickness, material, etc.',
+                'MID': 'Material ID — the material referenced by this element\'s property',
+                'Nodes': 'Grid point IDs defining this element\'s connectivity',
+            }
+            rows = []
+            model = self.current_generator.model
+            for eid in selected_ids:
+                if eid in all_elements:
+                    elem = all_elements[eid]
+                    pid = getattr(elem, 'pid', '')
+                    mid = ''
+                    if pid and pid in model.properties:
+                        prop = model.properties[pid]
+                        mid = getattr(prop, 'mid', None) or getattr(prop, 'mid1', None) or ''
+                    nodes_str = ', '.join(str(n) for n in elem.nodes) if hasattr(elem, 'nodes') else ''
+                    rows.append({
+                        'EID': elem.eid, 'Type': elem.type,
+                        'PID': pid, 'MID': mid, 'Nodes': nodes_str,
+                    })
+            title = f"Element Information ({len(rows)} element{'s' if len(rows) != 1 else ''})"
+            info_dialog = NodeElementInfoDialog(title, rows, columns, self, column_tooltips=tooltips)
+            info_dialog.exec()
+
+        self._end_selection_mode()
+
+    def _on_move_nodes_accept(self):
+        """Handle node move: open transform dialog after selection."""
+        selected_ids = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if selected_ids:
+            transform_dialog = NodeTransformDialog(self)
+            if transform_dialog.exec() and (params := transform_dialog.get_transform_parameters()):
+                cmd = TransformNodesCommand(selected_ids, params)
+                self.command_manager.execute(cmd, self.current_generator.model)
+                self._update_viewer(self.current_generator)
+                self._update_status(f"Moved {len(selected_ids)} nodes.")
+            else:
+                self._update_status("Node transform cancelled.")
+
+    def _open_element_editor(self):
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model contains no elements to edit.")
+            return
+
+        dialog = ElementEditorDialog(self.current_generator.model, self)
+        # Snapshot the element before the dialog mutates it
+        pre_edit_snapshot = None
+        original_accept = dialog.accept
+        def accept_with_snapshot():
+            nonlocal pre_edit_snapshot
+            if dialog.current_eid and dialog.current_eid in self.current_generator.model.elements:
+                pre_edit_snapshot = copy.deepcopy(self.current_generator.model.elements[dialog.current_eid])
+            original_accept()
+        dialog.accept = accept_with_snapshot
+
+        if dialog.exec():
+            eid = dialog.current_eid
+            if eid and pre_edit_snapshot is not None:
+                # The dialog already mutated the element. Create a command
+                # that stores the old snapshot and can redo/undo.
+                elem = self.current_generator.model.elements[eid]
+                cmd = EditElementCommand(eid, elem.pid, list(elem.nodes),
+                                         dialog.orientation_widget.get_orientation() if dialog.orientation_widget else None)
+                # Manually set old state instead of executing (already done by dialog)
+                cmd._old_element = pre_edit_snapshot
+                self.command_manager.undo_stack.append(cmd)
+                if len(self.command_manager.undo_stack) > self.command_manager.max_history:
+                    self.command_manager.undo_stack.pop(0)
+                self.command_manager.redo_stack.clear()
+
+            self._update_status(f"Element {eid} modified.")
+            self._update_viewer(self.current_generator)
+
+# Location: main.py, around line 2862
+# --- MODIFY THE METHOD SIGNATURE AND ADD ONE LINE ---
+    def _activate_single_node_picker(self, target_callback, calling_dialog=None):
+        self.picking_target_callback = target_callback
+        self.active_sub_dialog = calling_dialog # Store a reference to the dialog
+        self._set_picking_mode("Node", True)
+        self._update_status("PICKING MODE: Click a single node.")
+
+    def _highlight_entities(self, entity_type, entity_ids):
+        camera_before = self.plotter.camera.copy()
+
+        self.plotter.remove_actor('selection_highlight', render=False)
+
+        # Phase 8: Track current selection for group management
+        if entity_type == 'Node':
+            self._current_selection_nids = list(entity_ids) if entity_ids else []
+        elif entity_type == 'Element':
+            self._current_selection_eids = list(entity_ids) if entity_ids else []
+
+        if not entity_ids or not self.current_generator or not self.current_grid:
+            self.plotter.render()
+            return
+
+        if entity_type == 'Node':
+            coords = []
+            for nid in entity_ids:
+                if nid in self.current_generator.model.nodes:
+                    coords.append(self.current_generator.model.nodes[nid].get_position())
+            
+            if coords:
+                self.plotter.add_points(
+                    np.array(coords),
+                    color='yellow',
+                    point_size=12,
+                    render_points_as_spheres=True,
+                    name='selection_highlight',
+                    reset_camera=False,
+                )
+
+        elif entity_type == 'Element':
+            indices = np.isin(self.current_grid.cell_data['EID'], entity_ids)
+            if np.any(indices):
+                highlight_grid = self.current_grid.extract_cells(indices)
+                self.plotter.add_mesh(
+                    highlight_grid, style='wireframe', color='yellow',
+                    line_width=5, name='selection_highlight', pickable=False,
+                    reset_camera=False
+                )
+
+        self.plotter.camera = camera_before
+        self.plotter.render()
+
+    def _update_rubber_band(self, start_vtk, end_vtk):
+        """Show/update the box selection overlay (VTK display coords)."""
+        self._selection_overlay.update_box(start_vtk, end_vtk)
+
+    def _update_circle_overlay(self, center_vtk, radius):
+        """Show/update the circle selection overlay (VTK display coords)."""
+        self._selection_overlay.update_circle(center_vtk, radius)
+
+    def _update_polygon_overlay(self, polygon_points_vtk, cursor_vtk=None):
+        """Show/update the polygon selection overlay (VTK display coords)."""
+        self._selection_overlay.update_polygon(polygon_points_vtk, cursor_vtk)
+
+    def _hide_rubber_band(self):
+        """Hide the selection overlay."""
+        if hasattr(self, '_selection_overlay'):
+            self._selection_overlay.hide_overlay()
+
+    def _set_picking_mode(self, entity_type, enabled):
+        if enabled:
+            if not self.default_interactor_style:
+                self.default_interactor_style = self.plotter.interactor_style
+            mode_label = self._pick_selection_mode.capitalize()
+            self._update_status(f"PICKING MODE ({mode_label}): Left=Select, Middle=Rotate, Ctrl+Middle=Pan, Scroll=Zoom. ENTER=accept, ESC=cancel.")
+            self.plotter.setCursor(QtCore.Qt.CrossCursor)
+            self.plotter.add_text(f"PICKING MODE ({mode_label}): Left=Select, Middle=Rotate, Ctrl+Mid=Pan. ENTER=accept, ESC=cancel", position='upper_right', color='yellow', font_size=8, name='picking_mode_text')
+            interactor = ClickAndDragInteractor(main_window=self)
+            interactor._selection_mode = self._pick_selection_mode  # Apply stored mode
+            self.plotter.interactor.SetInteractorStyle(interactor)
+        else:
+            self.plotter.setCursor(QtCore.Qt.ArrowCursor)
+            self.plotter.remove_actor('picking_mode_text')
+            if self.default_interactor_style:
+                self.plotter.interactor.SetInteractorStyle(self.default_interactor_style)
+            # Selection bar is embedded — no need to show/activate it after picking
+            if self.active_sub_dialog and not self.active_sub_dialog.isVisible():
+                self.active_sub_dialog.show()
+                self.active_sub_dialog.activateWindow()
+                self.active_sub_dialog = None # Clear reference after showing
+            if self.active_creation_dialog and not self.active_creation_dialog.isVisible():
+                self.active_creation_dialog.show()
+                self.active_creation_dialog.activateWindow()
+            self.picking_target_callback = None
+            if self.current_selection_type is None:
+                self._update_status("Picking mode disabled.")
+
+    def _request_disable_picking_mode(self):
+        QtCore.QTimer.singleShot(0, self._disable_picking_mode)
+
+    def _request_accept_picking_mode(self):
+        QtCore.QTimer.singleShot(0, self._accept_picking_mode)
+
+    def _accept_picking_mode(self):
+        if self.current_selection_type:
+            self._set_picking_mode(self.current_selection_type, False)
+        if self.selection_bar.isVisible():
+            self._update_status("Selection complete. Click OK to proceed.")
+
+    def _disable_picking_mode(self):
+        if self.current_selection_type:
+            self._set_picking_mode(self.current_selection_type, False)
+        else:
+            self._set_picking_mode('Node', False)
+
+
+# START: Corrected replacement for _update_viewer method in main.py
+    def _update_viewer(self, generator, reset_camera=True):
+        self.quality_results = None
+        self.plotter.clear()
+        self.plotter.add_axes()
+        self.axes_actor = self.plotter.renderer.axes_actor
+        self._set_axes_label_color((0.804, 0.839, 0.957) if self.is_dark_theme else (0, 0, 0))
+
+        self.current_generator, self.current_grid = generator, None
+        model = generator.model
+
+        if not model.nodes:
+            self.tree_widget.blockSignals(True)
+            self._populate_tree()
+            self.tree_widget.blockSignals(False)
+            self.current_grid = pv.UnstructuredGrid()
+            # Coord actors are handled centrally by _refresh_coord_actors
+            self._update_plot_visibility()
+            return
+
+        self.current_node_ids_sorted = sorted(model.nodes.keys())
+        node_map = {nid: i for i, nid in enumerate(self.current_node_ids_sorted)}
+        node_coords = np.array([model.nodes[nid].get_position() for nid in self.current_node_ids_sorted])
+
+        nodes_used_by_elements = set()
+        shells_conn, trias_conn, beams_conn, rods_conn, bush_conn = [], [], [], [], []
+        hexas_conn, tetras_conn, pentas_conn, shear_conn, gap_conn = [], [], [], [], []
+        # --- FIX: Track cell data per group to keep in sync with cell ordering ---
+        shells_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        trias_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        hexas_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        tetras_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        pentas_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        shear_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        beams_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        rods_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        bush_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        gap_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+
+        all_elements = {**model.elements, **model.rigid_elements}
+        for eid, elem in all_elements.items():
+            try:
+                # RBE2/RBE3 don't have .nodes — get node IDs via independent/dependent
+                if elem.type in ['RBE2', 'RBE3']:
+                    try:
+                        nodes_used_by_elements.update(elem.independent_nodes + elem.dependent_nodes)
+                    except (AttributeError, TypeError):
+                        pass
+                    continue  # RBEs are rendered separately via _create_rbe_actors()
+                nodes_used_by_elements.update(elem.nodes)
+
+                if elem.type in ['CQUAD4', 'CMEMBRAN']:
+                    shells_conn.append([4] + [node_map[nid] for nid in elem.nodes])
+                    shells_data['PID'].append(elem.pid); shells_data['EID'].append(eid); shells_data['type'].append(elem.type); shells_data['is_shell'].append(1)
+                elif elem.type == 'CTRIA3':
+                    trias_conn.append([3] + [node_map[nid] for nid in elem.nodes])
+                    trias_data['PID'].append(elem.pid); trias_data['EID'].append(eid); trias_data['type'].append(elem.type); trias_data['is_shell'].append(1)
+                elif elem.type in ['CHEXA', 'CHEXA8', 'CHEXA20']:
+                    nids = [n for n in elem.nodes[:8] if n]
+                    hexas_conn.append([len(nids)] + [node_map[nid] for nid in nids])
+                    hexas_data['PID'].append(elem.pid); hexas_data['EID'].append(eid); hexas_data['type'].append('CHEXA'); hexas_data['is_shell'].append(0)
+                elif elem.type in ['CTETRA', 'CTETRA4', 'CTETRA10']:
+                    nids = [n for n in elem.nodes[:4] if n]
+                    tetras_conn.append([len(nids)] + [node_map[nid] for nid in nids])
+                    tetras_data['PID'].append(elem.pid); tetras_data['EID'].append(eid); tetras_data['type'].append('CTETRA'); tetras_data['is_shell'].append(0)
+                elif elem.type in ['CPENTA', 'CPENTA6', 'CPENTA15']:
+                    nids = [n for n in elem.nodes[:6] if n]
+                    pentas_conn.append([len(nids)] + [node_map[nid] for nid in nids])
+                    pentas_data['PID'].append(elem.pid); pentas_data['EID'].append(eid); pentas_data['type'].append('CPENTA'); pentas_data['is_shell'].append(0)
+                elif elem.type == 'CSHEAR':
+                    shear_conn.append([4] + [node_map[nid] for nid in elem.nodes])
+                    shear_data['PID'].append(elem.pid); shear_data['EID'].append(eid); shear_data['type'].append(elem.type); shear_data['is_shell'].append(1)
+                elif elem.type in ['CBEAM', 'CBAR']:
+                    beams_conn.append([2] + [node_map[nid] for nid in elem.nodes])
+                    beams_data['PID'].append(elem.pid); beams_data['EID'].append(eid); beams_data['type'].append(elem.type); beams_data['is_shell'].append(0)
+                elif elem.type == 'CROD':
+                    rods_conn.append([2] + [node_map[nid] for nid in elem.nodes])
+                    rods_data['PID'].append(elem.pid); rods_data['EID'].append(eid); rods_data['type'].append(elem.type); rods_data['is_shell'].append(0)
+                elif elem.type == 'CBUSH':
+                    bush_conn.append([2] + [node_map[nid] for nid in elem.nodes])
+                    bush_data['PID'].append(elem.pid); bush_data['EID'].append(eid); bush_data['type'].append(elem.type); bush_data['is_shell'].append(0)
+                elif elem.type == 'CGAP':
+                    gap_conn.append([2] + [node_map[nid] for nid in elem.nodes[:2]])
+                    gap_data['PID'].append(elem.pid); gap_data['EID'].append(eid); gap_data['type'].append(elem.type); gap_data['is_shell'].append(0)
+            except KeyError as e:
+                print(f"Warning: Skipping element {eid} due to missing node {e}.")
+
+        # PLOTELs are rendered separately but their nodes should not appear as free nodes
+        for eid, elem in model.plotels.items():
+            try: nodes_used_by_elements.update(elem.nodes)
+            except (AttributeError, KeyError): pass
+
+        all_node_ids = set(model.nodes.keys())
+        free_node_ids = all_node_ids - nodes_used_by_elements
+
+        vertex_conn = []
+        vertex_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        for nid in free_node_ids:
+            if nid in node_map:
+                vertex_conn.append([1, node_map[nid]])
+
+        for _ in free_node_ids:
+            vertex_data['PID'].append(-1)
+            vertex_data['EID'].append(-1)
+            vertex_data['type'].append('VTK_VERTEX')
+            vertex_data['is_shell'].append(0)
+
+        all_conns = shells_conn + trias_conn + hexas_conn + tetras_conn + pentas_conn + shear_conn + beams_conn + rods_conn + bush_conn + gap_conn + vertex_conn
+        # --- FIX: Concatenate cell data in the same order as cells ---
+        elem_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
+        for group_data in [shells_data, trias_data, hexas_data, tetras_data, pentas_data, shear_data, beams_data, rods_data, bush_data, gap_data, vertex_data]:
+            for key in elem_data:
+                elem_data[key].extend(group_data[key])
+        
+        if not all_conns and node_coords.any():
+            num_nodes = node_coords.shape[0]
+            cells = np.hstack([np.full((num_nodes, 1), 1), np.arange(num_nodes).reshape(-1, 1)]).ravel()
+            cell_types = np.full(num_nodes, pv.CellType.VERTEX)
+            self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+        elif all_conns:
+            flat_cells_list = [value for conn_list in all_conns for value in conn_list]
+            cells = np.array(flat_cells_list)
+            # --- Cell types must match all_conns order ---
+            cell_types = np.concatenate([
+                np.full(len(shells_conn), pv.CellType.QUAD),
+                np.full(len(trias_conn), pv.CellType.TRIANGLE),
+                np.full(len(hexas_conn), pv.CellType.HEXAHEDRON),
+                np.full(len(tetras_conn), pv.CellType.TETRA),
+                np.full(len(pentas_conn), pv.CellType.WEDGE),
+                np.full(len(shear_conn), pv.CellType.QUAD),
+                np.full(len(beams_conn) + len(rods_conn) + len(bush_conn) + len(gap_conn), pv.CellType.LINE),
+                np.full(len(vertex_conn), pv.CellType.VERTEX)
+            ])
+            self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+        else:
+            self.current_grid = pv.UnstructuredGrid()
+
+        self.current_grid.point_data['vtkOriginalPointIds'] = np.arange(self.current_grid.n_points)
+        
+        if elem_data['EID']:
+            for key, value in elem_data.items(): self.current_grid.cell_data[key] = np.array(value)
+
+        for pid in model.properties.keys():
+            if pid not in self.pid_color_map:
+                self.pid_color_map[pid] = QColor(random.randint(50, 220), random.randint(50, 220), random.randint(50, 220)).name()
+
+        self.tree_widget.blockSignals(True)
+        self._populate_tree()
+        self.tree_widget.blockSignals(False)
+
+        # Coord actors are created centrally via _refresh_coord_actors (called by _update_plot_visibility)
+        self._create_all_load_actors()
+        self._create_all_constraint_actors()
+        self._create_rbe_actors()
+        self._create_mass_actors()
+        self._create_plotel_actors()
+        self._update_plot_visibility()
+
+        if reset_camera and self.current_grid and self.current_grid.n_points > 0:
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
+        else:
+            self.plotter.render()
+# END: Corrected replacement for _update_viewer method in main.py
+
+
+    def _find_tree_items(self, data_tuple):
+        return [it.value() for it in QTreeWidgetItemIterator(self.tree_widget) if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
+
+    def _build_select_by_data(self):
+        """Build property/material/type/quality lookup dicts for element selection."""
+        model = self.current_generator.model
+        all_elements = {**model.elements, **model.rigid_elements}
+        by_property, by_material, by_type = {}, {}, {}
+        for eid, elem in all_elements.items():
+            by_type.setdefault(elem.type, []).append(eid)
+            pid = getattr(elem, 'pid', None)
+            if pid is not None:
+                by_property.setdefault(pid, []).append(eid)
+                prop = model.properties.get(pid)
+                if prop:
+                    mid = getattr(prop, 'mid', None) or getattr(prop, 'mid1', None)
+                    if mid: by_material.setdefault(mid, []).append(eid)
+
+        # Quality-based selection categories
+        by_quality = {}
+        try:
+            quality = self.current_generator.calculate_element_quality()
+            thresholds = {'Aspect > 5': ('aspect', 5.0, 'gt'),
+                          'Skew > 45°': ('skew', 45.0, 'gt'),
+                          'Skew > 60°': ('skew', 60.0, 'gt'),
+                          'Warp > 5°': ('warp', 5.0, 'gt'),
+                          'Warp > 10°': ('warp', 10.0, 'gt'),
+                          'Jacobian < 0.6': ('jacobian', 0.6, 'lt'),
+                          'Taper > 0.5': ('taper', 0.5, 'gt')}
+            for label, (metric, thresh, op) in thresholds.items():
+                eids = []
+                for eid, metrics in quality.items():
+                    val = metrics.get(metric)
+                    if val is None:
+                        continue
+                    if (op == 'gt' and val > thresh) or (op == 'lt' and val < thresh):
+                        eids.append(eid)
+                if eids:
+                    by_quality[label] = eids
+        except Exception:
+            pass
+
+        result = {'By Property': by_property, 'By Material': by_material,
+                  'By Type': by_type}
+        if by_quality:
+            result['By Quality'] = by_quality
+        return result
+
+    def _open_property_editor(self):
+        if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "No properties to edit."); return
+        dialog = PropertyEditorDialog(self.current_generator.model, self)
+        if dialog.exec(): self._update_plot_visibility(); self._populate_tree(); self._update_status("Properties updated.")
+        
+    def _open_material_editor(self):
+        if not self.current_generator or not self.current_generator.model.materials: QMessageBox.warning(self, "No Materials", "No materials to edit."); return
+        dialog = MaterialEditorDialog(self.current_generator.model, self)
+        if dialog.exec(): self._update_status("Materials updated.")
+
+
+    def _populate_tree(self):
+        try:
+            self.tree_widget.itemChanged.disconnect(self._handle_tree_item_changed)
+        except (RuntimeError, TypeError): pass
+        self.tree_widget.clear()
+
+        if not self.current_generator:
+            self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+            return
+        
+        model = self.current_generator.model
+        def create_item(parent, text, data=None, checked=True):
+            item = QTreeWidgetItem(parent, [text])
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            item.setData(0, QtCore.Qt.UserRole, data)
+            return item
+        
+
+        if model.coords:
+            coords_item = create_item(self.tree_widget, "Coordinate Systems", data=('group', 'coords'))
+            for cid in sorted(model.coords.keys()):
+                
+                if cid == 0:
+                    label = "Global Rectangular"
+                elif cid == 1:
+                    label = "Global Cylindrical"
+                elif cid == 2:
+                    label = "Global Spherical"
+                else:
+                    coord = model.coords[cid]
+                    type_map = {'CORD2R': 'Rectangular', 'CORD2C': 'Cylindrical', 'CORD2S': 'Spherical'}
+                    type_name = type_map.get(coord.type, coord.type)
+                    title = get_entity_title_from_comment(getattr(coord, 'comment', ''), "Coord", cid)
+                    if title != f"Coord {cid}":
+                        label = f"{type_name} - {title}"
+                    else:
+                        label = type_name
+                
+                # --- FIX: Set the default visibility state based on the CID ---
+                # Default systems (0, 1, 2) start OFF. User-created systems start ON.
+                is_checked_by_default = (cid > 2)
+                
+                create_item(coords_item, f"CID {cid}: {label}", data=('coord', cid), checked=is_checked_by_default)
+
+        if model.materials:
+            mats_item = create_item(self.tree_widget, "Materials", data=('group', 'materials'))
+            for mid, m in sorted(model.materials.items()):
+                title = self._get_entity_title_from_comment(m.comment, "Material", mid)
+                create_item(mats_item, f"{mid}: {title}", data=('material', mid))
+
+        nodes_item = create_item(self.tree_widget, f"Nodes ({len(model.nodes)})", data=('group', 'nodes'))
+
+        all_elements = {**model.elements, **model.rigid_elements}
+        if all_elements:
+            elems_item = create_item(self.tree_widget, f"Elements ({len(all_elements)})", data=('group', 'elements'))
+            type_item = create_item(elems_item, "By Type", data=('group', 'elem_by_type'))
+            shape_item = create_item(elems_item, "By Shape", data=('group', 'elem_by_shape'))
+
+            by_type_map = {
+                'CBEAM': 'Beams', 'CBAR': 'Bars', 'CROD': 'Rods',
+                'CBUSH': 'Bushes',
+                'CQUAD4': 'Plates', 'CMEMBRAN': 'Plates', 'CTRIA3': 'Plates',
+                'RBE2': 'Rigid', 'RBE3': 'Rigid',
+                'CHEXA': 'Solids', 'CHEXA8': 'Solids', 'CHEXA20': 'Solids',
+                'CTETRA': 'Solids', 'CTETRA4': 'Solids', 'CTETRA10': 'Solids',
+                'CPENTA': 'Solids', 'CPENTA6': 'Solids', 'CPENTA15': 'Solids',
+                'CSHEAR': 'Shear', 'CGAP': 'Gap',
+            }
+            by_type_counts = Counter(by_type_map.get(e.type, 'Other') for e in all_elements.values())
+            for type_name, count in sorted(by_type_counts.items()):
+                create_item(type_item, f"{type_name} ({count})", data=('elem_by_type_group', type_name))
+
+            shape_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'], 'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'], 'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'], 'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'] }
+            type_to_shape = {elem_type: shape for shape, types in shape_map.items() for elem_type in types}
+            shape_counts = Counter(type_to_shape.get(e.type, 'Other') for e in all_elements.values())
+            for shape, count in sorted(shape_counts.items()):
+                create_item(shape_item, f"{shape} ({count})", data=('elem_shape_group', shape))
+
+        if model.masses:
+            masses_item = create_item(self.tree_widget, f"Masses ({len(model.masses)})", data=('group', 'masses'))
+            for eid, mass_elem in sorted(model.masses.items()):
+                create_item(masses_item, f"CONM2 {eid}: Node {mass_elem.nid}, M={mass_elem.mass}", data=('mass', eid))
+
+        if model.plotels:
+            plotels_item = create_item(self.tree_widget, f"Plot Elements ({len(model.plotels)})", data=('group', 'plotels'))
+            for eid, elem in sorted(model.plotels.items()):
+                create_item(plotels_item, f"PLOTEL {eid}: Nodes {elem.nodes[0]}-{elem.nodes[1]}", data=('plotel', eid))
+
+        if model.properties:
+            props_item = create_item(self.tree_widget, "Properties", data=('group', 'properties'))
+            for pid, p in sorted(model.properties.items()):
+                title = self._get_entity_title_from_comment(p.comment, p.type, pid)
+                create_item(props_item, f"{pid}: {title}", data=('property', pid))
+        
+        
+
+        # --- Geometry tree section ---
+        if not self.geometry_store.is_empty:
+            geom_item = create_item(self.tree_widget, "Geometry", data=('group', 'geometry'))
+            if self.geometry_store.points:
+                pts_item = create_item(geom_item, f"Points ({len(self.geometry_store.points)})", data=('geom_group', 'points'))
+                for pid, pt in sorted(self.geometry_store.points.items()):
+                    label = f"P{pid}: ({pt.xyz[0]:.4g}, {pt.xyz[1]:.4g}, {pt.xyz[2]:.4g})"
+                    create_item(pts_item, label, data=('geom_point', pid))
+            all_curves = self.geometry_store.all_curve_ids()
+            if all_curves:
+                curves_item = create_item(geom_item, f"Curves ({len(all_curves)})", data=('geom_group', 'curves'))
+                for cid in all_curves:
+                    curve = self.geometry_store.get_curve(cid)
+                    if hasattr(curve, 'start_point_id') and hasattr(curve, 'end_point_id') and not hasattr(curve, 'mid_point_id'):
+                        label = f"Line {cid}: P{curve.start_point_id} -> P{curve.end_point_id}"
+                    elif hasattr(curve, 'mid_point_id'):
+                        label = f"Arc {cid}: P{curve.start_point_id} -> P{curve.mid_point_id} -> P{curve.end_point_id}"
+                    elif hasattr(curve, 'radius'):
+                        label = f"Circle {cid}: Center P{curve.center_point_id}, R={curve.radius:.4g}"
+                    else:
+                        label = f"Curve {cid}"
+                    create_item(curves_item, label, data=('geom_curve', cid))
+            if self.geometry_store.surfaces:
+                surfs_item = create_item(geom_item, f"Surfaces ({len(self.geometry_store.surfaces)})", data=('geom_group', 'surfaces'))
+                for sid, surf in sorted(self.geometry_store.surfaces.items()):
+                    label = f"Surface {sid}: {len(surf.boundary_curve_ids)} curves"
+                    create_item(surfs_item, label, data=('geom_surface', sid))
+
+        self.tree_widget.expandAll()
+        self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+        self._populate_loads_tab()
+        self._populate_analysis_tab()
+
+
+    def _handle_tree_item_changed(self, item, column):
+        self.tree_widget.blockSignals(True)
+        def set_child_states(parent_item):
+            if parent_item.checkState(0) == QtCore.Qt.PartiallyChecked: return
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i); child.setCheckState(0, parent_item.checkState(0)); set_child_states(child)
+        set_child_states(item)
+        parent = item.parent()
+        while parent:
+            child_states = [parent.child(i).checkState(0) for i in range(parent.childCount())]
+            if all(s == QtCore.Qt.Checked for s in child_states): parent.setCheckState(0, QtCore.Qt.Checked)
+            elif all(s == QtCore.Qt.Unchecked for s in child_states): parent.setCheckState(0, QtCore.Qt.Unchecked)
+            else: parent.setCheckState(0, QtCore.Qt.PartiallyChecked)
+            parent = parent.parent()
+        self.tree_widget.blockSignals(False); self._update_plot_visibility()
+
+    # --- Loads Tab Methods ---
+
+    def _format_load_entry(self, card) -> str:
+        """Format a load card for display in the loads tree."""
+        try:
+            card_type = card.type
+            if card_type in ('FORCE', 'FORCE1', 'FORCE2'):
+                return f"FORCE  Node {card.node_id}  F={card.mag:.4g}  [{card.xyz[0]:.3g}, {card.xyz[1]:.3g}, {card.xyz[2]:.3g}]"
+            elif card_type in ('MOMENT', 'MOMENT1', 'MOMENT2'):
+                return f"MOMENT  Node {card.node_id}  M={card.mag:.4g}  [{card.xyz[0]:.3g}, {card.xyz[1]:.3g}, {card.xyz[2]:.3g}]"
+            elif card_type == 'PLOAD4':
+                return f"PLOAD4  Elem {card.eids[0]}  P={card.pressures[0]:.4g}"
+            elif card_type == 'GRAV':
+                return f"GRAV  Scale={card.scale:.4g}  [{card.N[0]:.3g}, {card.N[1]:.3g}, {card.N[2]:.3g}]"
+            elif card_type == 'TEMPD':
+                return f"TEMPD  T={card.temperature:.4g}"
+            else:
+                return f"{card_type}"
+        except Exception:
+            return str(card.type) if hasattr(card, 'type') else "Unknown"
+
+    def _format_spc_entry(self, spc_card, node_id) -> str:
+        """Format an SPC entry for a specific node."""
+        try:
+            dof_names = {1: 'TX', 2: 'TY', 3: 'TZ', 4: 'RX', 5: 'RY', 6: 'RZ'}
+            # Get the components for this node from the SPC card
+            idx = list(spc_card.nodes).index(node_id)
+            components = spc_card.components[idx] if hasattr(spc_card, 'components') else str(spc_card.components[idx])
+            comp_str = str(components)
+            dofs = " ".join(dof_names.get(int(c), c) for c in comp_str if c.isdigit())
+            return f"Node {node_id}: {dofs}"
+        except Exception:
+            return f"Node {node_id}"
+
+    def _populate_loads_tab(self):
+        """Populate the Loads sidebar tab tree (unified, mirrors Model tab layout)."""
+        tree = self.loads_tab_tree
+        tree.clear()
+
+        gen = getattr(self, 'current_generator', None)
+        model = gen.model if gen else None
+        if not model:
+            return
+
+        # --- Load Sets (combine model.loads and model.tempds) ---
+        all_load_sids = set(model.loads.keys()) | set(model.tempds.keys())
+        if all_load_sids:
+            n_loads = sum(len(v) for v in model.loads.values()) + len(model.tempds)
+            loads_root = QTreeWidgetItem(tree, [f"Load Sets ({n_loads} entries)"])
+            loads_root.setData(0, QtCore.Qt.UserRole, ('loads_root',))
+            for sid in sorted(all_load_sids):
+                load_list = model.loads.get(sid, [])
+                tempd_card = model.tempds.get(sid, None)
+                # Build summary counts
+                counts = {}
+                for load in load_list:
+                    counts[load.type] = counts.get(load.type, 0) + 1
+                if tempd_card:
+                    counts['TEMPD'] = counts.get('TEMPD', 0) + 1
+                summary = ", ".join(f"{count} {ltype}" for ltype, count in counts.items())
+                set_item = QTreeWidgetItem(loads_root, [f"SID {sid}: {summary}"])
+                set_item.setFlags(set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                set_item.setCheckState(0, QtCore.Qt.Checked)
+                set_item.setData(0, QtCore.Qt.UserRole, ('load_set', sid))
+                # Regular load entries
+                for idx, card in enumerate(load_list):
+                    entry_text = self._format_load_entry(card)
+                    entry_item = QTreeWidgetItem(set_item, [entry_text])
+                    entry_item.setData(0, QtCore.Qt.UserRole, ('load_entry', sid, idx))
+                # TEMPD entry (stored separately in model.tempds)
+                if tempd_card:
+                    entry_text = self._format_load_entry(tempd_card)
+                    entry_item = QTreeWidgetItem(set_item, [entry_text])
+                    entry_item.setData(0, QtCore.Qt.UserRole, ('tempd_entry', sid))
+            loads_root.setExpanded(True)
+
+        # --- Constraint Sets ---
+        if model.spcs:
+            n_constr = sum(len(s.nodes) for sl in model.spcs.values() for s in sl)
+            constr_root = QTreeWidgetItem(tree, [f"Constraint Sets ({n_constr} nodes)"])
+            constr_root.setData(0, QtCore.Qt.UserRole, ('constraints_root',))
+            for sid, spc_list in sorted(model.spcs.items()):
+                all_nodes = set()
+                for spc in spc_list:
+                    all_nodes.update(spc.nodes)
+                summary = f"{len(all_nodes)} Nodes"
+                set_item = QTreeWidgetItem(constr_root, [f"SID {sid}: SPC ({summary})"])
+                set_item.setFlags(set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                set_item.setCheckState(0, QtCore.Qt.Checked)
+                set_item.setData(0, QtCore.Qt.UserRole, ('constraint_set', sid))
+                for spc_card in spc_list:
+                    for nid in spc_card.nodes:
+                        entry_text = self._format_spc_entry(spc_card, nid)
+                        entry_item = QTreeWidgetItem(set_item, [entry_text])
+                        entry_item.setData(0, QtCore.Qt.UserRole,
+                                           ('constraint_entry', sid, nid))
+            constr_root.setExpanded(True)
+
+        # --- Load Combinations ---
+        if hasattr(model, 'load_combinations') and model.load_combinations:
+            combos_root = QTreeWidgetItem(tree,
+                [f"Load Combinations ({len(model.load_combinations)})"])
+            combos_root.setData(0, QtCore.Qt.UserRole, ('combos_root',))
+            for combo_sid, combo_data in sorted(model.load_combinations.items()):
+                try:
+                    scale = combo_data.get('scale', 1.0)
+                    components = combo_data.get('scale_factors', [])
+                    load_ids = combo_data.get('load_ids', [])
+                    parts = [f"SID {lid} x{sf:.3g}"
+                             for sf, lid in zip(components, load_ids)]
+                    detail = ", ".join(parts) if parts else "empty"
+                    label = f"LOAD SID {combo_sid}: S={scale:.3g}  [{detail}]"
+                except Exception:
+                    label = f"LOAD SID {combo_sid}"
+                combo_item = QTreeWidgetItem(combos_root, [label])
+                combo_item.setData(0, QtCore.Qt.UserRole, ('load_combo', combo_sid))
+            combos_root.setExpanded(True)
+
+    def _populate_analysis_tab(self):
+        """Populate the Analysis sidebar tab tree."""
+        tree = self.analysis_tab_tree
+        tree.clear()
+
+        if not self.analysis_sets:
+            return
+
+        for sid, aset in sorted(self.analysis_sets.items()):
+            prefix = "\u2605 " if sid == self.active_analysis_set_id else ""
+            sol_str = f"SOL {aset.sol_type}" if aset.sol_type else "Punch"
+            n_sc = len(aset.subcases)
+            label = (f"{prefix}Set {sid}: {aset.name} ({sol_str}, "
+                     f"{n_sc} subcase{'s' if n_sc != 1 else ''})")
+
+            set_item = QTreeWidgetItem(tree, [label])
+            set_item.setData(0, QtCore.Qt.UserRole, ('analysis_set', sid))
+
+            # Show subcases as children
+            for sc in aset.subcases:
+                sc_parts = [f"SC {sc['id']}"]
+                if sc.get('load_sid'):
+                    sc_parts.append(f"LOAD={sc['load_sid']}")
+                if sc.get('spc_sid'):
+                    sc_parts.append(f"SPC={sc['spc_sid']}")
+                sc_label = ", ".join(sc_parts)
+                sc_item = QTreeWidgetItem(set_item, [sc_label])
+                sc_item.setData(0, QtCore.Qt.UserRole,
+                                ('analysis_subcase', sid, sc['id']))
+
+            # Show params summary
+            if aset.params:
+                params_item = QTreeWidgetItem(
+                    set_item, [f"Parameters ({len(aset.params)})"])
+                params_item.setData(0, QtCore.Qt.UserRole,
+                                    ('analysis_params', sid))
+
+        tree.expandAll()
+
+    def _show_loads_tab_context_menu(self, pos):
+        """Unified context menu for the loads tab tree."""
+        item = self.loads_tab_tree.itemAt(pos)
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data:
+            return
+
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        kind = data[0]
+
+        if kind == 'loads_root':
+            add_action = menu.addAction("Add Load...")
+            add_action.triggered.connect(self._create_load)
+        elif kind == 'load_set':
+            sid = data[1]
+            add_action = menu.addAction(f"Add to Load Set {sid}...")
+            add_action.triggered.connect(lambda: self._add_to_load_set(sid))
+            edit_action = menu.addAction(f"Edit Load Set {sid}...")
+            edit_action.triggered.connect(lambda: self._open_load_set_manager(sid))
+            menu.addSeparator()
+            delete_action = menu.addAction(f"Delete Set {sid}")
+            delete_action.triggered.connect(lambda: self._delete_load_set_from_tab(sid))
+        elif kind == 'load_entry':
+            sid, idx = data[1], data[2]
+            remove_action = menu.addAction("Remove Entry")
+            remove_action.triggered.connect(
+                lambda: self._remove_specific_load_entry(sid, idx))
+        elif kind == 'tempd_entry':
+            sid = data[1]
+            remove_action = menu.addAction("Remove TEMPD Entry")
+            remove_action.triggered.connect(
+                lambda: self._remove_tempd_entry(sid))
+        elif kind == 'constraints_root':
+            add_action = menu.addAction("Add Constraint...")
+            add_action.triggered.connect(self._create_constraint)
+        elif kind == 'constraint_set':
+            sid = data[1]
+            add_action = menu.addAction(f"Add to Constraint Set {sid}...")
+            add_action.triggered.connect(self._create_constraint)
+            menu.addSeparator()
+            delete_action = menu.addAction(f"Delete Set {sid}")
+            delete_action.triggered.connect(
+                lambda: self._delete_constraint_set_from_tab(sid))
+        elif kind == 'constraint_entry':
+            sid, nid = data[1], data[2]
+            remove_action = menu.addAction(f"Remove Node {nid} from Set")
+            remove_action.triggered.connect(
+                lambda: self._remove_specific_constraint_entry(sid, nid))
+        elif kind == 'combos_root':
+            add_action = menu.addAction("Add Combination...")
+            add_action.triggered.connect(self._create_load_combination)
+        elif kind == 'load_combo':
+            combo_sid = data[1]
+            delete_action = menu.addAction(f"Delete Combination SID {combo_sid}")
+            delete_action.triggered.connect(
+                lambda: self._delete_load_combo_from_tab(combo_sid))
+
+        if menu.actions():
+            menu.exec(self.loads_tab_tree.viewport().mapToGlobal(pos))
+
+    def _remove_load_entry_from_tab(self):
+        """Remove the selected load entry from the Loads tab tree."""
+        item = self.loads_tab_tree.currentItem()
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if data and data[0] == 'load_entry':
+            self._remove_specific_load_entry(data[1], data[2])
+        elif data and data[0] == 'tempd_entry':
+            self._remove_tempd_entry(data[1])
+        elif data and data[0] == 'load_set':
+            QMessageBox.information(self, "Info",
+                                    "Select a specific entry to remove, or use 'Remove Set'.")
+
+    def _remove_specific_load_entry(self, sid, entry_index):
+        """Remove a specific load entry by SID and index from model.loads."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        model = gen.model
+        if sid not in model.loads:
+            return
+        load_list = list(model.loads[sid])
+        if entry_index < 0 or entry_index >= len(load_list):
+            return
+
+        import copy
+        new_list = [copy.deepcopy(c) for i, c in enumerate(load_list) if i != entry_index]
+        if not new_list and sid not in model.tempds:
+            # Removing last entry and no TEMPD for this SID — delete entire set
+            from node_runner.commands import DeleteLoadCommand
+            cmd = DeleteLoadCommand(sid)
+            self.command_manager.execute(cmd, model)
+        else:
+            # Replace with remaining entries (or empty list if TEMPD still present)
+            from node_runner.commands import ReplaceLoadSetCommand
+            cmd = ReplaceLoadSetCommand(sid, new_list)
+            self.command_manager.execute(cmd, model)
+        self._populate_loads_tab()
+        self._update_viewer()
+
+    def _remove_tempd_entry(self, sid):
+        """Remove a TEMPD entry by SID from model.tempds."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        model = gen.model
+        if sid not in model.tempds:
+            return
+        # If SID has no other loads (only TEMPD), delete entire set (cleans both dicts)
+        has_other_loads = sid in model.loads and model.loads[sid]
+        if not has_other_loads:
+            from node_runner.commands import DeleteLoadCommand
+            cmd = DeleteLoadCommand(sid)
+        else:
+            # Only remove the TEMPD; keep model.loads[sid] intact
+            from node_runner.commands import DeleteTempdCommand
+            cmd = DeleteTempdCommand(sid)
+        self.command_manager.execute(cmd, model)
+        self._populate_loads_tab()
+        self._populate_tree()
+        self._update_viewer()
+
+    def _remove_load_set_from_tab(self):
+        """Remove the selected load set from the Loads tab."""
+        item = self.loads_tab_tree.currentItem()
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data:
+            return
+        # Navigate to parent if an entry is selected
+        sid = None
+        if data[0] == 'load_set':
+            sid = data[1]
+        elif data[0] == 'load_entry':
+            sid = data[1]
+        if sid is None:
+            return
+
+        reply = QMessageBox.question(
+            self, "Delete Load Set",
+            f"Delete entire load set SID {sid}?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._delete_load_set_from_tab(sid)
+
+    def _delete_load_set_from_tab(self, sid):
+        """Delete a load set by SID."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        from node_runner.commands import DeleteLoadCommand
+        cmd = DeleteLoadCommand(sid)
+        self.command_manager.execute(cmd, gen.model)
+        self._populate_loads_tab()
+        self._populate_tree()
+        self._update_viewer()
+
+    def _remove_constraint_entry_from_tab(self):
+        """Remove the selected constraint entry from the Loads tab."""
+        item = self.loads_tab_tree.currentItem()
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if data and data[0] == 'constraint_entry':
+            self._remove_specific_constraint_entry(data[1], data[2])
+        elif data and data[0] == 'constraint_set':
+            QMessageBox.information(self, "Info",
+                                    "Select a specific entry to remove, or use 'Remove Set'.")
+
+    def _remove_specific_constraint_entry(self, sid, node_id):
+        """Remove a specific constraint entry (by node) from an SPC set."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        model = gen.model
+        if sid not in model.spcs:
+            return
+
+        import copy
+        # Build new SPC list filtering out the specified node
+        new_list = []
+        for spc_card in model.spcs[sid]:
+            new_nodes = [n for n in spc_card.nodes if n != node_id]
+            if new_nodes:
+                new_spc = copy.deepcopy(spc_card)
+                # Rebuild with filtered nodes
+                new_list.append(new_spc)
+
+        if not new_list:
+            from node_runner.commands import DeleteConstraintCommand
+            cmd = DeleteConstraintCommand(sid)
+            self.command_manager.execute(cmd, model)
+        else:
+            from node_runner.commands import ReplaceConstraintSetCommand
+            cmd = ReplaceConstraintSetCommand(sid, new_list)
+            self.command_manager.execute(cmd, model)
+        self._populate_loads_tab()
+        self._update_viewer()
+
+    def _remove_constraint_set_from_tab(self):
+        """Remove the selected constraint set from the Loads tab."""
+        item = self.loads_tab_tree.currentItem()
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        sid = None
+        if data and data[0] == 'constraint_set':
+            sid = data[1]
+        elif data and data[0] == 'constraint_entry':
+            sid = data[1]
+        if sid is None:
+            return
+
+        reply = QMessageBox.question(
+            self, "Delete Constraint Set",
+            f"Delete entire constraint set SID {sid}?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self._delete_constraint_set_from_tab(sid)
+
+    def _delete_constraint_set_from_tab(self, sid):
+        """Delete a constraint set by SID."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        from node_runner.commands import DeleteConstraintCommand
+        cmd = DeleteConstraintCommand(sid)
+        self.command_manager.execute(cmd, gen.model)
+        self._populate_loads_tab()
+        self._populate_tree()
+        self._update_viewer()
+
+    def _remove_load_combo_from_tab(self):
+        """Remove the selected load combination from the Loads tab."""
+        item = self.loads_tab_tree.currentItem()
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data or data[0] != 'load_combo':
+            return
+        self._delete_load_combo_from_tab(data[1])
+
+    def _delete_load_combo_from_tab(self, combo_sid):
+        """Delete a load combination by SID."""
+        gen = getattr(self, 'current_generator', None)
+        if not gen:
+            return
+        model = gen.model
+        if hasattr(model, 'load_combinations') and combo_sid in model.load_combinations:
+            reply = QMessageBox.question(
+                self, "Delete Load Combination",
+                f"Delete load combination SID {combo_sid}?",
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                del model.load_combinations[combo_sid]
+                self._populate_loads_tab()
+                self._populate_tree()
+                self._update_status(f"Deleted load combination SID {combo_sid}.")
+
+    def _open_find_entity_tool(self):
+        """Launches a tool to find and zoom to selected entities."""
+        if not self.current_generator or not self.current_generator.model.nodes:
+            self._update_status("No model loaded to find entities in.", is_error=True)
+            return
+
+        entity_types = ["Node", "Element"]
+        entity_type, ok = QInputDialog.getItem(self, "Select Entity Type", 
+                                               "What type of entity do you want to find?", entity_types, 0, False)
+
+        if ok and entity_type:
+            if entity_type == 'Node':
+                all_ids = self.current_generator.model.nodes.keys()
+            else:
+                all_ids = self.current_generator.model.elements.keys()
+            select_by = self._build_select_by_data() if entity_type == 'Element' else None
+            self._start_selection(entity_type, all_ids,
+                                  self._on_find_entities_accept, select_by)
+
+    def _on_find_entities_accept(self):
+        """Callback for when the user confirms their selection in the Find tool."""
+        selected_ids = self.selection_bar.get_selected_ids()
+        entity_type = self.selection_bar.entity_type
+        self._end_selection_mode()
+
+        if not selected_ids:
+            # --- FIX: Call the correct highlighting function with an empty list ---
+            # This correctly removes any existing highlight actor from the scene.
+            self._highlight_entities(entity_type, [])
+            self._update_status("Highlight cleared.")
+            return
+        
+        # --- Calculate bounding box of selection and zoom to it ---
+        all_points = []
+        if entity_type == 'Node':
+            for nid in selected_ids:
+                if nid in self.current_generator.model.nodes:
+                    all_points.append(self.current_generator.model.nodes[nid].xyz)
+        else: # Element
+            nodes_to_get = set()
+            for eid in selected_ids:
+                if eid in self.current_generator.model.elements:
+                    nodes_to_get.update(self.current_generator.model.elements[eid].nodes)
+            for nid in nodes_to_get:
+                 if nid in self.current_generator.model.nodes:
+                    all_points.append(self.current_generator.model.nodes[nid].xyz)
+        
+        if all_points:
+            bounds = pv.PolyData(np.array(all_points)).bounds
+            self.plotter.reset_camera(bounds=bounds, render=False)
+            self._highlight_entities(entity_type, selected_ids) # Re-highlight after zoom
+        
+        self._update_status(f"Found and zoomed to {len(selected_ids)} {entity_type.lower()}(s).")
+    
+
+
+
+    def _open_fuselage_generator(self):
+        mat_model = None
+        if self.current_generator:
+            mat_model = self.current_generator.model
+        else:
+            mat_model = self._auto_load_materials()
+
+        if not mat_model or not mat_model.materials:
+            QMessageBox.warning(self, "No Materials", "Load a model with materials or place 'materials.bdf' in the application folder."); return
+
+        dialog = GeneratorDialog(self); dialog.set_materials(mat_model)
+        if dialog.exec():
+            try:
+                params = dialog.get_parameters()
+                generator = NastranModelGenerator(params=params)
+                for mid, mat in mat_model.materials.items():
+                    generator.model.add_mat1(mid, mat.e, mat.g, mat.nu, comment=mat.comment)
+                
+                generator._generate_nodes()
+                generator._generate_elements()
+                generator.generate_floor_structure()
+                self._ensure_default_coords(generator.model)
+
+                self.command_manager.clear()
+                self._update_viewer(generator); self._update_status("Fuselage model generated.")
+            except Exception as e: self._update_status(f"Generation failed: {e}", is_error=True); QMessageBox.critical(self, "Error", f"Failed to generate model: {e}")
+
+
+
+    def _parse_bdf_to_generator(self, filepath):
+        """
+        Robustly parses a BDF file into a new NastranModelGenerator object.
+        Uses multiple fallback strategies including lenient card-by-card
+        parsing that skips unparseable cards.
+
+        Args:
+            filepath (str): The path to the BDF file.
+
+        Returns:
+            tuple: (NastranModelGenerator, LenientResult or None)
+                Strict success → (generator, None)
+                Lenient fallback → (generator, LenientResult)
+
+        Raises:
+            RuntimeError: If the file cannot be parsed by any strategy.
+        """
+        generator = NastranModelGenerator()
+        model, lenient_result = NastranModelGenerator._read_bdf_robust(filepath)
+        generator.model = model
+        return generator, lenient_result
+
+
+
+
+
+
+
+
+
+    def _open_file_dialog(self):
+        filepath, _ = QFileDialog.getOpenFileName(self, "Open Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")
+        if not filepath:
+            return
+
+        try:
+            generator, lenient_result = self._parse_bdf_to_generator(filepath)
+            self._ensure_default_coords(generator.model)
+            self.command_manager.clear()
+            self.subcases = []
+            self.geometry_store.clear()
+            self.sol_type = None
+            self.eigrl_cards = []
+            self.analysis_sets.clear()
+            self.active_analysis_set_id = None
+            self.op2_results = None
+            self.results_widget.setVisible(False)
+            self.groups.clear()
+            self._hidden_groups.clear()
+            self._isolate_mode = None
+            self._populate_groups_list()
+            self._update_viewer(generator)
+
+            fname = os.path.basename(filepath)
+            if lenient_result and lenient_result.skipped:
+                n = len(lenient_result.skipped)
+                self._update_status(
+                    f"Opened {fname} ({n} card{'s' if n != 1 else ''} skipped)")
+                LenientImportReportDialog(fname, lenient_result, self).exec()
+            elif lenient_result:
+                self._update_status(
+                    f"Opened {fname} (lenient mode, all cards OK)")
+            else:
+                self._update_status(f"Displayed {fname}")
+        except Exception as e:
+            self._update_status(f"File open failed.", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not open/parse file: {e}")
+
+
+    def _import_cad_file(self):
+        """Import a STEP/IGES/STL file via gmsh meshing."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Import CAD File", "",
+            "CAD Files (*.step *.stp *.iges *.igs *.stl);;All Files (*)")
+        if not filepath:
+            return
+
+        # Ensure we have a model
+        if not self.current_generator:
+            from node_runner.model import NastranModelGenerator
+            gen = NastranModelGenerator()
+            gen.create_new_model()
+            self._ensure_default_coords(gen.model)
+            self.command_manager.clear()
+            self._update_viewer(gen)
+
+        available_pids = list(self.current_generator.model.properties.keys()) or [1]
+        dlg = ImportCADDialog(filepath, available_pids, self)
+        if not dlg.exec():
+            return
+
+        settings = dlg.get_settings()
+
+        # Ensure the PID exists
+        pid = settings['pid']
+        model = self.current_generator.model
+        if pid not in model.properties:
+            # Create a default PSHELL with thickness 1.0
+            mid = min(model.materials.keys()) if model.materials else 1
+            if mid not in model.materials:
+                model.add_mat1(mid, 70000.0, 0.33, rho=2.7e-9,
+                               comment='Auto-created for CAD import')
+            model.add_pshell(pid, mid1=mid, t=1.0,
+                             comment='Auto-created for CAD import')
+
+        try:
+            cmd = ImportCADCommand(
+                settings['filepath'], settings['mesh_size'],
+                settings['elem_preference'], pid)
+            self.command_manager.execute(cmd, model)
+            n_nodes = len(cmd._created_nids)
+            n_elems = len(cmd._created_eids)
+            QMessageBox.information(
+                self, "CAD Import Complete",
+                f"Created {n_nodes} nodes and {n_elems} elements "
+                f"from {os.path.basename(filepath)}.")
+            self._update_status(
+                f"Imported CAD: {n_nodes} nodes, {n_elems} elements.")
+            self._update_viewer(self.current_generator, reset_camera=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", str(e))
+            self._update_status(f"CAD import failed: {e}", is_error=True)
+
+    def _import_file_dialog(self):
+        """Handles the 'Import' file action, showing an options dialog."""
+        filepath, _ = QFileDialog.getOpenFileName(self, "Import Nastran File", "", "Nastran Files (*.bdf *.dat *.nas);;All Files (*)")
+        if not filepath:
+            self._update_status("Import cancelled.")
+            return
+
+        # If there's no model loaded, the only option is to create a new one.
+        if not self.current_generator or not self.current_generator.model.nodes:
+            option = 'new'
+        else:
+            dialog = ImportOptionsDialog(self)
+            if dialog.exec():
+                option = dialog.get_selected_option()
+            else:
+                self._update_status("Import cancelled.")
+                return
+
+        try:
+            filename = os.path.basename(filepath)
+            if option == 'new':
+                generator, lenient_result = self._parse_bdf_to_generator(filepath)
+                self._ensure_default_coords(generator.model)
+                self.command_manager.clear()
+                # Phase 8: Reset groups on import-new
+                self.groups.clear()
+                self._hidden_groups.clear()
+                self._isolate_mode = None
+                self._populate_groups_list()
+                self._update_viewer(generator)
+
+                if lenient_result and lenient_result.skipped:
+                    n = len(lenient_result.skipped)
+                    self._update_status(
+                        f"Opened {filename} ({n} card{'s' if n != 1 else ''} skipped)")
+                    LenientImportReportDialog(filename, lenient_result, self).exec()
+                elif lenient_result:
+                    self._update_status(
+                        f"Opened {filename} (lenient mode, all cards OK)")
+                else:
+                    self._update_status(f"Opened new model from {filename}")
+            
+            elif option == 'append':
+                # This calls our new backend method
+                summary = self.current_generator.import_and_append_bdf(filepath)
+                
+                self._ensure_default_coords(self.current_generator.model)
+
+                # Create a summary message of what was imported
+                summary_parts = [f"{count} {name}" for name, count in summary.items() if count > 0]
+                if summary_parts:
+                    message = f"Appended {', '.join(summary_parts)} from {filename}."
+                else:
+                    message = f"No new cards were appended from {filename}."
+                
+                self._update_status(message)
+                self._update_viewer(self.current_generator, reset_camera=False)
+
+        except Exception as e:
+            self._update_status(f"File import failed.", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not import file: {e}")
+
+
+
+    def _auto_load_materials(self):
+        materials_path = os.path.join(PROJECT_ROOT, "materials.bdf")
+        if os.path.exists(materials_path):
+            try:
+                mat_model = BDF(debug=False)
+                mat_model.read_bdf(materials_path, punch=True)
+                self._update_status(f"Auto-loaded {len(mat_model.materials)} materials.")
+                return mat_model
+            except Exception as e:
+                self._update_status(f"Could not parse default materials: {e}", is_error=True)
+        else:
+            self._update_status("'materials.bdf' not found.", is_error=True)
+        return None
+
+    def _save_configuration(self):
+        if not (self.current_generator and self.current_generator.params): QMessageBox.warning(self, "No Data", "Only generator parameters can be saved."); return
+        if not (save_path := QFileDialog.getSaveFileName(self, "Save Configuration", "", "JSON Files (*.json)")[0]): return
+        try:
+            with open(save_path, 'w') as f: json.dump(self.current_generator.params, f, indent=4)
+            self._update_status(f"Config saved to {os.path.basename(save_path)}")
+        except Exception as e: self._update_status(f"Error saving config: {e}", is_error=True)
+
+    def _load_configuration(self):
+        if not (load_path := QFileDialog.getOpenFileName(self, "Load Configuration", "", "JSON Files (*.json)")[0]): return
+        try:
+            with open(load_path, 'r') as f: config = json.load(f)
+            dialog = GeneratorDialog(self);
+            
+            mat_model = self.current_generator.model if self.current_generator else self._auto_load_materials()
+            if not mat_model:
+                 QMessageBox.warning(self, "No Materials", "Could not find materials to use for generator."); return
+            dialog.set_materials(mat_model)
+
+            for key, w in [('fuselage_radius',dialog.radius_input),('num_bays',dialog.bays_input),('frame_spacing',dialog.spacing_input),('skin_thickness',dialog.skin_thick_input),('skin_material_id',dialog.skin_mat_combo),('num_stringers',dialog.num_stringers_input),('stringer_section_type',dialog.stringer_type_combo),('stringer_material_id',dialog.stringer_mat_combo),('frame_section_type',dialog.frame_type_combo),('frame_material_id',dialog.frame_mat_combo)]:
+                if key in config: getattr(w, 'setText' if isinstance(w, QLineEdit) else 'setCurrentText')(str(config[key]))
+            self._update_status(f"Config loaded from {os.path.basename(load_path)}.")
+            if dialog.exec():
+                params = dialog.get_parameters()
+                generator = NastranModelGenerator(params=params)
+                for mid, mat in mat_model.materials.items():
+                    generator.model.add_mat1(mid, mat.e, mat.g, mat.nu, comment=mat.comment)
+                
+                generator._generate_nodes(); generator._generate_elements()
+                self._ensure_default_coords(generator.model)
+                self.command_manager.clear()
+                self._update_viewer(generator); self._update_status("Model generated from loaded configuration.")
+        except Exception as e: self._update_status(f"Error loading config: {e}", is_error=True); QMessageBox.critical(self, "Error", f"Could not load config: {e}")
+        
+    def _open_color_manager(self):
+        if not self.current_grid: self._update_status("No model loaded.", is_error=True); return
+        current_map = self.type_color_map if self.color_mode == "type" else self.pid_color_map; dialog = ColorManagerDialog(current_map, self)
+        if dialog.exec():
+            (self.type_color_map if self.color_mode == "type" else self.pid_color_map).update(dialog.color_map)
+            self._update_plot_visibility(); self._update_status("Colors updated.")
+            
+    # --- Display Settings, Screenshot, Presentation Mode ---
+
+    def _load_display_settings(self) -> dict:
+        """Load display settings from QSettings."""
+        from PySide6.QtCore import QSettings
+        s = QSettings("NodeRunner", "NodeRunner")
+        return {
+            'bg_mode': s.value("display/bg_mode", "solid"),
+            'bg_color': s.value("display/bg_color", "#1e1e2e"),
+            'bg_top_color': s.value("display/bg_top", "#1a2a4a"),
+            'bg_bottom_color': s.value("display/bg_bottom", "#0a0a1e"),
+            'bg_image_path': s.value("display/bg_image", ""),
+            'show_axes': s.value("display/show_axes", True, type=bool),
+            'axes_color': s.value("display/axes_color", "#cdd6f4"),
+            'edge_color': s.value("display/edge_color", "#000000"),
+            'node_size': int(s.value("display/node_size", 8)),
+            'line_width': int(s.value("display/line_width", 2)),
+            'selection_color': s.value("display/selection_color", "#ffff00"),
+            'watermark_text': s.value("display/watermark_text", ""),
+            'watermark_color': s.value("display/watermark_color", "#ffffff"),
+            'watermark_position': s.value("display/watermark_position", "Bottom-Right"),
+            'screenshot_resolution': s.value("display/screenshot_res", "Current Viewport"),
+            'custom_width': int(s.value("display/custom_width", 1920)),
+            'custom_height': int(s.value("display/custom_height", 1080)),
+            'transparent_bg': s.value("display/transparent_bg", False, type=bool),
+            'antialiasing': s.value("display/antialiasing", True, type=bool),
+            'file_format': s.value("display/file_format", "PNG"),
+        }
+
+    def _save_display_settings(self):
+        """Save display settings to QSettings."""
+        from PySide6.QtCore import QSettings
+        s = QSettings("NodeRunner", "NodeRunner")
+        ds = self._display_settings
+        s.setValue("display/bg_mode", ds.get('bg_mode', 'solid'))
+        s.setValue("display/bg_color", ds.get('bg_color', '#1e1e2e'))
+        s.setValue("display/bg_top", ds.get('bg_top_color', '#1a2a4a'))
+        s.setValue("display/bg_bottom", ds.get('bg_bottom_color', '#0a0a1e'))
+        s.setValue("display/bg_image", ds.get('bg_image_path', ''))
+        s.setValue("display/show_axes", ds.get('show_axes', True))
+        s.setValue("display/axes_color", ds.get('axes_color', '#cdd6f4'))
+        s.setValue("display/edge_color", ds.get('edge_color', '#000000'))
+        s.setValue("display/node_size", ds.get('node_size', 8))
+        s.setValue("display/line_width", ds.get('line_width', 2))
+        s.setValue("display/selection_color", ds.get('selection_color', '#ffff00'))
+        s.setValue("display/watermark_text", ds.get('watermark_text', ''))
+        s.setValue("display/watermark_color", ds.get('watermark_color', '#ffffff'))
+        s.setValue("display/watermark_position", ds.get('watermark_position', 'Bottom-Right'))
+        s.setValue("display/screenshot_res", ds.get('screenshot_resolution', 'Current Viewport'))
+        s.setValue("display/custom_width", ds.get('custom_width', 1920))
+        s.setValue("display/custom_height", ds.get('custom_height', 1080))
+        s.setValue("display/transparent_bg", ds.get('transparent_bg', False))
+        s.setValue("display/antialiasing", ds.get('antialiasing', True))
+        s.setValue("display/file_format", ds.get('file_format', 'PNG'))
+
+    def _apply_background(self):
+        """Apply current background settings to the plotter."""
+        import os
+        ds = self._display_settings
+        bg_mode = ds.get('bg_mode', 'solid')
+
+        # Remove any existing background image
+        try:
+            self.plotter.renderer.RemoveAllViewProps()
+        except Exception:
+            pass
+
+        if bg_mode == 'gradient':
+            top = ds.get('bg_top_color', '#1a2a4a')
+            bottom = ds.get('bg_bottom_color', '#0a0a1e')
+            self.plotter.set_background(bottom, top=top)
+        elif bg_mode == 'image':
+            fallback = ds.get('bg_color', '#1e1e2e')
+            self.plotter.set_background(fallback)
+            img_path = ds.get('bg_image_path', '')
+            if img_path and os.path.exists(img_path):
+                try:
+                    self.plotter.add_background_image(img_path, scale=1.0, as_global=True)
+                except Exception as e:
+                    self._update_status(f"Failed to load background image: {e}", is_error=True)
+        else:
+            color = ds.get('bg_color', '#1e1e2e')
+            self.plotter.set_background(color)
+        self.plotter.render()
+
+    def _open_display_settings(self):
+        """Open the Display Settings dialog."""
+        from node_runner.dialogs.tools import DisplaySettingsDialog
+        dialog = DisplaySettingsDialog(settings=self._display_settings.copy(), parent=self)
+        if dialog.exec():
+            new_settings = dialog.get_settings()
+            capture = new_settings.pop('capture_requested', False)
+
+            # Update display settings
+            self._display_settings.update(new_settings)
+            self._save_display_settings()
+            self._apply_background()
+
+            # Apply axes visibility
+            if hasattr(self, 'axes_actor') and self.axes_actor:
+                self.axes_actor.SetVisibility(new_settings.get('show_axes', True))
+
+            # Apply axes label color
+            axes_color_hex = new_settings.get('axes_color', '#cdd6f4')
+            color = QtGui.QColor(axes_color_hex)
+            self._set_axes_label_color(
+                (color.redF(), color.greenF(), color.blueF()))
+
+            self._update_plot_visibility()
+            self._update_status("Display settings updated.")
+
+            # If capture was requested, do it now
+            if capture:
+                self._capture_screenshot()
+
+    def _capture_screenshot(self):
+        """Take a screenshot with current display settings."""
+        from PySide6.QtWidgets import QFileDialog
+        ds = self._display_settings
+        fmt = ds.get('file_format', 'PNG').lower()
+        filters = {
+            'png': "PNG Files (*.png)",
+            'jpg': "JPEG Files (*.jpg *.jpeg)",
+            'bmp': "BMP Files (*.bmp)",
+            'tiff': "TIFF Files (*.tiff *.tif)",
+        }
+        file_filter = filters.get(fmt, "PNG Files (*.png)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Screenshot", f"screenshot.{fmt}", file_filter)
+        if not path:
+            return
+
+        # Determine resolution
+        res_text = ds.get('screenshot_resolution', 'Current Viewport')
+        if res_text == '1920 x 1080 (Full HD)':
+            w, h = 1920, 1080
+        elif res_text == '2560 x 1440 (2K)':
+            w, h = 2560, 1440
+        elif res_text == '3840 x 2160 (4K)':
+            w, h = 3840, 2160
+        elif res_text == 'Custom':
+            w = ds.get('custom_width', 1920)
+            h = ds.get('custom_height', 1080)
+        else:
+            # Current Viewport
+            w, h = None, None
+
+        try:
+            transparent = ds.get('transparent_bg', False)
+            kwargs = {'transparent_background': transparent}
+            if w and h:
+                kwargs['window_size'] = (w, h)
+
+            self.plotter.screenshot(path, **kwargs)
+            self._update_status(f"Screenshot saved: {path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Screenshot Error",
+                                f"Failed to save screenshot:\n{str(e)}")
+
+    def _toggle_presentation_mode(self, checked):
+        """Toggle presentation mode — fullscreen with UI hidden."""
+        self.menuBar().setVisible(not checked)
+        self.statusBar().setVisible(not checked)
+        # Hide the sidebar tabs container
+        sidebar_parent = self.sidebar_tabs.parent()
+        if sidebar_parent:
+            sidebar_parent.setVisible(not checked)
+        if checked:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+
+    def eventFilter(self, obj, event):
+        """Catch ESC on the plotter to exit presentation mode."""
+        if (event.type() == QtCore.QEvent.KeyPress
+                and event.key() == QtCore.Qt.Key_Escape
+                and self.presentation_action.isChecked()):
+            self.presentation_action.setChecked(False)
+            return True  # consumed
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        """Handle key press events for presentation mode exit."""
+        if event.key() == QtCore.Qt.Key_Escape and self.presentation_action.isChecked():
+            self.presentation_action.setChecked(False)
+        else:
+            super().keyPressEvent(event)
+
+    def _set_render_style(self, style):
+        self.render_style = style
+        self.transparent_shells_action.setEnabled(style == "surface")
+        # Sync sidebar combo
+        style_map = {"surface": 0, "wireframe": 1, "surface_only": 2, "points": 3}
+        idx = style_map.get(style, 0)
+        self.render_style_combo.blockSignals(True)
+        self.render_style_combo.setCurrentIndex(idx)
+        self.render_style_combo.blockSignals(False)
+        self._update_plot_visibility(); self._refresh_labels()
+        self._update_status(f"Render style: {style}.")
+
+    def _on_render_style_combo_changed(self, index):
+        style_map = {0: "surface", 1: "wireframe", 2: "surface_only", 3: "points"}
+        style = style_map.get(index, "surface")
+        self.render_style = style
+        self.transparent_shells_action.setEnabled(style == "surface")
+        # Sync menu actions
+        if style == "wireframe":
+            self.style_wire_action.setChecked(True)
+        else:
+            self.style_surf_action.setChecked(True)
+        self._update_plot_visibility(); self._refresh_labels()
+        self._update_status(f"Render style: {style}.")
+
+    def _on_color_mode_combo_changed(self, index):
+        mode_map = {0: "property", 1: "type", 2: "quality", 3: "results"}
+        mode = mode_map.get(index, "property")
+        self._set_coloring_mode(mode)
+
+    def _toggle_shell_transparency(self, state):
+        self.shell_opacity = 0.4 if state else 1.0
+        self.shell_opacity_slider.blockSignals(True)
+        self.shell_opacity_slider.setValue(int(self.shell_opacity * 100))
+        self.shell_opacity_slider.blockSignals(False)
+        self._update_plot_visibility(); self._refresh_labels()
+        self._update_status(f"Shell transparency {'ON' if state else 'OFF'}.")
+
+    def _toggle_perspective_view(self, state):
+        self.plotter.camera.SetParallelProjection(not state); self.plotter.render(); self._update_status(f"Perspective view {'ON' if state else 'OFF'}.")
+
+    # --- Display tab handlers ---
+    def _on_node_size_changed(self, value):
+        self.node_size = value
+        self._update_plot_visibility()
+
+    def _pick_node_color(self):
+        color = QColorDialog.getColor(QColor(self.node_color), self, "Node Color")
+        if color.isValid():
+            self.node_color = color.name()
+            self.node_color_btn.setStyleSheet(f"background-color: {self.node_color}; border: 1px solid #555;")
+            self._update_plot_visibility()
+
+    def _on_shell_opacity_changed(self, value):
+        self.shell_opacity = value / 100.0
+        self._update_plot_visibility()
+
+    def _on_elem_shrink_changed(self, value):
+        self.elem_shrink = value / 100.0
+        self._update_plot_visibility()
+
+    def _pick_edge_color(self):
+        color = QColorDialog.getColor(QColor(self.edge_color), self, "Edge Color")
+        if color.isValid():
+            self.edge_color = color.name()
+            self.edge_color_btn.setStyleSheet(f"background-color: {self.edge_color}; border: 1px solid #555;")
+            self._update_plot_visibility()
+
+    def _on_edge_width_changed(self, value):
+        self.edge_width = value
+        self._update_plot_visibility()
+
+    def _on_beam_width_changed(self, value):
+        self.beam_width = value
+        self._update_plot_visibility()
+
+    def _on_bg_preset_changed(self, preset_name):
+        preset = BACKGROUND_PRESETS.get(preset_name)
+        if not preset:
+            return
+        if preset["mode"] == "solid":
+            self.plotter.set_background(preset["color"])
+        elif preset["mode"] == "gradient":
+            self.plotter.set_background(preset["bottom"], top=preset["top"])
+        self.plotter.render()
+        
+    def _set_coloring_mode(self, mode):
+        self.color_mode = mode
+        # Sync sidebar combo
+        mode_map = {"property": 0, "type": 1, "quality": 2, "results": 3}
+        idx = mode_map.get(mode, 0)
+        self.color_mode_combo.blockSignals(True)
+        self.color_mode_combo.setCurrentIndex(idx)
+        self.color_mode_combo.blockSignals(False)
+        is_quality_mode = (mode == "quality")
+        is_results_mode = (mode == "results")
+        self.quality_widget.setVisible(is_quality_mode)
+        self.results_widget.setVisible(is_results_mode and self.op2_results is not None)
+
+        if is_quality_mode and self.current_generator:
+            # Populate the dropdown with available metrics the first time
+            if self.quality_metric_combo.count() == 0:
+                 has_quads = any(e.type in ['CQUAD4', 'CMEMBRAN'] for e in self.current_generator.model.elements.values())
+                 metrics = ["Aspect Ratio", "Skew", "Min Angle", "Max Angle"]
+                 if has_quads:
+                     metrics = ["Warping", "Jacobian", "Taper"] + metrics
+                 self.quality_metric_combo.addItems(metrics)
+
+        if is_results_mode and not self.op2_results:
+            QMessageBox.information(self, "No Results",
+                                    "No results loaded. Use File > Load Results (OP2) first.")
+
+        self._update_plot_visibility()
+        self._update_status(f"Color mode: {mode}.")
+        
+    def _rebuild_plot(self, visibility_mask=None):
+        self.plotter.remove_actor(['nodes_actor', 'shells', 'beams', 'beam_sections_3d',
+                                   'selection_highlight'])
+
+        nodes_visible = False
+        if (nodes_item_list := self._find_tree_items(('group', 'nodes'))):
+            if nodes_item_list[0].checkState(0) == QtCore.Qt.Checked:
+                nodes_visible = True
+
+        if nodes_visible and self.current_grid and self.current_grid.n_points > 0:
+            node_points = self.current_grid.points
+            if self.current_node_ids_sorted and (
+                (hasattr(self, '_isolate_mode') and self._isolate_mode) or
+                (hasattr(self, '_hidden_groups') and self._hidden_groups)
+            ):
+                all_nids = np.array(self.current_node_ids_sorted)
+                if self._isolate_mode:
+                    group_data = self.groups.get(self._isolate_mode, {})
+                    show_nids = set(group_data.get("nodes", []))
+                    if show_nids:
+                        point_mask = np.isin(all_nids, list(show_nids))
+                        if point_mask.any():
+                            node_points = self.current_grid.points[point_mask]
+                        else:
+                            node_points = None
+                    else:
+                        node_points = None
+                elif self._hidden_groups:
+                    hidden_nids = set()
+                    for grp_name in self._hidden_groups:
+                        grp = self.groups.get(grp_name, {})
+                        hidden_nids.update(grp.get("nodes", []))
+                    if hidden_nids:
+                        point_mask = ~np.isin(all_nids, list(hidden_nids))
+                        if point_mask.any():
+                            node_points = self.current_grid.points[point_mask]
+                        else:
+                            node_points = None
+            if node_points is not None and len(node_points) > 0:
+                self.plotter.add_points(pv.PolyData(node_points), color=self.node_color, point_size=self.node_size,
+                                        render_points_as_spheres=True, name='nodes_actor')
+
+        grid_to_render = self.current_grid
+        if visibility_mask is not None:
+            visible_indices = np.where(visibility_mask)[0]
+            if visible_indices.size > 0:
+                grid_to_render = self.current_grid.extract_cells(visible_indices)
+            else:
+                self.plotter.remove_actor(['shells', 'beams'])
+                self.plotter.render()
+                return
+
+        # --- FIX: Check if cell data (like 'is_shell') exists before trying to use it ---
+        if grid_to_render and grid_to_render.n_cells > 0 and 'is_shell' in grid_to_render.cell_data:
+            shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
+            beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
+
+            # Apply element shrink if set
+            if self.elem_shrink > 0 and shells.n_cells > 0:
+                shells = shells.shrink(1.0 - self.elem_shrink)
+
+            # Determine render style for pyvista
+            pv_style = self.render_style
+            if pv_style == "surface_only":
+                pv_style = "surface"
+            show_edges = self.render_style == "surface"
+
+            # Common shell kwargs
+            shell_kw = dict(style=pv_style, show_edges=show_edges,
+                            opacity=self.shell_opacity, name="shells")
+            if show_edges:
+                shell_kw['edge_color'] = self.edge_color
+                shell_kw['line_width'] = self.edge_width
+            beam_kw = dict(render_lines_as_tubes=True, line_width=self.beam_width, name="beams")
+
+            if self.color_mode == "type":
+                if shells.n_cells > 0:
+                    self.plotter.add_mesh(shells, color=self.type_color_map["Shells"], **shell_kw)
+                if beams.n_cells > 0:
+                    self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+            elif self.color_mode == "property":
+                if shells.n_cells > 0:
+                    pids = np.unique(shells.cell_data['PID'])
+                    cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
+                    self.plotter.add_mesh(shells, scalars="PID", cmap=cmap, categories=True,
+                                          show_scalar_bar=False, **shell_kw)
+                if beams.n_cells > 0:
+                    pids = np.unique(beams.cell_data['PID'])
+                    cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
+                    self.plotter.add_mesh(beams, scalars="PID", cmap=cmap, categories=True,
+                                          show_scalar_bar=False, **beam_kw)
+            elif self.color_mode == "quality":
+                if self.quality_results is None:
+                    self.quality_results = self.current_generator.calculate_element_quality()
+
+                metric_text = self.quality_metric_combo.currentText()
+                metric_key_map = {
+                    "Warping": "warp", "Aspect Ratio": "aspect", "Skew": "skew",
+                    "Jacobian": "jacobian", "Taper": "taper",
+                    "Min Angle": "min_angle", "Max Angle": "max_angle",
+                }
+                metric_key = metric_key_map.get(metric_text, "aspect")
+
+                if shells.n_cells > 0 and self.quality_results and metric_key:
+                    scalars = np.full(shells.n_cells, 0.0, dtype=float)
+
+                    for i, eid in enumerate(shells.cell_data['EID']):
+                        scalars[i] = self.quality_results.get(eid, {}).get(metric_key, 0.0)
+
+                    self.plotter.add_mesh(shells, scalars=scalars, cmap='viridis',
+                                          scalar_bar_args={'title': metric_text}, **shell_kw)
+                if beams.n_cells > 0:
+                    self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+            elif self.color_mode == "results" and self.op2_results:
+                sc_id = self.results_subcase_combo.currentData()
+                sc_data = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
+                result_type = self.results_type_combo.currentText()
+                component = self.results_component_combo.currentText()
+
+                if result_type in ("Displacement", "Eigenvector", "SPC Forces"):
+                    key_map = {"Displacement": "displacements",
+                               "Eigenvector": "eigenvectors",
+                               "SPC Forces": "spc_forces"}
+                    raw = sc_data.get(key_map.get(result_type, ""), {})
+                    if result_type == "Eigenvector" and isinstance(raw, list):
+                        mode_idx = max(0, self.results_mode_combo.currentIndex())
+                        data_dict = raw[mode_idx] if mode_idx < len(raw) else {}
+                    else:
+                        data_dict = raw if isinstance(raw, dict) else {}
+                    comp_idx = {"T1 (X)": 0, "T2 (Y)": 1, "T3 (Z)": 2,
+                                "R1 (RX)": 3, "R2 (RY)": 4, "R3 (RZ)": 5}.get(component)
+
+                    # Build point scalars on the full grid
+                    point_scalars = np.zeros(self.current_grid.n_points)
+                    for i, nid in enumerate(self.current_node_ids_sorted):
+                        vals = data_dict.get(nid)
+                        if vals:
+                            if component == "Magnitude":
+                                point_scalars[i] = np.linalg.norm(vals[:3])
+                            elif comp_idx is not None:
+                                point_scalars[i] = vals[comp_idx]
+
+                    # Apply deformation if scale != 0
+                    if self._anim_override_scale is not None:
+                        deform_scale = self._anim_override_scale
+                    else:
+                        try:
+                            deform_scale = float(self.deformation_scale_input.text() or 0)
+                        except ValueError:
+                            deform_scale = 0.0
+                    if deform_scale != 0 and result_type in ("Displacement", "Eigenvector"):
+                        disp_data = data_dict
+                        deformed_points = grid_to_render.points.copy()
+                        for i, nid in enumerate(self.current_node_ids_sorted):
+                            vals = disp_data.get(nid)
+                            if vals and i < len(deformed_points):
+                                deformed_points[i] += np.array(vals[:3]) * deform_scale
+                        grid_to_render.points = deformed_points
+                        shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
+                        beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
+
+                    self.current_grid.point_data['result_scalars'] = point_scalars
+                    if shells.n_cells > 0:
+                        shell_scalars = np.zeros(shells.n_cells)
+                        for i, eid in enumerate(shells.cell_data['EID']):
+                            elem = model.elements.get(eid) or model.rigid_elements.get(eid)
+                            if elem:
+                                node_ids_elem = elem.nodes
+                                vals_list = [data_dict.get(nid) for nid in node_ids_elem if data_dict.get(nid)]
+                                if vals_list:
+                                    if component == "Magnitude":
+                                        shell_scalars[i] = np.mean([np.linalg.norm(v[:3]) for v in vals_list])
+                                    elif comp_idx is not None:
+                                        shell_scalars[i] = np.mean([v[comp_idx] for v in vals_list])
+                        self.plotter.add_mesh(shells, scalars=shell_scalars, cmap='jet',
+                                              scalar_bar_args={'title': f"{result_type} - {component}"}, **shell_kw)
+                    if beams.n_cells > 0:
+                        self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+
+                elif result_type == "Stress":
+                    stress_data = sc_data.get("stresses", {})
+                    comp_key_map = {
+                        "von Mises": "von_mises", "Max Principal": "max_principal",
+                        "Min Principal": "min_principal",
+                        "XX": "oxx", "YY": "oyy", "XY": "txy",
+                    }
+                    comp_key = comp_key_map.get(component, "von_mises")
+
+                    if shells.n_cells > 0:
+                        scalars = np.zeros(shells.n_cells)
+                        for i, eid in enumerate(shells.cell_data['EID']):
+                            elem_stress = stress_data.get(int(eid), {})
+                            scalars[i] = elem_stress.get(comp_key, 0.0)
+                        self.plotter.add_mesh(shells, scalars=scalars, cmap='jet',
+                                              scalar_bar_args={'title': f"Stress - {component}"}, **shell_kw)
+                    if beams.n_cells > 0:
+                        self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+                else:
+                    # Fallback: property coloring
+                    if shells.n_cells > 0:
+                        pids = np.unique(shells.cell_data['PID'])
+                        cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
+                        self.plotter.add_mesh(shells, scalars="PID", cmap=cmap, categories=True,
+                                              show_scalar_bar=False, **shell_kw)
+                    if beams.n_cells > 0:
+                        pids = np.unique(beams.cell_data['PID'])
+                        cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
+                        self.plotter.add_mesh(beams, scalars="PID", cmap=cmap, categories=True,
+                                              show_scalar_bar=False, **beam_kw)
+        else:
+             # If there's no 'is_shell' data, it means there are no elements to draw.
+             # Ensure any old shell/beam actors are removed.
+             self.plotter.remove_actor(['shells', 'beams'])
+
+        # Beam 3D section rendering
+        if self.show_beam_sections_check.isChecked() and self.current_generator:
+            self._render_beam_sections()
+
+        self.plotter.render()
+
+    def _render_beam_sections(self):
+        """Render 3D extruded beam cross-sections for all CBAR/CBEAM elements."""
+        import pyvista as pv
+
+        gen = self.current_generator
+        model = gen.model
+        all_node_coords = {nid: node.xyz for nid, node in model.nodes.items()}
+
+        all_verts = []
+        all_faces = []
+        vertex_offset = 0
+
+        beam_types = {'CBEAM', 'CBAR'}
+        for eid, elem in model.elements.items():
+            if elem.type not in beam_types:
+                continue
+
+            pid = getattr(elem, 'pid', None)
+            if pid is None:
+                continue
+
+            polygon_2d = gen.get_beam_section_polygon(pid)
+            if polygon_2d is None:
+                continue
+
+            # Filter out hole markers
+            outer_pts = [(y, z) for y, z in polygon_2d
+                         if y is not None and z is not None]
+            if len(outer_pts) < 3:
+                continue
+
+            # Get beam axis
+            try:
+                p1 = np.array(all_node_coords[elem.nodes[0]], dtype=float)
+                p2 = np.array(all_node_coords[elem.nodes[1]], dtype=float)
+            except (KeyError, IndexError):
+                continue
+
+            axis = p2 - p1
+            length = np.linalg.norm(axis)
+            if length < 1e-12:
+                continue
+            axis_dir = axis / length
+
+            # Orientation vector: g0 node or x vector
+            try:
+                if hasattr(elem, 'g0') and elem.g0 is not None and elem.g0 > 0:
+                    g0_pos = np.array(all_node_coords[elem.g0], dtype=float)
+                    v_orient = g0_pos - p1
+                elif hasattr(elem, 'x') and elem.x is not None:
+                    v_orient = np.array(elem.x, dtype=float)
+                else:
+                    # Default: pick arbitrary perpendicular
+                    ref = np.array([0.0, 0.0, 1.0])
+                    if abs(np.dot(axis_dir, ref)) > 0.9:
+                        ref = np.array([0.0, 1.0, 0.0])
+                    v_orient = ref
+            except (KeyError, TypeError):
+                ref = np.array([0.0, 0.0, 1.0])
+                if abs(np.dot(axis_dir, ref)) > 0.9:
+                    ref = np.array([0.0, 1.0, 0.0])
+                v_orient = ref
+
+            # Build local coordinate frame
+            v_y = v_orient - np.dot(v_orient, axis_dir) * axis_dir
+            v_y_len = np.linalg.norm(v_y)
+            if v_y_len < 1e-12:
+                ref = np.array([1.0, 0.0, 0.0])
+                v_y = ref - np.dot(ref, axis_dir) * axis_dir
+                v_y_len = np.linalg.norm(v_y)
+                if v_y_len < 1e-12:
+                    continue
+            v_y = v_y / v_y_len
+            v_z = np.cross(axis_dir, v_y)
+
+            # Extrude polygon: create quads connecting p1-section to p2-section
+            n_pts = len(outer_pts)
+            for i, (y, z) in enumerate(outer_pts):
+                pt1 = p1 + y * v_y + z * v_z
+                pt2 = p2 + y * v_y + z * v_z
+                all_verts.append(pt1)
+                all_verts.append(pt2)
+
+            # Create quad faces along the extrusion
+            for i in range(n_pts - 1):
+                i0 = vertex_offset + i * 2
+                i1 = vertex_offset + i * 2 + 1
+                i2 = vertex_offset + (i + 1) * 2 + 1
+                i3 = vertex_offset + (i + 1) * 2
+                all_faces.extend([4, i0, i1, i2, i3])
+
+            # End caps (triangulate as fan)
+            cap1_center = vertex_offset + n_pts * 2
+            cap2_center = vertex_offset + n_pts * 2 + 1
+            c1 = np.mean([p1 + y * v_y + z * v_z
+                          for y, z in outer_pts], axis=0)
+            c2 = np.mean([p2 + y * v_y + z * v_z
+                          for y, z in outer_pts], axis=0)
+            all_verts.append(c1)
+            all_verts.append(c2)
+
+            for i in range(n_pts - 1):
+                # Cap at p1
+                all_faces.extend([3, cap1_center,
+                                  vertex_offset + (i + 1) * 2,
+                                  vertex_offset + i * 2])
+                # Cap at p2
+                all_faces.extend([3, cap2_center,
+                                  vertex_offset + i * 2 + 1,
+                                  vertex_offset + (i + 1) * 2 + 1])
+
+            vertex_offset = len(all_verts)
+
+        if all_verts:
+            mesh = pv.PolyData(np.array(all_verts), faces=all_faces)
+            color = self.type_color_map.get("Beams", "#89b4fa")
+            self.plotter.add_mesh(mesh, color=color, opacity=0.7,
+                                  name='beam_sections_3d',
+                                  reset_camera=False)
+
+    def _refresh_labels(self):
+        if self.show_node_labels_check.isChecked(): self._toggle_node_labels(False); self._toggle_node_labels(True)
+        if self.show_elem_labels_check.isChecked(): self._toggle_element_labels(False); self._toggle_element_labels(True)
+        
+    def _toggle_node_labels(self, state):
+        self.plotter.remove_actor('node_labels', render=False)
+        if state and self.current_grid and self.current_grid.n_points > 0:
+            color = 'white' if self.is_dark_theme else 'black'
+            self.plotter.add_point_labels(
+                self.current_grid.points, self.current_node_ids_sorted,
+                name='node_labels', font_size=14, text_color=color,
+                shape=None, bold=False, always_visible=True,
+                reset_camera=False, render=True
+            )
+        self._update_status(f"Node labels {'ON' if state else 'OFF'}")
+
+    def _toggle_element_labels(self, state):
+        self.plotter.remove_actor('elem_labels', render=False)
+        if state and self.current_grid and self.current_grid.n_cells > 0 and 'EID' in self.current_grid.cell_data:
+            color = 'white' if self.is_dark_theme else 'black'
+            self.plotter.add_point_labels(
+                self.current_grid.cell_centers().points, self.current_grid.cell_data["EID"],
+                name='elem_labels', font_size=14, text_color=color,
+                shape=None, bold=False, always_visible=True,
+                reset_camera=False, render=True
+            )
+        self._update_status(f"Element labels {'ON' if state else 'OFF'}")
+    
+    def _find_and_zoom_to_entity(self):
+        if not self.current_generator or not self.current_grid: self._update_status("No model.", is_error=True); return
+        try: entity_id = int(self.entity_id_input.text()); etype = self.entity_type_combo.currentText()
+        except ValueError: self._update_status("Invalid ID.", is_error=True); return
+        
+        coords, found = None, False
+        model = self.current_generator.model
+
+        if etype == "Node":
+            if entity_id in model.nodes:
+                coords = model.nodes[entity_id].get_position()
+                found = True
+        elif etype == "Element":
+            if entity_id in self.current_grid.cell_data["EID"]:
+                idx = np.where(self.current_grid.cell_data["EID"] == entity_id)[0][0]
+                coords = self.current_grid.get_cell(idx).center
+                found = True
+
+        self.plotter.remove_actor('highlight_actor', render=False)
+        if found:
+            self.plotter.add_points(np.array(coords), color='yellow', point_size=15, render_points_as_spheres=True, name='highlight_actor'); self.plotter.fly_to(coords)
+            self._update_status(f"Found {etype} {entity_id}.")
+        else: self._update_status(f"{etype} {entity_id} not found.", is_error=True)
+
+    def _clear_entity_highlight(self): 
+        self.plotter.remove_actor('highlight_actor', render=True); self.entity_id_input.clear(); self._update_status("Highlight cleared.")
+        
+    def _update_status(self, msg, is_error=False):
+        self.statusBar().showMessage(msg); self.statusBar().setStyleSheet(f"color: {'#f38ba8' if is_error else '#a6adc8'};")
+        
+    def _toggle_theme(self):
+        app = QApplication.instance()
+        self.is_dark_theme = not self.is_dark_theme
+        app.setPalette(dark_palette if self.is_dark_theme else light_palette)
+        app.setStyleSheet(DARK_STYLESHEET if self.is_dark_theme else "")
+
+        bg_color = '#1e1e2e' if self.is_dark_theme else 'white'
+        label_color_tuple = (0.804, 0.839, 0.957) if self.is_dark_theme else (0, 0, 0)
+
+        self.plotter.set_background(bg_color)
+
+        self.plotter.remove_axes()
+        self.plotter.add_axes()
+        self.axes_actor = self.plotter.renderer.axes_actor
+        self._set_axes_label_color(label_color_tuple)
+
+        self.theme_button.setText(f"Switch to {'Light' if self.is_dark_theme else 'Dark'} Mode")
+        self._update_plot_visibility()
+
+
+    def _create_load(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please open or generate a model first.")
+            return
+
+        dialog = CreateLoadDialog(self.current_generator.model, self)
+        dialog.selection_requested.connect(self._handle_sub_dialog_selection_request)
+        dialog.accepted.connect(self._on_load_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _create_constraint(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please open or generate a model first.")
+            return
+
+        dialog = CreateConstraintDialog(self.current_generator.model, self)
+        # --- FIX: Connect directly to the handler, since the signal now carries the entity type ---
+        dialog.selection_requested.connect(self._handle_sub_dialog_selection_request)
+        dialog.accepted.connect(self._on_constraint_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _on_load_creation_accept(self):
+        dialog = self.active_creation_dialog
+        if not dialog: return
+
+        params = dialog.get_parameters()
+        if params:
+            model = self.current_generator.model
+            sid = params['sid']
+            load_type = params.pop('type')
+
+            # Always append to the load set — never delete-and-replace.
+            # Use the Load Set Manager to edit/remove individual entries.
+            cmd = AddLoadCommand(load_type, params)
+            self.command_manager.execute(cmd, model)
+
+            self._update_status(f"Added load entries to SID {sid}.")
+            self._populate_tree()
+            self._create_all_load_actors()
+            self._update_plot_visibility()
+
+        self.active_creation_dialog = None
+
+    def _on_constraint_creation_accept(self):
+        dialog = self.active_creation_dialog
+        if not dialog: return
+
+        params = dialog.get_parameters()
+        if params:
+            model = self.current_generator.model
+            sid = params['sid']
+
+            # Always append to the constraint set — never delete-and-replace.
+            cmd = AddConstraintCommand(params)
+            self.command_manager.execute(cmd, model)
+
+            self._update_status(f"Added constraint entries to SID {sid}.")
+            self._populate_tree()
+            self._create_all_constraint_actors()
+            self._update_plot_visibility()
+
+        self.active_creation_dialog = None
+
+    def _open_load_set_manager(self, sid):
+        """Open the Load Set Manager dialog for viewing/editing entries in a set."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        if sid not in model.loads and sid not in model.tempds:
+            QMessageBox.information(self, "Empty Set",
+                                    f"Load set SID {sid} has no entries.")
+            return
+        from node_runner.dialogs.loads import LoadSetManagerDialog
+        dialog = LoadSetManagerDialog(model, sid, self)
+        if dialog.exec():
+            new_entries = dialog.get_modified_entries()
+            tempd_removed = dialog.tempd_was_removed()
+            if new_entries is not None:
+                cmd = ReplaceLoadSetCommand(sid, new_entries)
+                self.command_manager.execute(cmd, model)
+            if tempd_removed:
+                from node_runner.commands import DeleteTempdCommand
+                cmd2 = DeleteTempdCommand(sid)
+                self.command_manager.execute(cmd2, model)
+            if new_entries is not None or tempd_removed:
+                self._populate_tree()
+                self._populate_loads_tab()
+                self._create_all_load_actors()
+                self._update_plot_visibility()
+                n = len(new_entries) if new_entries is not None else 0
+                self._update_status(
+                    f"Updated load set SID {sid} ({n} entries)")
+
+    def _add_to_load_set(self, sid):
+        """Open CreateLoadDialog pre-filled with the given SID to add entries."""
+        if not self.current_generator:
+            return
+        if self.active_creation_dialog:
+            self.active_creation_dialog.activateWindow()
+            return
+        dialog = CreateLoadDialog(self.current_generator.model, self,
+                                  existing_sid=sid)
+        dialog.selection_requested.connect(self._handle_sub_dialog_selection_request)
+        dialog.accepted.connect(self._on_load_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _handle_sub_dialog_selection_request(self, entity_type):
+        if self.active_creation_dialog:
+            self.active_creation_dialog.hide()
+
+        if entity_type == 'Node':
+            all_ids = self.current_generator.model.nodes.keys()
+        else:
+            all_ids = [eid for eid, elem in self.current_generator.model.elements.items() if elem.type in ['CQUAD4', 'CTRIA3']]
+
+        select_by = self._build_select_by_data() if entity_type == 'Element' else None
+
+        # Store entity_type for the closure
+        _et = entity_type
+
+        def on_accept():
+            selected_ids = self.selection_bar.get_selected_ids()
+            if self.active_creation_dialog:
+                self.active_creation_dialog.update_selection_list(_et, selected_ids)
+                self.active_creation_dialog.show()
+            self._end_selection_mode()
+
+        self._start_selection(entity_type, all_ids, on_accept, select_by)
+        # Override reject to also re-show the creation dialog
+        self._selection_reject_restore_creation = True
+
+    def _create_all_load_actors(self):
+        """
+        Creates all load actors for the current model, one per SID.
+        This is slow and should only be called when loads are created/edited/deleted.
+        """
+        actor_names_to_remove = [name for name in self.plotter.actors if name.startswith(('force_actors_', 'moment_actors_', 'pressure_actors_'))]
+        self.plotter.remove_actor(actor_names_to_remove, render=False)
+
+        # --- MODIFIED: Clear and prepare the scaling info dictionary ---
+        self.load_scaling_info.clear()
+
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.loads: return
+        
+        all_force_mags, all_moment_mags, all_pressure_mags = [], [], []
+        for load_list in model.loads.values():
+            for load in load_list:
+                if load.type == 'FORCE': all_force_mags.append(np.linalg.norm(np.array(load.xyz) * load.mag))
+                elif load.type == 'MOMENT': all_moment_mags.append(np.linalg.norm(np.array(load.xyz) * load.mag))
+                elif load.type == 'PLOAD4': all_pressure_mags.append(abs(load.pressures[0]))
+
+        # --- MODIFIED: Store max magnitudes in the new dictionary ---
+        self.load_scaling_info['force_max_mag'] = np.max(all_force_mags) if all_force_mags else 0.0
+        self.load_scaling_info['moment_max_mag'] = np.max(all_moment_mags) if all_moment_mags else 0.0
+        self.load_scaling_info['pressure_max_mag'] = np.max(all_pressure_mags) if all_pressure_mags else 0.0
+        
+        eid_to_cell_idx_map = {eid: i for i, eid in enumerate(self.current_grid.cell_data['EID'])}
+
+        for sid, load_list in model.loads.items():
+            force_points, force_vectors = [], []
+            moment_points, moment_vectors = [], []
+            pressure_points, pressure_vectors = [], []
+
+            for load in load_list:
+                if load.type == 'FORCE' and load.node in model.nodes:
+                    force_points.append(model.nodes[load.node].get_position())
+                    force_vectors.append(np.array(load.xyz) * load.mag)
+                elif load.type == 'MOMENT' and load.node in model.nodes:
+                    moment_points.append(model.nodes[load.node].get_position())
+                    moment_vectors.append(np.array(load.xyz) * load.mag)
+                elif load.type == 'PLOAD4':
+                    for eid in load.eids:
+                        if (cell_idx := eid_to_cell_idx_map.get(eid)) is not None:
+                            cell = self.current_grid.get_cell(cell_idx)
+                            pressure_points.append(cell.center)
+                            pressure_vectors.append(cell.normal * load.pressures[0])
+
+            if force_points:
+                actor = pv.PolyData(np.array(force_points))
+                actor['vectors'] = np.array(force_vectors)
+                actor.set_active_vectors('vectors')
+                # --- FIX: The buggy actor.userData line has been removed ---
+                self.plotter.add_mesh(actor, name=f"force_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='red', opacity=0)
+
+            if moment_points:
+                actor = pv.PolyData(np.array(moment_points))
+                actor['vectors'] = np.array(moment_vectors)
+                actor.set_active_vectors('vectors')
+                self.plotter.add_mesh(actor, name=f"moment_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
+            
+            if pressure_points:
+                actor = pv.PolyData(np.array(pressure_points))
+                actor['vectors'] = np.array(pressure_vectors)
+                actor.set_active_vectors('vectors')
+                self.plotter.add_mesh(actor, name=f"pressure_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='yellow', opacity=0)
+    
+    
+    def _create_all_constraint_actors(self):
+        """Creates all constraint actors for the current model, one per SID."""
+        actor_names_to_remove = [name for name in self.plotter.actors if name.startswith('constraint_actors_')]
+        self.plotter.remove_actor(actor_names_to_remove, render=False)
+
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.spcs: return
+
+        for sid, spc_list in model.spcs.items():
+            coords = []
+            for spc in spc_list:
+                for nid in spc.nodes:
+                    if nid in model.nodes:
+                        coords.append(model.nodes[nid].get_position())
+            if coords:
+                actor = pv.PolyData(np.array(coords))
+                self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
+
+    def _create_rbe_actors(self):
+        """Creates spider-line visualization for RBE2 and RBE3 rigid elements."""
+        self.plotter.remove_actor('rbe_actors', render=False)
+
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.rigid_elements: return
+
+        points = []
+        lines = []
+        colors = []
+        pt_idx = 0
+
+        for eid, elem in model.rigid_elements.items():
+            try:
+                if elem.type == 'RBE2':
+                    # RBE2: independent node (gn) is the center, dependent nodes (Gmi) are the legs
+                    center_nid = elem.gn
+                    leg_nids = list(elem.Gmi)
+                    color = self.type_color_map.get('RBE2', '#ff3131')
+                elif elem.type == 'RBE3':
+                    # RBE3: dependent node (refgrid) is the center, independent nodes are the legs
+                    center_nid = elem.refgrid
+                    # Extract all grid IDs from weight/component/grid groups
+                    leg_nids = []
+                    for wt_cg in elem.wt_cg_groups:
+                        # wt_cg is (weight, components, grids_list)
+                        leg_nids.extend(wt_cg[2])
+                    color = self.type_color_map.get('RBE3', '#ffd700')
+                else:
+                    continue
+
+                if center_nid not in model.nodes:
+                    continue
+
+                center_pos = model.nodes[center_nid].get_position()
+
+                for leg_nid in leg_nids:
+                    if leg_nid not in model.nodes:
+                        continue
+                    leg_pos = model.nodes[leg_nid].get_position()
+                    points.append(center_pos)
+                    points.append(leg_pos)
+                    lines.append([2, pt_idx, pt_idx + 1])
+                    colors.append(color)
+                    pt_idx += 2
+            except (AttributeError, KeyError, IndexError) as e:
+                print(f"Warning: Skipping RBE {eid} visualization: {e}")
+                continue
+
+        if not points:
+            return
+
+        poly = pv.PolyData(np.array(points))
+        flat_lines = [val for line in lines for val in line]
+        poly.lines = np.array(flat_lines)
+
+        # Convert hex colors to per-point RGB (2 points per line segment)
+        from PySide6.QtGui import QColor
+        point_colors = []
+        for c in colors:
+            rgb = [int(x * 255) for x in QColor(c).getRgbF()[:3]]
+            point_colors.append(rgb)  # start point
+            point_colors.append(rgb)  # end point
+        poly.point_data['colors'] = np.array(point_colors, dtype=np.uint8)
+
+        self.plotter.add_mesh(poly, scalars='colors', rgb=True,
+                              render_lines_as_tubes=True, line_width=3,
+                              name='rbe_actors', pickable=False)
+
+    def _create_mass_actors(self):
+        """Creates cube glyph visualization for CONM2 mass elements."""
+        self.plotter.remove_actor('mass_actors', render=False)
+
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.masses: return
+
+        coords = []
+        for eid, mass_elem in model.masses.items():
+            try:
+                nid = mass_elem.nid
+                if nid in model.nodes:
+                    coords.append(model.nodes[nid].get_position())
+            except (AttributeError, KeyError):
+                continue
+
+        if not coords:
+            return
+
+        pts = pv.PolyData(np.array(coords))
+        cube = pv.Cube(x_length=1.0, y_length=1.0, z_length=1.0)
+        scale = self.current_grid.length * 0.015 if self.current_grid.length > 0 else 1.0
+        glyphs = pts.glyph(scale=False, factor=scale, geom=cube)
+        self.plotter.add_mesh(glyphs, color=self.type_color_map.get('Masses', '#00cc66'),
+                              name='mass_actors', pickable=False)
+
+    def _create_plotel_actors(self):
+        """Creates line visualization for PLOTEL elements."""
+        self.plotter.remove_actor('plotel_actors', render=False)
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.plotels: return
+        points = []; lines = []; pt_idx = 0
+        for eid, elem in model.plotels.items():
+            try:
+                n1, n2 = elem.nodes
+                if n1 in model.nodes and n2 in model.nodes:
+                    points.append(model.nodes[n1].get_position())
+                    points.append(model.nodes[n2].get_position())
+                    lines.append([2, pt_idx, pt_idx + 1])
+                    pt_idx += 2
+            except (KeyError, AttributeError): continue
+        if not points: return
+        poly = pv.PolyData(np.array(points))
+        poly.lines = np.array([v for l in lines for v in l])
+        color = self.type_color_map.get('Plotel', '#ff69b4')
+        self.plotter.add_mesh(poly, color=color, render_lines_as_tubes=True,
+                              line_width=2, name='plotel_actors', pickable=False)
+
+    def _create_element_normals_actor(self):
+        """
+        Calculates and creates a renderable actor for shell element normals by
+        manually performing a cross-product on each element's nodes. This
+        ensures the visualization is a 1:1 match with the model's data.
+        """
+        self.plotter.remove_actor('element_normals_actor', render=False)
+
+        if not self.current_grid or 'is_shell' not in self.current_grid.cell_data:
+            return
+
+        shell_indices = np.where(self.current_grid.cell_data['is_shell'] == 1)[0]
+        if shell_indices.size == 0:
+            return
+        
+        centers = []
+        vectors = []
+
+        # --- FIX: Manually calculate the normal for each shell element ---
+        # This bypasses PyVista's automatic normal "fixing" and guarantees we
+        # visualize the true normal based on the raw node order from the model.
+        for i in shell_indices:
+            cell = self.current_grid.get_cell(i)
+            points = cell.points
+            
+            # Calculate normal using the cross product, respecting Nastran's right-hand rule
+            if cell.type == vtk.VTK_QUAD or cell.type == vtk.VTK_PIXEL: # For CQUAD4
+                # Use the two diagonals for a robust calculation
+                vec1 = points[2] - points[0]
+                vec2 = points[3] - points[1]
+                normal = np.cross(vec1, vec2)
+            elif cell.type == vtk.VTK_TRIANGLE: # For CTRIA3
+                vec1 = points[1] - points[0]
+                vec2 = points[2] - points[0]
+                normal = np.cross(vec1, vec2)
+            else:
+                continue # Should not be possible due to our filter
+
+            # Normalize the vector to get a unit direction
+            norm_len = np.linalg.norm(normal)
+            if norm_len > 1e-9:
+                normal = normal / norm_len
+
+            centers.append(cell.center)
+            vectors.append(normal)
+
+        if not centers:
+            return
+
+        try:
+            scale_percent = float(self.normal_arrow_scale_input.text())
+        except ValueError:
+            scale_percent = 2.5
+        
+        scale = self.plotter.camera.parallel_scale * (scale_percent / 50.0)
+
+        points_pd = pv.PolyData(np.array(centers))
+        points_pd['vectors'] = np.array(vectors)
+        arrow_geom = pv.Arrow(tip_length=0.2, shaft_radius=0.02)
+        glyphs = points_pd.glyph(orient='vectors', scale=False, factor=scale, geom=arrow_geom)
+        self.plotter.add_mesh(glyphs, name='element_normals_actor', color='#ffbe0b', reset_camera=False)
+
+    def _create_free_edges_actor(self):
+        """Creates a line overlay highlighting free (unshared) shell element edges."""
+        self.plotter.remove_actor('free_edges_actor', render=False)
+
+        if not self.current_generator or not self.current_generator.model.elements:
+            return
+
+        free_edges = self.current_generator.find_free_edges()
+        if not free_edges:
+            self._update_status("No free edges found.")
+            return
+
+        # Build line PolyData from edge node pairs
+        points = []
+        lines = []
+        node_map = {}  # nid -> index in points list
+        model_nodes = self.current_generator.model.nodes
+
+        for nid1, nid2 in free_edges:
+            if nid1 not in model_nodes or nid2 not in model_nodes:
+                continue  # Skip edges with missing nodes
+            for nid in (nid1, nid2):
+                if nid not in node_map:
+                    node_map[nid] = len(points)
+                    points.append(model_nodes[nid].get_position())
+            lines.append([2, node_map[nid1], node_map[nid2]])
+
+        if not points:
+            self._update_status("No free edges with valid nodes found.")
+            return
+
+        poly = pv.PolyData(np.array(points), lines=np.hstack(lines))
+        self.plotter.add_mesh(poly, name='free_edges_actor', color='#ff3131',
+                              line_width=4, render_lines_as_tubes=True, reset_camera=False)
+        self._update_status(f"Showing {len(free_edges)} free edge(s).")
+
+# START: Final replacement for _create_bush_orientation_glyphs in main.py
+    def _create_bush_orientation_glyphs(self, visibility_mask):
+        """Creates and renders orientation triads for visible CBUSH elements."""
+        self.plotter.remove_actor('bush_orientation_glyphs', render=False)
+        if not self.show_bush_orient_check.isChecked() or not self.current_grid or self.current_grid.n_cells == 0:
+            return
+
+        if 'type' not in self.current_grid.cell_data: return
+        all_bush_indices_mask = self.current_grid.cell_data['type'] == 'CBUSH'
+        
+        visible_bush_mask = all_bush_indices_mask & visibility_mask
+        visible_bush_indices = np.where(visible_bush_mask)[0]
+
+        if visible_bush_indices.size == 0:
+            return
+
+        visible_eids = self.current_grid.cell_data['EID'][visible_bush_indices]
+        centers = self.current_grid.cell_centers().points[visible_bush_indices]
+        
+        glyph_points = []
+        glyph_vectors = []
+        glyph_colors = []
+        
+        # --- MODIFIED: Define colors as numerical RGB tuples ---
+        colors = {
+            "x": [255, 0, 0],   # Red
+            "y": [0, 255, 0],   # Green
+            "z": [0, 0, 255]    # Blue
+        }
+        
+        scale = self.plotter.camera.parallel_scale * 0.05
+
+        for i, eid in enumerate(visible_eids):
+            matrix = self.current_generator.get_cbush_orientation_matrix(eid)
+            center_point = centers[i]
+
+            glyph_points.extend([center_point, center_point, center_point])
+            glyph_vectors.extend([matrix[:,0], matrix[:,1], matrix[:,2]])
+            glyph_colors.extend([colors['x'], colors['y'], colors['z']])
+
+        if not glyph_points: return
+
+        polydata = pv.PolyData(np.array(glyph_points))
+        polydata['vectors'] = np.array(glyph_vectors)
+        polydata['colors'] = np.array(glyph_colors, dtype=np.uint8)
+
+        arrows = polydata.glyph(orient='vectors', scale=False, factor=scale, geom=pv.Arrow(tip_length=0.2, shaft_radius=0.02))
+        self.plotter.add_mesh(arrows, scalars='colors', rgb=True, name='bush_orientation_glyphs', reset_camera=False)
+# END: Final replacement for _create_bush_orientation_glyphs in main.py
+    
+
+
+# START: New glyph creation method in main.py
+    def _create_beam_orientation_glyphs(self, visibility_mask):
+        """Creates and renders orientation triads for visible CBEAM/CBAR elements."""
+        self.plotter.remove_actor('beam_orientation_glyphs', render=False)
+        if not self.show_beam_orient_check.isChecked() or not self.current_grid or self.current_grid.n_cells == 0:
+            return
+
+        if 'type' not in self.current_grid.cell_data: return
+        beam_types = ['CBEAM', 'CBAR']
+        all_beam_indices_mask = np.isin(self.current_grid.cell_data['type'], beam_types)
+        
+        visible_beam_mask = all_beam_indices_mask & visibility_mask
+        visible_beam_indices = np.where(visible_beam_mask)[0]
+
+        if visible_beam_indices.size == 0:
+            return
+
+        visible_eids = self.current_grid.cell_data['EID'][visible_beam_indices]
+        centers = self.current_grid.cell_centers().points[visible_beam_indices]
+        
+        glyph_points, glyph_vectors, glyph_colors = [], [], []
+        colors = {"x": [255, 0, 0], "y": [0, 255, 0], "z": [0, 0, 255]}
+        scale = self.plotter.camera.parallel_scale * 0.05
+
+        for i, eid in enumerate(visible_eids):
+            matrix = self.current_generator.get_beam_orientation_matrix(eid)
+            center_point = centers[i]
+
+            glyph_points.extend([center_point, center_point, center_point])
+            glyph_vectors.extend([matrix[:,0], matrix[:,1], matrix[:,2]])
+            glyph_colors.extend([colors['x'], colors['y'], colors['z']])
+
+        if not glyph_points: return
+
+        polydata = pv.PolyData(np.array(glyph_points))
+        polydata['vectors'] = np.array(glyph_vectors)
+        polydata['colors'] = np.array(glyph_colors, dtype=np.uint8)
+
+        arrows = polydata.glyph(orient='vectors', scale=False, factor=scale, geom=pv.Arrow(tip_length=0.2, shaft_radius=0.02))
+        self.plotter.add_mesh(arrows, scalars='colors', rgb=True, name='beam_orientation_glyphs', reset_camera=False)
+
+    def _schedule_glyph_refresh(self):
+        """Start/restart the debounce timer for orientation glyph refresh."""
+        if hasattr(self, '_glyph_refresh_timer'):
+            self._glyph_refresh_timer.start()
+
+    def _refresh_orientation_glyphs(self):
+        """Recreate visible orientation glyphs using cached visibility mask."""
+        if self._last_visibility_mask is None or not self.current_grid:
+            return
+        mask = self._last_visibility_mask
+        if self.show_bush_orient_check.isChecked():
+            self._create_bush_orientation_glyphs(mask)
+        if self.show_beam_orient_check.isChecked():
+            self._create_beam_orientation_glyphs(mask)
+        if self.show_normals_check.isChecked():
+            self._create_element_normals_actor()
+        self.plotter.render()
+
+
+
+    def _create_coord_system(self):
+        if self.active_creation_dialog: return self.active_creation_dialog.activateWindow()
+        
+        next_cid = max(list(self.current_generator.model.coords.keys()) + [0]) + 1
+        
+        # Pass the model so the dialog can populate the reference CID list
+        dialog = CreateCoordDialog(next_cid, self.current_generator.model, self)
+        dialog.accepted.connect(self._on_coord_creation_accept)
+        dialog.rejected.connect(self._on_creation_reject)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        dialog.show()
+        self.active_creation_dialog = dialog
+
+    def _on_coord_creation_accept(self):
+        dialog = self.active_creation_dialog
+        if not dialog: return
+
+        if params := dialog.get_parameters():
+            cmd = AddCoordCommand(params)
+            self.command_manager.execute(cmd, self.current_generator.model)
+            self._update_status(f"Created/Updated Coordinate System CID {params['cid']}.")
+            self._update_viewer(self.current_generator, reset_camera=False)
+
+        self.active_creation_dialog = None
+
+
+    def _create_coord_system_actors(self, cid):
+        """Creates static csys triad arrows + optional label for a coordinate system.
+
+        Reads display-tab settings (axis size, label toggle).
+        Safely skips if the coord object cannot provide origin/axes.
+        """
+        if not self.current_generator or cid not in self.current_generator.model.coords:
+            return False
+
+        try:
+            coord = self.current_generator.model.coords[cid]
+            origin = np.asarray(coord.origin, dtype=float)
+            x_axis = np.asarray(coord.i, dtype=float)
+            y_axis = np.asarray(coord.j, dtype=float)
+            z_axis = np.asarray(coord.k, dtype=float)
+        except Exception:
+            return False  # coord not fully initialised (e.g. cross-ref missing)
+
+        # Scale from Display-tab slider (‰ of model diagonal)
+        model_size = (self.current_grid.length
+                      if self.current_grid and self.current_grid.n_points > 1
+                      else 10.0)
+        if np.isclose(model_size, 0.0):
+            model_size = 10.0
+        scale = model_size * self.csys_scale_slider.value() / 1000.0
+
+        arrow_kw = dict(shaft_radius=0.015, tip_radius=0.04, tip_length=0.25)
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=x_axis, scale=scale, **arrow_kw),
+                              color='red', name=f"coord_{cid}_x", reset_camera=False)
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=y_axis, scale=scale, **arrow_kw),
+                              color='green', name=f"coord_{cid}_y", reset_camera=False)
+        self.plotter.add_mesh(pv.Arrow(start=origin, direction=z_axis, scale=scale, **arrow_kw),
+                              color='blue', name=f"coord_{cid}_z", reset_camera=False)
+
+        # Label — honour the "Show Labels" checkbox
+        if self.show_csys_labels_check.isChecked():
+            label_map = {0: "CID 0: Global Rect", 1: "CID 1: Global Cyl",
+                         2: "CID 2: Global Sph"}
+            label_text = label_map.get(cid, f"CID {cid}")
+            label_color = 'white' if self.is_dark_theme else 'black'
+            self.plotter.add_point_labels(
+                origin, [label_text], name=f"coord_label_{cid}",
+                font_size=10, text_color=label_color, shape=None,
+                always_visible=True, reset_camera=False)
+        return True
+
+    def _remove_coord_actors(self, cid):
+        """Remove all actors (arrows + label) for a coordinate system."""
+        for suffix in ('_x', '_y', '_z'):
+            self.plotter.remove_actor(f"coord_{cid}{suffix}", render=False)
+        self.plotter.remove_actor(f"coord_label_{cid}", render=False)
+
+    def _refresh_coord_actors(self, _=None, render=True):
+        """Rebuild all coord-system actors honouring Display-tab settings + tree state."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+
+        master_on = self.show_csys_check.isChecked()
+        show_global = self.show_global_csys_check.isChecked()
+
+        # Remove ALL existing coord actors first (clean slate)
+        for cid in list(model.coords.keys()):
+            self._remove_coord_actors(cid)
+
+        if not master_on:
+            if render:
+                self.plotter.render()
+            return
+
+        # Determine per-CID visibility from tree checkboxes
+        tree_visible = {}
+        coord_group_items = self._find_tree_items(('group', 'coords'))
+        if coord_group_items:
+            parent = coord_group_items[0]
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                child_data = child.data(0, QtCore.Qt.UserRole)
+                if isinstance(child_data, tuple) and len(child_data) >= 2:
+                    tree_visible[child_data[1]] = (
+                        child.checkState(0) == QtCore.Qt.Checked)
+
+        for cid in sorted(model.coords.keys()):
+            # Global CSys master toggle
+            if cid <= 2 and not show_global:
+                continue
+            # Per-CID tree checkbox
+            if not tree_visible.get(cid, cid > 2):
+                continue
+            self._create_coord_system_actors(cid)
+
+        if render:
+            self.plotter.render()
+
+
+
+    def _update_plot_visibility(self):
+        """Fast update of actor visibilities based on tree state. Does not rebuild actors."""
+        if not self.current_generator or not self.current_grid:
+            self._rebuild_plot()
+            return
+
+        visibility_mask = np.ones(self.current_grid.n_cells, dtype=bool)
+        model = self.current_generator.model
+        type_to_nastran_map = { 'Beams': ['CBEAM'], 'Bars': ['CBAR'], 'Rods': ['CROD'], 'Plates': ['CQUAD4', 'CMEMBRAN', 'CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Solids': ['CHEXA', 'CHEXA8', 'CHEXA20', 'CTETRA', 'CTETRA4', 'CTETRA10', 'CPENTA', 'CPENTA6', 'CPENTA15'], 'Shear': ['CSHEAR'], 'Gap': ['CGAP'] }
+        shape_to_nastran_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'], 'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'], 'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'], 'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'] }
+        iterator = QTreeWidgetItemIterator(self.tree_widget)
+        while iterator.value():
+            item = iterator.value()
+            item_data = item.data(0, QtCore.Qt.UserRole)
+            if isinstance(item_data, tuple) and item_data[0] == 'elem_by_type_group':
+                if item.checkState(0) != QtCore.Qt.Checked:
+                    nastran_types_to_hide = type_to_nastran_map.get(item_data[1], [])
+                    if nastran_types_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['type'], nastran_types_to_hide)] = False
+            elif isinstance(item_data, tuple) and item_data[0] == 'elem_shape_group':
+                if item.checkState(0) != QtCore.Qt.Checked:
+                    nastran_types_to_hide = shape_to_nastran_map.get(item_data[1], [])
+                    if nastran_types_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['type'], nastran_types_to_hide)] = False
+            iterator += 1
+        props_to_hide = {prop_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'properties')) for i in range(item.childCount()) if (prop_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
+        if props_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['PID'], list(props_to_hide))] = False
+        mids_to_hide = {mat_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'materials')) for i in range(item.childCount()) if (mat_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
+        if mids_to_hide:
+            props_using_hidden_mats = set()
+            for pid, prop in model.properties.items():
+                for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                    val = getattr(prop, attr, None)
+                    if val is not None and val in mids_to_hide:
+                        props_using_hidden_mats.add(pid)
+                        break
+            if props_using_hidden_mats: visibility_mask[np.isin(self.current_grid.cell_data['PID'], list(props_using_hidden_mats))] = False
+        if (rbe_actor := self.plotter.actors.get('rbe_actors')):
+            rbe_actor.SetVisibility(not any(item.checkState(0) != QtCore.Qt.Checked for item in self._find_tree_items(('elem_by_type_group', 'Rigid'))))
+        if (mass_actor := self.plotter.actors.get('mass_actors')):
+            mass_items = self._find_tree_items(('group', 'masses'))
+            mass_actor.SetVisibility(not mass_items or mass_items[0].checkState(0) == QtCore.Qt.Checked)
+        if (plotel_actor := self.plotter.actors.get('plotel_actors')):
+            plotel_items = self._find_tree_items(('group', 'plotels'))
+            plotel_actor.SetVisibility(not plotel_items or plotel_items[0].checkState(0) == QtCore.Qt.Checked)
+
+        # --- Phase 8: Group visibility ---
+        if self._isolate_mode:
+            group_data = self.groups.get(self._isolate_mode, {})
+            group_eids = set(group_data.get("elements", []))
+            if group_eids:
+                visibility_mask &= np.isin(self.current_grid.cell_data['EID'], list(group_eids))
+            else:
+                visibility_mask[:] = False
+        elif self._hidden_groups:
+            hidden_eids: set[int] = set()
+            for grp_name in self._hidden_groups:
+                grp = self.groups.get(grp_name, {})
+                hidden_eids.update(grp.get("elements", []))
+            if hidden_eids:
+                visibility_mask[np.isin(self.current_grid.cell_data['EID'], list(hidden_eids))] = False
+
+        self._last_visibility_mask = visibility_mask.copy()
+        self._rebuild_plot(visibility_mask=visibility_mask)
+
+        try:
+            arrow_size_percent = float(self.arrow_scale_input.text()); use_relative_scaling = self.relative_scaling_check.isChecked()
+        except (ValueError, AttributeError):
+            arrow_size_percent = 10.0; use_relative_scaling = True
+        base_scale = self.current_grid.length * (arrow_size_percent / 100.0)
+
+        max_force_mag = self.load_scaling_info.get('force_max_mag', 0.0)
+        max_moment_mag = self.load_scaling_info.get('moment_max_mag', 0.0)
+        max_pressure_mag = self.load_scaling_info.get('pressure_max_mag', 0.0)
+
+        for sid in model.loads.keys():
+            is_visible = False
+            if (sid_item_list := self._find_tree_items(('load_set', sid))) and sid_item_list[0].checkState(0) == QtCore.Qt.Checked:
+                is_visible = True
+            
+            for type, max_mag in [('force', max_force_mag), ('moment', max_moment_mag), ('pressure', max_pressure_mag)]:
+                actor_name = f"{type}_actors_{sid}"; glyph_name = f"{type}_glyphs_{sid}"
+                self.plotter.remove_actor(glyph_name, render=False)
+                if (actor := self.plotter.actors.get(actor_name)) and is_visible:
+                    dataset = actor.mapper.dataset
+                    if not dataset.n_points: continue
+                    if type == 'force':
+                        vectors = dataset['vectors']; mags = np.linalg.norm(vectors, axis=1)
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            unit_vectors = np.nan_to_num(vectors / mags[:, np.newaxis])
+                        if use_relative_scaling and max_mag > 1e-9:
+                            scaled_vectors = unit_vectors * (mags / max_mag * base_scale)[:, np.newaxis]
+                        else:
+                            scaled_vectors = unit_vectors * base_scale
+                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='red', name=glyph_name)
+                    elif type == 'moment':
+                        moment_glyph = pv.DoubleArrow(tip_length=0.2, tip_radius=0.08, shaft_radius=0.03)
+                        if use_relative_scaling and max_mag > 1e-9:
+                            mags = np.linalg.norm(dataset['vectors'], axis=1); dataset['relative_mag'] = mags / max_mag
+                            glyphs = dataset.glyph(orient='vectors', scale='relative_mag', factor=base_scale, geom=moment_glyph)
+                        else:
+                            glyphs = dataset.glyph(orient='vectors', scale=False, factor=base_scale, geom=moment_glyph)
+                        self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
+                    elif type == 'pressure':
+                        vectors = dataset['vectors']; mags = np.linalg.norm(vectors, axis=1)
+                        with np.errstate(divide='ignore', invalid='ignore'):
+                            unit_vectors = np.nan_to_num(vectors / mags[:, np.newaxis])
+                        uniform_size = base_scale * 0.75
+                        if use_relative_scaling and max_mag > 1e-9:
+                            scaled_vectors = unit_vectors * (mags / max_mag * uniform_size)[:, np.newaxis]
+                        else:
+                            scaled_vectors = unit_vectors * uniform_size
+                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='yellow', name=glyph_name)
+        
+        for sid in model.spcs.keys():
+            is_visible = False
+            if (sid_item_list := self._find_tree_items(('constraint_set', sid))) and sid_item_list[0].checkState(0) == QtCore.Qt.Checked:
+                is_visible = True
+            
+            glyph_name = f"constraint_glyphs_{sid}"
+            self.plotter.remove_actor(glyph_name, render=False)
+            if (actor := self.plotter.actors.get(f"constraint_actors_{sid}")) and is_visible:
+                dataset = actor.mapper.dataset
+                if not dataset.n_points: continue
+                glyph_geom = pv.Cone(direction=(0, 0, 1), height=1.0, radius=0.3); scale_factor = self.current_grid.length * 0.02
+                glyphs = dataset.glyph(scale=False, factor=scale_factor, orient=False, geom=glyph_geom)
+                self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
+
+        # --- Control visibility of coordinate system actors ---
+        self._refresh_coord_actors(render=False)
+
+        self._create_bush_orientation_glyphs(visibility_mask)
+        self._create_beam_orientation_glyphs(visibility_mask)
+        if self.show_free_edges_check.isChecked():
+            self._create_free_edges_actor()
+        self._render_geometry()
+        self.plotter.render()
+
+    # --- Geometry visualization ---
+
+    def _render_geometry(self):
+        """Render geometry entities (points, lines, arcs, circles) in the viewer."""
+        # Remove old geometry actors
+        actors_to_remove = [name for name in self.plotter.actors if name.startswith('geom_')]
+        for name in actors_to_remove:
+            self.plotter.remove_actor(name, render=False)
+
+        if self.geometry_store.is_empty:
+            return
+
+        # Check tree visibility
+        geom_items = self._find_tree_items(('group', 'geometry'))
+        if geom_items and geom_items[0].checkState(0) == QtCore.Qt.Unchecked:
+            return
+
+        # Points group visibility
+        pts_visible = True
+        pts_group = self._find_tree_items(('geom_group', 'points'))
+        if pts_group and pts_group[0].checkState(0) == QtCore.Qt.Unchecked:
+            pts_visible = False
+
+        if pts_visible and self.geometry_store.points:
+            pts_array = np.array([pt.xyz for pt in self.geometry_store.points.values()])
+            self.plotter.add_points(pts_array, color='orange', point_size=8,
+                                    render_points_as_spheres=True, name='geom_points')
+
+        # Curves group visibility
+        curves_visible = True
+        curves_group = self._find_tree_items(('geom_group', 'curves'))
+        if curves_group and curves_group[0].checkState(0) == QtCore.Qt.Unchecked:
+            curves_visible = False
+
+        if curves_visible:
+            for lid, line in self.geometry_store.lines.items():
+                pts = line.evaluate_array(2)
+                poly = pv.Line(pts[0], pts[1])
+                self.plotter.add_mesh(poly, color='magenta', line_width=3,
+                                      name=f'geom_line_{lid}', render=False)
+
+            for aid, arc in self.geometry_store.arcs.items():
+                pts = arc.evaluate_array(32)
+                poly = pv.PolyData(pts)
+                poly.lines = np.hstack([[32] + list(range(32))])
+                self.plotter.add_mesh(poly, color='cyan', line_width=3,
+                                      name=f'geom_arc_{aid}', render=False)
+
+            for cid, circle in self.geometry_store.circles.items():
+                pts = circle.evaluate_array(64)
+                # Close the circle
+                connectivity = list(range(64)) + [0]
+                poly = pv.PolyData(pts)
+                poly.lines = np.hstack([[65] + connectivity])
+                self.plotter.add_mesh(poly, color='cyan', line_width=3,
+                                      name=f'geom_circle_{cid}', render=False)
+
+        # Surfaces - just render boundary curves for now (fill deferred)
+        surfs_visible = True
+        surfs_group = self._find_tree_items(('geom_group', 'surfaces'))
+        if surfs_group and surfs_group[0].checkState(0) == QtCore.Qt.Unchecked:
+            surfs_visible = False
+
+        if surfs_visible and self.geometry_store.surfaces:
+            for sid, surf in self.geometry_store.surfaces.items():
+                for curve_id in surf.boundary_curve_ids:
+                    try:
+                        pts = self.geometry_store.evaluate_curve(curve_id, 32)
+                        poly = pv.PolyData(pts)
+                        poly.lines = np.hstack([[32] + list(range(32))])
+                        self.plotter.add_mesh(poly, color='orange', line_width=2,
+                                              opacity=0.7, name=f'geom_surf_{sid}_curve_{curve_id}',
+                                              render=False)
+                    except KeyError:
+                        pass
+
+    # --- Geometry creation handlers ---
+
+    def _create_geometry_point(self):
+        next_id = self.geometry_store.next_point_id()
+        dialog = CreateGeometryPointDialog(next_id, self)
+        if dialog.exec():
+            if dialog.is_batch:
+                batch = dialog.get_batch_parameters()
+                cmds = []
+                for pt in batch:
+                    pid = pt['id'] if pt['id'] else self.geometry_store.next_point_id()
+                    cmd = AddGeometryPointCommand(
+                        self.geometry_store, pid,
+                        [pt['x'], pt['y'], pt['z']])
+                    cmds.append(cmd)
+                compound = CompoundCommand(cmds, f"Import {len(cmds)} geometry points from Excel")
+                compound.execute(None)
+                self.command_manager.undo_stack.append(compound)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Imported {len(cmds)} geometry points from Excel")
+            else:
+                params = dialog.get_parameters()
+                cmd = AddGeometryPointCommand(
+                    self.geometry_store, params['id'],
+                    [params['x'], params['y'], params['z']])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Created geometry point P{params['id']}")
+
+    def _create_geometry_line(self):
+        if len(self.geometry_store.points) < 2:
+            QMessageBox.warning(self, "Insufficient Points",
+                                "Need at least 2 geometry points to create a line.")
+            return
+        next_id = self.geometry_store.next_curve_id()
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = CreateGeometryLineDialog(next_id, point_ids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            cmd = AddGeometryLineCommand(
+                self.geometry_store, params['id'],
+                params['start_point_id'], params['end_point_id'])
+            cmd.execute(None)
+            self.command_manager.undo_stack.append(cmd)
+            self.command_manager.redo_stack.clear()
+            self._populate_tree()
+            self._update_plot_visibility()
+            self._update_status(f"Created geometry line {params['id']}")
+
+    def _create_geometry_arc(self):
+        if len(self.geometry_store.points) < 3:
+            QMessageBox.warning(self, "Insufficient Points",
+                                "Need at least 3 geometry points to create an arc.")
+            return
+        next_id = self.geometry_store.next_curve_id()
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = CreateGeometryArcDialog(next_id, point_ids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            try:
+                cmd = AddGeometryArcCommand(
+                    self.geometry_store, params['id'],
+                    params['start_point_id'], params['mid_point_id'],
+                    params['end_point_id'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Created geometry arc {params['id']}")
+            except ValueError as e:
+                QMessageBox.critical(self, "Arc Error", str(e))
+
+    def _create_geometry_circle(self):
+        if not self.geometry_store.points:
+            QMessageBox.warning(self, "No Points",
+                                "Need at least 1 geometry point for the circle center.")
+            return
+        next_id = self.geometry_store.next_curve_id()
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = CreateGeometryCircleDialog(next_id, point_ids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            cmd = AddGeometryCircleCommand(
+                self.geometry_store, params['id'],
+                params['center_point_id'], params['radius'],
+                [params['nx'], params['ny'], params['nz']])
+            cmd.execute(None)
+            self.command_manager.undo_stack.append(cmd)
+            self.command_manager.redo_stack.clear()
+            self._populate_tree()
+            self._update_plot_visibility()
+            self._update_status(f"Created geometry circle {params['id']}")
+
+    def _create_geometry_surface(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.warning(self, "No Curves",
+                                "Need at least 1 curve to create a surface.")
+            return
+        next_id = self.geometry_store.next_surface_id()
+        dialog = CreateGeometrySurfaceDialog(next_id, all_curves, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            cmd = AddGeometrySurfaceCommand(
+                self.geometry_store, params['id'], params['curve_ids'])
+            cmd.execute(None)
+            self.command_manager.undo_stack.append(cmd)
+            self.command_manager.redo_stack.clear()
+            self._populate_tree()
+            self._update_plot_visibility()
+            self._update_status(f"Created geometry surface {params['id']}")
+
+    # --- Geometry modify handlers ---
+
+    def _edit_geometry_point(self):
+        if not self.geometry_store.points:
+            QMessageBox.information(self, "No Points", "No geometry points to edit.")
+            return
+        point_ids = sorted(self.geometry_store.points.keys())
+        items = [f"P{pid}" for pid in point_ids]
+        item, ok = QInputDialog.getItem(self, "Edit Geometry Point",
+                                         "Select point:", items, 0, False)
+        if ok and item:
+            pid = int(item[1:])
+            pt = self.geometry_store.points[pid]
+            from node_runner.dialogs.geometry import EditGeometryPointDialog
+            dialog = EditGeometryPointDialog(pid, pt.xyz, self)
+            if dialog.exec():
+                params = dialog.get_parameters()
+                try:
+                    cmd = EditGeometryPointCommand(
+                        self.geometry_store, pid,
+                        [params['x'], params['y'], params['z']])
+                    cmd.execute(None)
+                    self.command_manager.undo_stack.append(cmd)
+                    self.command_manager.redo_stack.clear()
+                    self._populate_tree()
+                    self._update_plot_visibility()
+                    self._update_status(f"Edited geometry point P{pid}")
+                except ValueError as e:
+                    QMessageBox.critical(self, "Edit Error", str(e))
+
+    def _edit_geometry_curve(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.information(self, "No Curves", "No geometry curves to edit.")
+            return
+        items = [f"Curve {cid}" for cid in all_curves]
+        item, ok = QInputDialog.getItem(self, "Edit Geometry Curve",
+                                         "Select curve:", items, 0, False)
+        if ok and item:
+            cid = int(item.split()[1])
+            point_ids = sorted(self.geometry_store.points.keys())
+            if cid in self.geometry_store.lines:
+                line = self.geometry_store.lines[cid]
+                current_data = {
+                    'start_point_id': line.start_point_id,
+                    'end_point_id': line.end_point_id,
+                }
+                curve_type = 'line'
+            elif cid in self.geometry_store.arcs:
+                arc = self.geometry_store.arcs[cid]
+                current_data = {
+                    'start_point_id': arc.start_point_id,
+                    'mid_point_id': arc.mid_point_id,
+                    'end_point_id': arc.end_point_id,
+                }
+                curve_type = 'arc'
+            elif cid in self.geometry_store.circles:
+                circle = self.geometry_store.circles[cid]
+                current_data = {
+                    'center_point_id': circle.center_point_id,
+                    'radius': circle.radius,
+                    'normal': circle.normal.tolist(),
+                }
+                curve_type = 'circle'
+            else:
+                return
+
+            from node_runner.dialogs.geometry import EditGeometryCurveDialog
+            dialog = EditGeometryCurveDialog(
+                cid, curve_type, point_ids, current_data, self)
+            if dialog.exec():
+                params = dialog.get_parameters()
+                try:
+                    cmd = EditGeometryCurveCommand(
+                        self.geometry_store, cid, params)
+                    cmd.execute(None)
+                    self.command_manager.undo_stack.append(cmd)
+                    self.command_manager.redo_stack.clear()
+                    self._populate_tree()
+                    self._update_plot_visibility()
+                    self._update_status(f"Edited geometry curve {cid}")
+                except ValueError as e:
+                    QMessageBox.critical(self, "Edit Error", str(e))
+
+    def _edit_geometry_surface(self):
+        if not self.geometry_store.surfaces:
+            QMessageBox.information(self, "No Surfaces",
+                                    "No geometry surfaces to edit.")
+            return
+        surface_ids = sorted(self.geometry_store.surfaces.keys())
+        items = [f"Surface {sid}" for sid in surface_ids]
+        item, ok = QInputDialog.getItem(self, "Edit Geometry Surface",
+                                         "Select surface:", items, 0, False)
+        if ok and item:
+            sid = int(item.split()[1])
+            surf = self.geometry_store.surfaces[sid]
+            all_curves = self.geometry_store.all_curve_ids()
+            from node_runner.dialogs.geometry import EditGeometrySurfaceDialog
+            dialog = EditGeometrySurfaceDialog(
+                sid, all_curves, surf.boundary_curve_ids, self)
+            if dialog.exec():
+                params = dialog.get_parameters()
+                cmd = EditGeometrySurfaceBoundariesCommand(
+                    self.geometry_store, sid, params['curve_ids'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Edited geometry surface {sid} boundaries")
+
+    # --- Geometry transform handlers ---
+
+    def _transform_geometry(self, default_tab='translate'):
+        if not self.geometry_store.points:
+            QMessageBox.information(self, "No Points",
+                                    "No geometry points to transform.")
+            return
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = EntitySelectionDialog("Geometry Point", set(point_ids), self)
+        if dialog.exec():
+            selected = dialog.get_selected_ids()
+            if not selected:
+                return
+            from node_runner.dialogs.geometry import TransformGeometryDialog
+            t_dialog = TransformGeometryDialog(selected, self)
+            tab_map = {'translate': 0, 'rotate': 1, 'mirror': 2, 'scale': 3}
+            t_dialog.tabs.setCurrentIndex(tab_map.get(default_tab, 0))
+            if t_dialog.exec():
+                params = t_dialog.get_parameters()
+                try:
+                    cmd = TransformGeometryPointsCommand(
+                        self.geometry_store, selected, params)
+                    cmd.execute(None)
+                    self.command_manager.undo_stack.append(cmd)
+                    self.command_manager.redo_stack.clear()
+                    self._populate_tree()
+                    self._update_plot_visibility()
+                    self._update_status(
+                        f"{params['type'].capitalize()}d {len(selected)} "
+                        f"geometry point(s)")
+                except ValueError as e:
+                    QMessageBox.critical(self, "Transform Error", str(e))
+
+    def _copy_geometry(self):
+        if not self.geometry_store.points:
+            QMessageBox.information(self, "No Points",
+                                    "No geometry points to copy.")
+            return
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = EntitySelectionDialog("Geometry Point", set(point_ids), self)
+        if dialog.exec():
+            selected = dialog.get_selected_ids()
+            if not selected:
+                return
+            from node_runner.dialogs.geometry import CopyGeometryDialog
+            c_dialog = CopyGeometryDialog(selected, self)
+            if c_dialog.exec():
+                params = c_dialog.get_parameters()
+                cmd = CopyGeometryCommand(
+                    self.geometry_store, selected, params['delta'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(
+                    f"Copied {len(selected)} geometry point(s) "
+                    f"and dependent curves")
+
+    # --- CAD-like geometry operation handlers ---
+
+    def _split_curve(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        # Exclude circles (cannot split full circles)
+        splittable = [cid for cid in all_curves
+                      if cid not in self.geometry_store.circles]
+        if not splittable:
+            QMessageBox.information(self, "No Curves",
+                                    "No splittable curves (lines/arcs).")
+            return
+        from node_runner.dialogs.geometry import SplitCurveDialog
+        dialog = SplitCurveDialog(splittable, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            try:
+                cmd = SplitCurveCommand(
+                    self.geometry_store,
+                    params['curve_id'], params['n_segments'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(
+                    f"Split curve {params['curve_id']} into "
+                    f"{params['n_segments']} segments")
+            except ValueError as e:
+                QMessageBox.critical(self, "Split Error", str(e))
+
+    def _offset_curve(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.information(self, "No Curves",
+                                    "No geometry curves to offset.")
+            return
+        from node_runner.dialogs.geometry import OffsetCurveDialog
+        dialog = OffsetCurveDialog(all_curves, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            try:
+                cmd = OffsetCurveCommand(
+                    self.geometry_store,
+                    params['curve_id'], params['distance'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(
+                    f"Offset curve {params['curve_id']} "
+                    f"by {params['distance']}")
+            except ValueError as e:
+                QMessageBox.critical(self, "Offset Error", str(e))
+
+    def _project_point_to_curve(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.information(self, "No Curves",
+                                    "No geometry curves to project onto.")
+            return
+        from node_runner.dialogs.geometry import ProjectPointToCurveDialog
+        dialog = ProjectPointToCurveDialog(all_curves, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            cmd = ProjectPointToCurveCommand(
+                self.geometry_store,
+                params['curve_id'], params['source_xyz'])
+            cmd.execute(None)
+            self.command_manager.undo_stack.append(cmd)
+            self.command_manager.redo_stack.clear()
+            self._populate_tree()
+            self._update_plot_visibility()
+            self._update_status(
+                f"Projected point onto curve {params['curve_id']}")
+
+    def _fillet_curves(self):
+        line_ids = sorted(self.geometry_store.lines.keys())
+        if len(line_ids) < 2:
+            QMessageBox.information(self, "Insufficient Lines",
+                                    "Need at least 2 geometry lines for a fillet.")
+            return
+        from node_runner.dialogs.geometry import FilletDialog
+        dialog = FilletDialog(line_ids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            try:
+                cmd = FilletCommand(
+                    self.geometry_store,
+                    params['line_id_1'], params['line_id_2'],
+                    params['radius'])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(
+                    f"Created fillet R={params['radius']} between "
+                    f"lines {params['line_id_1']} and {params['line_id_2']}")
+            except ValueError as e:
+                QMessageBox.critical(self, "Fillet Error", str(e))
+
+    # --- Geometry meshing handlers ---
+
+    def _mesh_curve(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.warning(self, "No Curves", "No geometry curves to mesh.")
+            return
+        if not self.current_generator or not self.current_generator.model.properties:
+            QMessageBox.warning(self, "No Properties",
+                                "Create a line element property first.")
+            return
+        model = self.current_generator.model
+        line_prop_ids = []
+        for pid, prop in model.properties.items():
+            if prop.type in ('PBAR', 'PBARL', 'PBEAM', 'PBEAML', 'PROD', 'PBUSH'):
+                line_prop_ids.append(pid)
+        if not line_prop_ids:
+            QMessageBox.warning(self, "No Line Properties",
+                                "No bar/beam/rod/bush properties found.")
+            return
+        dialog = MeshCurveDialog(all_curves, line_prop_ids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            cmd = MeshCurveCommand(
+                self.geometry_store, params['curve_ids'],
+                params['n_elements'], params['elem_type'], params['pid'])
+            self.command_manager.execute(cmd, model)
+            self._update_viewer(self.current_generator)
+            self._update_status(
+                f"Meshed {len(params['curve_ids'])} curve(s) with "
+                f"{params['n_elements']} elements each")
+
+    def _mesh_surface(self):
+        surface_ids = sorted(self.geometry_store.surfaces.keys())
+        if not surface_ids:
+            QMessageBox.warning(self, "No Surfaces",
+                                "No geometry surfaces to mesh.")
+            return
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        shell_pids = []
+        for pid, prop in model.properties.items():
+            if prop.type in ('PSHELL', 'PCOMP'):
+                shell_pids.append(pid)
+        if not shell_pids:
+            QMessageBox.warning(self, "No Shell Properties",
+                                "Create a PSHELL or PCOMP property first.")
+            return
+        dialog = MeshSurfaceDialog(surface_ids, shell_pids, self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            try:
+                cmd = MeshSurfaceCommand(
+                    self.geometry_store, params['surface_id'],
+                    params['n_per_edge'], params['pid'],
+                    params['elem_preference'])
+                self.command_manager.execute(cmd, model)
+                self._update_viewer(self.current_generator)
+                n_elems = len(cmd._created_eids)
+                n_nodes = len(cmd._created_nids)
+                self._update_status(
+                    f"Meshed surface {params['surface_id']}: "
+                    f"{n_nodes} nodes, {n_elems} elements")
+            except Exception as e:
+                QMessageBox.critical(self, "Mesh Error", str(e))
+
+    def _nodes_at_geometry_points(self):
+        if not self.geometry_store.points:
+            QMessageBox.warning(self, "No Points", "No geometry points exist.")
+            return
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        point_ids = sorted(self.geometry_store.points.keys())
+        dialog = EntitySelectionDialog("Geometry Point", set(point_ids), self)
+        if dialog.exec():
+            selected = dialog.get_selected_ids()
+            if not selected:
+                return
+            cmd = NodesAtGeometryPointsCommand(self.geometry_store, selected)
+            self.command_manager.execute(cmd, model)
+            self._update_viewer(self.current_generator)
+            self._update_status(f"Created {len(selected)} node(s) at geometry points")
+
+    # --- Geometry deletion handlers ---
+
+    def _delete_geometry_points(self):
+        if not self.geometry_store.points:
+            QMessageBox.information(self, "No Points", "No geometry points to delete.")
+            return
+        point_ids = sorted(self.geometry_store.points.keys())
+        items = [f"P{pid}" for pid in point_ids]
+        item, ok = QInputDialog.getItem(self, "Delete Geometry Point",
+                                         "Select point to delete:", items, 0, False)
+        if ok and item:
+            pid = int(item[1:])
+            dep_curves = self.geometry_store.curves_referencing_point(pid)
+            dep_surfs = self.geometry_store.surfaces_referencing_curves(set(dep_curves))
+            msg = f"Delete geometry point P{pid}?"
+            if dep_curves:
+                msg += f"\n\nThis will also delete {len(dep_curves)} dependent curve(s)"
+            if dep_surfs:
+                msg += f" and {len(dep_surfs)} dependent surface(s)"
+            msg += "."
+            reply = QMessageBox.question(self, "Confirm Deletion", msg,
+                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteGeometryPointsCommand(self.geometry_store, [pid])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Deleted geometry point P{pid}")
+
+    def _delete_geometry_curves(self):
+        all_curves = self.geometry_store.all_curve_ids()
+        if not all_curves:
+            QMessageBox.information(self, "No Curves", "No geometry curves to delete.")
+            return
+        items = [f"Curve {cid}" for cid in all_curves]
+        item, ok = QInputDialog.getItem(self, "Delete Geometry Curve",
+                                         "Select curve to delete:", items, 0, False)
+        if ok and item:
+            cid = int(item.split()[-1])
+            dep_surfs = self.geometry_store.surfaces_referencing_curve(cid)
+            msg = f"Delete geometry curve {cid}?"
+            if dep_surfs:
+                msg += f"\n\nThis will also delete {len(dep_surfs)} dependent surface(s)."
+            reply = QMessageBox.question(self, "Confirm Deletion", msg,
+                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteGeometryCurvesCommand(self.geometry_store, [cid])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Deleted geometry curve {cid}")
+
+    def _delete_geometry_surfaces(self):
+        if not self.geometry_store.surfaces:
+            QMessageBox.information(self, "No Surfaces", "No geometry surfaces to delete.")
+            return
+        surface_ids = sorted(self.geometry_store.surfaces.keys())
+        items = [f"Surface {sid}" for sid in surface_ids]
+        item, ok = QInputDialog.getItem(self, "Delete Geometry Surface",
+                                         "Select surface to delete:", items, 0, False)
+        if ok and item:
+            sid = int(item.split()[-1])
+            reply = QMessageBox.question(self, "Confirm Deletion",
+                                          f"Delete geometry surface {sid}?",
+                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                cmd = DeleteGeometrySurfacesCommand(self.geometry_store, [sid])
+                cmd.execute(None)
+                self.command_manager.undo_stack.append(cmd)
+                self.command_manager.redo_stack.clear()
+                self._populate_tree()
+                self._update_plot_visibility()
+                self._update_status(f"Deleted geometry surface {sid}")
+
+    # --- Analysis (SOL/EIGRL) handlers ---
+
+    def _set_sol_type(self, sol):
+        self.sol_type = sol
+        label = f"SOL {sol}" if sol else "None (Punch file)"
+        self._update_status(f"Solution type set to {label}")
+
+    def _create_eigrl(self):
+        from node_runner.dialogs.loads import CreateEigrlDialog
+        dialog = CreateEigrlDialog(self)
+        if dialog.exec():
+            params = dialog.get_parameters()
+            self.eigrl_cards.append(params)
+            self._update_status(f"Created EIGRL SID {params['sid']} (ND={params['nd']})")
+
+    def _open_analysis_set_manager(self):
+        """Open the Analysis Set Manager dialog."""
+        from node_runner.dialogs.analysis import AnalysisSetManagerDialog, AnalysisSet
+        # Auto-create a default set if none exist
+        if not self.analysis_sets:
+            self._create_default_analysis_set()
+
+        model = self.current_generator.model if self.current_generator else None
+        dialog = AnalysisSetManagerDialog(
+            self.analysis_sets, self.active_analysis_set_id,
+            model=model, parent=self)
+        if dialog.exec():
+            self.analysis_sets, self.active_analysis_set_id = dialog.get_results()
+            active = self.analysis_sets.get(self.active_analysis_set_id)
+            if active:
+                # Sync legacy fields from the active analysis set
+                self.sol_type = active.sol_type
+                self.subcases = active.subcases
+                if active.eigrl:
+                    # Replace/add EIGRL card
+                    self.eigrl_cards = [active.eigrl]
+                self._update_status(
+                    f"Analysis Set Manager: {len(self.analysis_sets)} set(s), "
+                    f"active = '{active.name}'")
+            else:
+                self._update_status(
+                    f"Analysis Set Manager: {len(self.analysis_sets)} set(s)")
+            self._populate_tree()
+
+    def _open_output_requests_dialog(self):
+        """Open the quick Output Requests dialog for the active analysis set."""
+        from node_runner.dialogs.analysis import OutputRequestsDialog, AnalysisSet
+        if not self.analysis_sets:
+            self._create_default_analysis_set()
+
+        active = self.analysis_sets.get(self.active_analysis_set_id)
+        if not active:
+            QMessageBox.information(self, "No Active Set",
+                                    "No active analysis set. Use the Analysis Set Manager first.")
+            return
+
+        dialog = OutputRequestsDialog(active.output_requests, parent=self)
+        if dialog.exec():
+            active.output_requests = dialog.get_output_requests()
+            self._update_status(f"Output requests updated for '{active.name}'")
+
+    def _create_default_analysis_set(self):
+        """Create a default analysis set from legacy fields (sol_type, subcases, eigrl_cards)."""
+        from node_runner.dialogs.analysis import AnalysisSet
+        aset = AnalysisSet(
+            id=1,
+            name="Default",
+            sol_type=self.sol_type,
+            subcases=list(self.subcases) if self.subcases else [],
+            eigrl=dict(self.eigrl_cards[0]) if self.eigrl_cards else None,
+        )
+        self.analysis_sets[1] = aset
+        self.active_analysis_set_id = 1
+
+    def _set_active_analysis_set(self, set_id):
+        """Set the given analysis set as active (from context menu)."""
+        if set_id in self.analysis_sets:
+            self.active_analysis_set_id = set_id
+            aset = self.analysis_sets[set_id]
+            # Sync legacy fields
+            self.sol_type = aset.sol_type
+            self.subcases = aset.subcases
+            if aset.eigrl:
+                self.eigrl_cards = [aset.eigrl]
+            self._update_status(f"Active analysis set: '{aset.name}'")
+            self._populate_tree()
+
+    def _delete_analysis_set(self, set_id):
+        """Delete an analysis set (from context menu)."""
+        if set_id not in self.analysis_sets:
+            return
+        if len(self.analysis_sets) <= 1:
+            QMessageBox.information(self, "Cannot Delete",
+                                    "At least one analysis set must remain.")
+            return
+        reply = QMessageBox.question(
+            self, "Confirm Deletion",
+            f"Delete analysis set '{self.analysis_sets[set_id].name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            del self.analysis_sets[set_id]
+            if self.active_analysis_set_id == set_id:
+                self.active_analysis_set_id = next(iter(self.analysis_sets.keys()))
+            self._update_status(f"Deleted analysis set {set_id}.")
+            self._populate_tree()
+
+    # --- Analysis Tab helpers ---
+
+    def _show_analysis_tab_context_menu(self, pos):
+        """Context menu for the Analysis sidebar tab tree."""
+        item = self.analysis_tab_tree.itemAt(pos)
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data:
+            return
+
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        kind = data[0]
+
+        if kind == 'analysis_set':
+            set_id = data[1]
+            edit_action = menu.addAction(f"Edit Analysis Set {set_id}...")
+            edit_action.triggered.connect(self._open_analysis_set_manager)
+            active_action = menu.addAction("Set as Active")
+            active_action.triggered.connect(
+                lambda checked=False, sid=set_id: self._set_active_analysis_set(sid))
+            menu.addSeparator()
+            delete_action = menu.addAction(f"Delete Analysis Set {set_id}...")
+            delete_action.triggered.connect(
+                lambda checked=False, sid=set_id: self._delete_analysis_set(sid))
+
+        if menu.actions():
+            menu.exec(self.analysis_tab_tree.viewport().mapToGlobal(pos))
+
+    def _new_analysis_set_from_tab(self):
+        """Create a new analysis set and open the manager."""
+        from node_runner.dialogs.analysis import AnalysisSet
+        new_id = max(self.analysis_sets.keys(), default=0) + 1
+        aset = AnalysisSet(id=new_id, name=f"Analysis Set {new_id}")
+        self.analysis_sets[new_id] = aset
+        if self.active_analysis_set_id is None:
+            self.active_analysis_set_id = new_id
+        self._populate_analysis_tab()
+        self._open_analysis_set_manager()
+
+    def _set_active_from_tab(self):
+        """Set the currently selected analysis set as active (from tab button)."""
+        item = self.analysis_tab_tree.currentItem()
+        if not item:
+            QMessageBox.information(self, "No Selection",
+                                    "Select an analysis set first.")
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if data and data[0] == 'analysis_set':
+            self._set_active_analysis_set(data[1])
+        elif data and data[0] in ('analysis_subcase', 'analysis_params'):
+            # Selected a child — use the parent set's ID
+            self._set_active_analysis_set(data[1])
+        else:
+            QMessageBox.information(self, "No Selection",
+                                    "Select an analysis set first.")
+
+    # --- Post-processing (OP2 results) handlers ---
+
+    def _load_results_dialog(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            return
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Load Results File", "", "OP2 Files (*.op2);;All Files (*)")
+        if not filepath:
+            return
+        try:
+            from node_runner.model import load_op2_results
+            self.op2_results = load_op2_results(filepath)
+            self.results_widget.setVisible(True)
+            self._populate_results_combos()
+            subcases = sorted(self.op2_results['subcases'].keys())
+            self._update_status(f"Loaded results: {os.path.basename(filepath)} "
+                               f"({len(subcases)} subcases)")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load results: {e}")
+
+    def _populate_results_combos(self):
+        """Populate results sidebar combos from loaded OP2 data."""
+        if not self.op2_results:
+            return
+        self.results_subcase_combo.clear()
+        for sc_id in sorted(self.op2_results['subcases'].keys()):
+            self.results_subcase_combo.addItem(f"Subcase {sc_id}", sc_id)
+        self._on_results_type_changed()
+
+    def _populate_mode_combo(self):
+        """Populate mode selector from eigenvector data of current subcase."""
+        self.results_mode_combo.blockSignals(True)
+        self.results_mode_combo.clear()
+        sc_id = self.results_subcase_combo.currentData()
+        if sc_id is not None and self.op2_results:
+            sc_data = self.op2_results['subcases'].get(sc_id, {})
+            eig_list = sc_data.get('eigenvectors', [])
+            freqs = sc_data.get('frequencies', [])
+            for i in range(len(eig_list)):
+                freq = freqs[i] if i < len(freqs) and freqs[i] is not None else None
+                label = f"Mode {i + 1}"
+                if freq is not None:
+                    label += f" ({freq:.4g} Hz)"
+                self.results_mode_combo.addItem(label, i)
+        self.results_mode_combo.blockSignals(False)
+
+    def _on_results_type_changed(self):
+        """Update component combo based on selected result type."""
+        result_type = self.results_type_combo.currentText()
+        self.results_component_combo.clear()
+        if result_type in ("Displacement", "Eigenvector", "SPC Forces"):
+            self.results_component_combo.addItems([
+                "Magnitude", "T1 (X)", "T2 (Y)", "T3 (Z)",
+                "R1 (RX)", "R2 (RY)", "R3 (RZ)"
+            ])
+        elif result_type == "Stress":
+            self.results_component_combo.addItems([
+                "von Mises", "Max Principal", "Min Principal",
+                "XX", "YY", "XY"
+            ])
+        is_eig = (result_type == "Eigenvector")
+        self.results_mode_combo.setVisible(is_eig)
+        if is_eig:
+            self._populate_mode_combo()
+        self._on_results_changed()
+
+    def _on_results_changed(self):
+        """Re-render when any results selection changes."""
+        if self.color_mode == "results":
+            self._update_plot_visibility()
+
+    def _toggle_animation(self, checked):
+        import math
+        if checked:
+            self.anim_play_btn.setText("Pause")
+            self._anim_phase = 0.0
+            interval = max(10, 210 - self.anim_speed_slider.value())
+            self._anim_timer.start(interval)
+        else:
+            self.anim_play_btn.setText("Play")
+            self._anim_timer.stop()
+            self._anim_override_scale = None
+            self._on_results_changed()
+
+    def _on_anim_speed_changed(self, value):
+        if self._anim_timer.isActive():
+            self._anim_timer.setInterval(max(10, 210 - value))
+
+    def _on_animation_tick(self):
+        import math
+        self._anim_phase += 0.15
+        if self._anim_phase > 2 * math.pi:
+            self._anim_phase -= 2 * math.pi
+        try:
+            max_scale = float(self.deformation_scale_input.text() or 0)
+        except ValueError:
+            max_scale = 1.0
+        if max_scale == 0:
+            max_scale = 1.0
+        self._anim_override_scale = max_scale * math.sin(self._anim_phase)
+        self._update_plot_visibility()
+
+    def _export_results_gif(self):
+        import math
+        if not self.op2_results or not self.current_grid:
+            QMessageBox.warning(self, "No Results", "Load OP2 results first.")
+            return
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Animation GIF", "", "GIF Files (*.gif)")
+        if not filepath:
+            return
+        try:
+            import imageio
+        except ImportError:
+            QMessageBox.critical(self, "Missing Package",
+                                 "Install imageio: pip install imageio")
+            return
+        try:
+            max_scale = float(self.deformation_scale_input.text() or 1.0)
+        except ValueError:
+            max_scale = 1.0
+        if max_scale == 0:
+            max_scale = 1.0
+        n_frames = 30
+        frames = []
+        for i in range(n_frames):
+            phase = 2 * math.pi * i / n_frames
+            self._anim_override_scale = max_scale * math.sin(phase)
+            self._update_plot_visibility()
+            self.plotter.render()
+            img = self.plotter.screenshot(return_img=True)
+            frames.append(img)
+        self._anim_override_scale = None
+        self._on_results_changed()
+        imageio.mimsave(filepath, frames, fps=20, loop=0)
+        self._update_status(f"Exported animation GIF: {os.path.basename(filepath)}")
+
+    def _show_free_body_diagram(self):
+        if not self.op2_results:
+            QMessageBox.warning(self, "No Results",
+                                "Load OP2 results first (Results > Load OP2).")
+            return
+        if not self.current_generator:
+            return
+        all_nids = list(self.current_generator.model.nodes.keys())
+        dlg = FreeBodyDiagramDialog(self.op2_results, all_nids, self)
+        dlg.request_render_arrows = self._render_fbd_arrows
+        dlg.exec()
+        for c in ('green', 'blue', 'red'):
+            self.plotter.remove_actor(f'fbd_arrows_{c}', render=False)
+        self.plotter.render()
+
+    def _render_fbd_arrows(self, nid, forces, scale, show_applied,
+                           show_spc, show_elements):
+        """Render colored force arrows at a node for the free body diagram."""
+        for c in ('green', 'blue', 'red'):
+            self.plotter.remove_actor(f'fbd_arrows_{c}', render=False)
+        if not self.current_generator or nid not in self.current_generator.model.nodes:
+            return
+        node_pos = np.array(
+            self.current_generator.model.nodes[nid].get_position())
+        color_map = {'APPLIED': 'green', 'SPC': 'blue'}
+        all_starts, all_dirs, all_colors = [], [], []
+        for f in forces:
+            src = f['source']
+            if src == 'APPLIED' and not show_applied:
+                continue
+            if src == 'SPC' and not show_spc:
+                continue
+            if src.startswith('EID') and not show_elements:
+                continue
+            fvec = np.array(f['forces'][:3])
+            mag = np.linalg.norm(fvec)
+            if mag < 1e-20:
+                continue
+            all_starts.append(node_pos)
+            all_dirs.append(fvec * scale)
+            all_colors.append(color_map.get(src, 'red'))
+        if not all_starts:
+            self.plotter.render()
+            return
+        # Render arrows grouped by color
+        for color in ('green', 'blue', 'red'):
+            pts = [s for s, c in zip(all_starts, all_colors) if c == color]
+            dirs = [d for d, c in zip(all_dirs, all_colors) if c == color]
+            if pts:
+                import pyvista as pv
+                centers = np.array(pts)
+                directions = np.array(dirs)
+                self.plotter.add_arrows(
+                    centers, directions, color=color,
+                    name=f'fbd_arrows_{color}', pickable=False,
+                    reset_camera=False)
+        self.plotter.render()
+
