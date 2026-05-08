@@ -247,6 +247,17 @@ class MainWindow(QMainWindow):
         self._measurement_pick_count = 0
         self._measurement_callback = None
 
+        # --- Phase 1: export format / units / loaded-file metadata for status bar ---
+        from PySide6.QtCore import QSettings
+        _settings = QSettings("NodeRunner", "NodeRunner")
+        self._export_format = _settings.value("export/default_format", "short")
+        if self._export_format not in ("short", "long", "free"):
+            self._export_format = "short"
+        self._units = _settings.value("display/units", "SI")
+        if self._units not in ("SI", "English"):
+            self._units = "SI"
+        self._loaded_filepath: str | None = None
+
         self.command_manager = CommandManager(max_history=20)
         self.subcases = []  # Case control deck subcase definitions (legacy)
         self.geometry_store = GeometryStore()
@@ -295,6 +306,7 @@ class MainWindow(QMainWindow):
 
     def initUI(self):
         self._create_menu_bar()
+        self._build_status_widgets()
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -1258,6 +1270,14 @@ class MainWindow(QMainWindow):
         edit_colors_action.triggered.connect(self._open_color_manager)
         view_menu.addAction(edit_colors_action)
 
+        settings_menu = menu_bar.addMenu("&Settings")
+        export_defaults_action = QAction("Export Defaults...", self)
+        export_defaults_action.triggered.connect(self._open_export_defaults_dialog)
+        settings_menu.addAction(export_defaults_action)
+        units_action = QAction("Units...", self)
+        units_action.triggered.connect(self._open_units_dialog)
+        settings_menu.addAction(units_action)
+
         help_menu = menu_bar.addMenu("&Help")
         about_action = QAction("&About...", self)
         about_action.triggered.connect(self._show_about_dialog)
@@ -1283,14 +1303,121 @@ class MainWindow(QMainWindow):
         if not filepath:
             self._update_status("Save cancelled.")
             return
-        
+
+        # Ask for field format. Pre-select the model's current format
+        # (auto-detected on import or last user choice). Cancelling the
+        # options dialog cancels the save.
+        from node_runner.dialogs import ExportOptionsDialog
+        from PySide6.QtCore import QSettings
+        settings = QSettings("NodeRunner", "NodeRunner")
+        prefilled = self._export_format or settings.value("export/default_format", "short")
+        dlg = ExportOptionsDialog(default_format=prefilled, parent=self)
+        if not dlg.exec():
+            self._update_status("Save cancelled.")
+            return
+        chosen = dlg.selected_format
+        if dlg.save_as_default:
+            settings.setValue("export/default_format", chosen)
+
         try:
             self._apply_case_control()
-            self.current_generator.model.write_bdf(filepath, size=8, is_double=False)
-            self._update_status(f"Model saved to {os.path.basename(filepath)}")
+            self.current_generator._write_bdf(filepath, field_format=chosen)
+            self._export_format = chosen
+            self._refresh_status_widgets()
+            self._update_status(f"Model saved to {os.path.basename(filepath)} ({chosen} field)")
         except Exception as e:
             self._update_status(f"File save failed: {e}", is_error=True)
             QMessageBox.critical(self, "Error", f"Could not save file: {e}")
+
+    # --- Phase 1: persistent status-bar widgets (model / nodes / export / units) ---
+    def _build_status_widgets(self):
+        """Add four permanent labels to the status bar.
+
+        Permanent widgets coexist with transient `showMessage()` calls; Qt
+        renders transient messages on the left and permanent widgets on the
+        right.
+        """
+        from PySide6.QtWidgets import QLabel, QFrame
+        bar = self.statusBar()
+        self._status_model_lbl = QLabel("Model: Untitled")
+        self._status_nodes_lbl = QLabel("Nodes: 0")
+        self._status_format_lbl = QLabel(f"Export: {self._export_format.title()}")
+        self._status_units_lbl = QLabel(f"Units: {self._units}")
+        for lbl in (self._status_model_lbl, self._status_nodes_lbl,
+                    self._status_format_lbl, self._status_units_lbl):
+            lbl.setStyleSheet("padding: 0 8px;")
+        sep1 = QFrame(); sep1.setFrameShape(QFrame.VLine); sep1.setFrameShadow(QFrame.Sunken)
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.VLine); sep3.setFrameShadow(QFrame.Sunken)
+        bar.addPermanentWidget(self._status_model_lbl)
+        bar.addPermanentWidget(sep1)
+        bar.addPermanentWidget(self._status_nodes_lbl)
+        bar.addPermanentWidget(sep2)
+        bar.addPermanentWidget(self._status_format_lbl)
+        bar.addPermanentWidget(sep3)
+        bar.addPermanentWidget(self._status_units_lbl)
+
+    def _refresh_status_widgets(self):
+        """Recompute the four status labels from current state."""
+        if not hasattr(self, '_status_model_lbl'):
+            return  # status widgets not built yet (early-init path)
+        if self._loaded_filepath:
+            name = os.path.basename(self._loaded_filepath)
+        else:
+            name = "Untitled"
+        self._status_model_lbl.setText(f"Model: {name}")
+        node_count = 0
+        if self.current_generator is not None and self.current_generator.model is not None:
+            try:
+                node_count = len(self.current_generator.model.nodes)
+            except Exception:
+                node_count = 0
+        self._status_nodes_lbl.setText(f"Nodes: {node_count:,}")
+        self._status_format_lbl.setText(f"Export: {self._export_format.title()}")
+        self._status_units_lbl.setText(f"Units: {self._units}")
+
+    def _on_model_loaded(self, filepath, detected_format):
+        """Called after a successful BDF open/import.
+
+        Stores the filepath and applies format detection per the PRD rule:
+        the user's QSettings default (if set) wins on save, but for the
+        initial export-format display we honor what the file actually was
+        so round-tripping is intuitive.
+        """
+        self._loaded_filepath = filepath
+        if detected_format in ("short", "long", "free"):
+            self._export_format = detected_format
+        self._refresh_status_widgets()
+
+    # --- Phase 1: Settings menu handlers ---
+    def _open_export_defaults_dialog(self):
+        """Settings -> Export Defaults..."""
+        from node_runner.dialogs import ExportDefaultsDialog
+        from PySide6.QtCore import QSettings
+        settings = QSettings("NodeRunner", "NodeRunner")
+        current = settings.value("export/default_format", self._export_format)
+        if current not in ("short", "long", "free"):
+            current = "short"
+        dlg = ExportDefaultsDialog(current_format=current, parent=self)
+        if dlg.exec():
+            settings.setValue("export/default_format", dlg.selected_format)
+            # If no file is loaded, also update the live status widget so the
+            # user sees their choice take effect immediately.
+            if self._loaded_filepath is None:
+                self._export_format = dlg.selected_format
+                self._refresh_status_widgets()
+            self._update_status(f"Default export format set to {dlg.selected_format}.")
+
+    def _open_units_dialog(self):
+        """Settings -> Units..."""
+        from node_runner.dialogs import UnitsDialog
+        from PySide6.QtCore import QSettings
+        dlg = UnitsDialog(current_units=self._units, parent=self)
+        if dlg.exec():
+            self._units = dlg.selected_units
+            QSettings("NodeRunner", "NodeRunner").setValue("display/units", self._units)
+            self._refresh_status_widgets()
+            self._update_status(f"Units set to {self._units}.")
 
     # --- NEW: Handler for the "License..." menu action ---
     def _show_license_dialog(self):
@@ -3520,8 +3647,16 @@ class MainWindow(QMainWindow):
                 if cid in model.coords:
                     new_model.coords[cid] = model.coords[cid]
 
-            new_model.write_bdf(filepath, size=8, is_double=False)
-            self._update_status(f"Exported group '{name}' as BDF: {os.path.basename(filepath)}")
+            # Respect the user's export-format preference (Phase 1).
+            fmt = self._export_format if self._export_format in ("short", "long", "free") else "short"
+            if fmt == "long":
+                new_model.write_bdf(filepath, size=16, is_double=False)
+            else:
+                new_model.write_bdf(filepath, size=8, is_double=False)
+                if fmt == "free":
+                    from node_runner.model import _convert_bdf_to_free
+                    _convert_bdf_to_free(filepath)
+            self._update_status(f"Exported group '{name}' as BDF ({fmt}): {os.path.basename(filepath)}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export group as BDF:\n{e}")
 
@@ -4957,6 +5092,9 @@ class MainWindow(QMainWindow):
 
         self.current_generator, self.current_grid = generator, None
         model = generator.model
+        # Phase 1: refresh persistent status-bar widgets whenever the viewer
+        # is rebuilt - covers undo/redo, generator runs, and CAD imports.
+        self._refresh_status_widgets()
 
         if not model.nodes:
             self.tree_widget.blockSignals(True)
@@ -5836,17 +5974,19 @@ class MainWindow(QMainWindow):
             filepath (str): The path to the BDF file.
 
         Returns:
-            tuple: (NastranModelGenerator, LenientResult or None)
-                Strict success → (generator, None)
-                Lenient fallback → (generator, LenientResult)
+            tuple: (NastranModelGenerator, LenientResult or None, detected_format)
+                Strict success → (generator, None, 'short'|'long'|'free')
+                Lenient fallback → (generator, LenientResult, 'short'|'long'|'free')
 
         Raises:
             RuntimeError: If the file cannot be parsed by any strategy.
         """
+        from node_runner.model import detect_bdf_field_format
+        detected_format = detect_bdf_field_format(filepath)
         generator = NastranModelGenerator()
         model, lenient_result = NastranModelGenerator._read_bdf_robust(filepath)
         generator.model = model
-        return generator, lenient_result
+        return generator, lenient_result, detected_format
 
 
 
@@ -5862,7 +6002,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            generator, lenient_result = self._parse_bdf_to_generator(filepath)
+            generator, lenient_result, detected_format = self._parse_bdf_to_generator(filepath)
             self._ensure_default_coords(generator.model)
             self.command_manager.clear()
             self.subcases = []
@@ -5878,6 +6018,7 @@ class MainWindow(QMainWindow):
             self._isolate_mode = None
             self._populate_groups_list()
             self._update_viewer(generator)
+            self._on_model_loaded(filepath, detected_format)
 
             fname = os.path.basename(filepath)
             if lenient_result and lenient_result.skipped:
@@ -5970,7 +6111,7 @@ class MainWindow(QMainWindow):
         try:
             filename = os.path.basename(filepath)
             if option == 'new':
-                generator, lenient_result = self._parse_bdf_to_generator(filepath)
+                generator, lenient_result, detected_format = self._parse_bdf_to_generator(filepath)
                 self._ensure_default_coords(generator.model)
                 self.command_manager.clear()
                 # Phase 8: Reset groups on import-new
@@ -5979,6 +6120,7 @@ class MainWindow(QMainWindow):
                 self._isolate_mode = None
                 self._populate_groups_list()
                 self._update_viewer(generator)
+                self._on_model_loaded(filepath, detected_format)
 
                 if lenient_result and lenient_result.skipped:
                     n = len(lenient_result.skipped)

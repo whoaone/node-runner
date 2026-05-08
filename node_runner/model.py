@@ -13,6 +13,160 @@ from pyNastran.bdf.cards.elements.shell import CQUAD4, CTRIA3
 SkippedCard = namedtuple('SkippedCard', ['line', 'card', 'raw', 'error'])
 LenientResult = namedtuple('LenientResult', ['model', 'skipped', 'counts'])
 
+# Result wrapper carrying field-format detection alongside the parsed model.
+# A `None` LenientResult means strict parse succeeded; format is still set.
+ImportResult = namedtuple('ImportResult', ['model', 'lenient_result', 'detected_format'])
+
+# Valid Nastran field formats. Used by both the writer (size selection) and
+# the reader (format detection result).
+FIELD_FORMATS = ("short", "long", "free")
+
+
+def _convert_fixed_line_to_free(line):
+    """Convert one fixed-field BDF line into comma-separated free format.
+
+    Handles both short (8-char) and long (16-char) field cards.  Keeps the
+    line ending intact.  Trailing empty fields are dropped.
+    """
+    # Strip the line ending so we can put it back unchanged.
+    if line.endswith('\r\n'):
+        eol = '\r\n'
+        body = line[:-2]
+    elif line.endswith('\n'):
+        eol = '\n'
+        body = line[:-1]
+    else:
+        eol = ''
+        body = line
+
+    if not body.strip():
+        return line
+
+    # Card name is always the first 8 chars in fixed-field BDF.
+    card_name = body[:8].strip()
+    is_long = card_name.endswith('*')
+
+    # Continuation cards: first field is blank or starts with '+' / '*'.
+    # We treat them like normal cards for chunking purposes; the leading
+    # token preserves the continuation marker.
+    rest = body[8:]
+    field_width = 16 if is_long else 8
+
+    fields = [card_name]
+    for i in range(0, len(rest), field_width):
+        chunk = rest[i:i + field_width]
+        fields.append(chunk.strip())
+
+    # Drop trailing empty fields (keep at least the card name).
+    while len(fields) > 1 and fields[-1] == '':
+        fields.pop()
+
+    return ','.join(fields) + eol
+
+
+_EXEC_CASE_CONTROL_KEYWORDS = (
+    'SOL ', 'SOL,', 'CEND', 'TITLE', 'SUBCASE', 'LABEL', 'ECHO', 'SUBTITLE',
+    'TIME ', 'DIAG', 'ANALYSIS', 'DISP', 'STRESS', 'STRAIN', 'FORCE', 'MPCFORCE',
+    'SPCFORCE', 'OLOAD', 'GPFORCE', 'ESE', 'METHOD', 'LOAD ', 'SPC ', 'MPC ',
+    'INCLUDE', 'OUTPUT', 'SET ', 'PARAM,', 'PARAM ',
+)
+
+
+def _convert_bdf_to_free(path):
+    """Rewrite a fixed-field BDF in place as comma-separated free format.
+
+    Handles both full decks (with executive/case control + ``BEGIN BULK``)
+    and punch decks (bulk data only). For full decks the executive- and
+    case-control sections pass through untouched; for punch decks every
+    non-comment line is treated as a bulk-data card.
+
+    Comments (``$``-lines) are preserved verbatim. Lines that already
+    contain a comma are assumed to be free-format already and skipped.
+    """
+    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+        lines = fh.readlines()
+
+    # Detect whether this is a full deck (has BEGIN BULK) or a punch file.
+    has_begin_bulk = any(line.lstrip().upper().startswith('BEGIN BULK') for line in lines)
+
+    out = []
+    in_bulk = not has_begin_bulk  # punch -> entire file is bulk data
+    for line in lines:
+        upper = line.lstrip().upper()
+        if upper.startswith('BEGIN BULK'):
+            in_bulk = True
+            out.append(line)
+            continue
+        if upper.startswith('ENDDATA'):
+            in_bulk = False
+            out.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith('$'):
+            out.append(line)
+            continue
+        if not in_bulk:
+            # Executive or case-control region of a full deck - leave intact.
+            out.append(line)
+            continue
+        # Defensive: if a recognized exec/case keyword leaked into the bulk
+        # region (mis-classified file), pass it through unchanged.
+        if any(upper.startswith(kw) for kw in _EXEC_CASE_CONTROL_KEYWORDS):
+            out.append(line)
+            continue
+        if ',' in line:
+            out.append(line)
+            continue
+        out.append(_convert_fixed_line_to_free(line))
+
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.writelines(out)
+
+
+def detect_bdf_field_format(filepath):
+    """Inspect a BDF file and return one of 'short', 'long', 'free'.
+
+    Heuristic, looks at the first few non-blank, non-comment, non-control
+    bulk-data lines:
+      - any comma in a card line  -> 'free'
+      - card name ends with '*'   -> 'long' (e.g. 'GRID*')
+      - else                      -> 'short' (default 8-char fixed)
+
+    Returns 'short' as the safe default if the file can't be sniffed.
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+            checked = 0
+            for raw in fh:
+                line = raw.rstrip('\n').rstrip('\r')
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith('$'):
+                    continue
+                upper = stripped.upper()
+                # Skip executive/case-control keywords commonly above bulk data.
+                if upper.startswith(('SOL ', 'CEND', 'BEGIN BULK', 'ENDDATA',
+                                     'TITLE', 'SUBCASE', 'LABEL', 'ECHO',
+                                     'SUBTITLE', 'INCLUDE', 'PARAM', 'TIME ',
+                                     'DIAG', 'ANALYSIS')):
+                    continue
+                # Bulk-data line: classify.
+                if ',' in line:
+                    return 'free'
+                # First field is the card name; if it ends with '*' it's long.
+                head = line.lstrip().split(None, 1)[0] if line.strip() else ''
+                if head.endswith('*'):
+                    return 'long'
+                # Confidence builds across a few cards; we just need one
+                # decisive observation. Default at the end is 'short'.
+                checked += 1
+                if checked >= 5:
+                    break
+    except OSError:
+        pass
+    return 'short'
+
 
 def _humanize_bdf_error(card_name, raw_msg):
     """Translate cryptic pyNastran exceptions into user-friendly messages."""
@@ -88,8 +242,22 @@ class NastranModelGenerator:
         except Exception as e:
             raise RuntimeError(f"pyNastran failed to parse BDF: {e}")
 
-    def _write_bdf(self, output_path):
-        self.model.write_bdf(output_path, size=8, is_double=False)
+    def _write_bdf(self, output_path, field_format='short'):
+        """Write the model as a Nastran BDF in the requested field format.
+
+        field_format: 'short' (size=8), 'long' (size=16), or 'free' (comma).
+        For 'free', pyNastran's BDF.write_bdf is invoked at size=8 and the
+        resulting file is post-processed in place by `_convert_bdf_to_free`.
+        """
+        if field_format not in FIELD_FORMATS:
+            field_format = 'short'
+
+        if field_format == 'long':
+            self.model.write_bdf(output_path, size=16, is_double=False)
+        else:
+            self.model.write_bdf(output_path, size=8, is_double=False)
+            if field_format == 'free':
+                _convert_bdf_to_free(output_path)
     
     def _generate_nodes(self):
         radius = self.params['fuselage_radius']; num_bays = self.params['num_bays']; frame_spacing = self.params['frame_spacing']; num_stringers = self.params['num_stringers']
