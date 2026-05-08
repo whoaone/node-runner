@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QActionGroup, QFont
 
 
 # ---------------------------------------------------------------------------
-# EntitySelectionBar — Femap-style floating selection window
+# EntitySelectionBar - Femap-style floating selection window
 # ---------------------------------------------------------------------------
 #
 #  Layout (3-column):
@@ -31,7 +31,7 @@ from PySide6.QtGui import QAction, QActionGroup, QFont
 #
 
 class EntitySelectionBar(QDialog):
-    """Femap-style entity selection window — floating, movable, non-modal."""
+    """Femap-style entity selection window - floating, movable, non-modal."""
 
     request_show_selection = QtCore.Signal(str, list)
     request_picking_mode = QtCore.Signal(str, bool)
@@ -328,7 +328,7 @@ class EntitySelectionBar(QDialog):
 
         menu.addSeparator()
 
-        # Advanced picking (stubs — disabled)
+        # Advanced picking (stubs - disabled)
         for label in ("Coordinate...", "Around Point...",
                       "Around Vector...", "Around Plane..."):
             act = menu.addAction(label)
@@ -336,7 +336,7 @@ class EntitySelectionBar(QDialog):
 
         menu.addSeparator()
 
-        # Selection by visual (stubs — disabled)
+        # Selection by visual (stubs - disabled)
         for label in ("By Color...", "By Faces..."):
             act = menu.addAction(label)
             act.setEnabled(False)
@@ -399,7 +399,7 @@ class EntitySelectionBar(QDialog):
             act.setEnabled(False)
 
     # ------------------------------------------------------------------
-    # configure — reset for a new selection workflow
+    # configure - reset for a new selection workflow
     # ------------------------------------------------------------------
 
     def configure(self, entity_type, all_entity_ids, select_by_data=None,
@@ -426,7 +426,7 @@ class EntitySelectionBar(QDialog):
         self._method_btn.setText("Method \u25b4")
         self._method_stack.setCurrentIndex(0)
 
-        # Rebuild Group combo — always visible, shows "GID: Name"
+        # Rebuild Group combo - always visible, shows "GID: Name"
         self._group_combo.blockSignals(True)
         self._group_combo.clear()
         self._group_combo.addItem("")
@@ -785,9 +785,9 @@ class EntitySelectionBar(QDialog):
         """Compress a sorted list of IDs into range strings.
 
         Returns a list of strings:
-          "5"       — single ID
-          "1,5,1"   — consecutive IDs 1 through 5 (step 1)
-          "1,9,2"   — stepped IDs 1, 3, 5, 7, 9 (step 2)
+          "5"       - single ID
+          "1,5,1"   - consecutive IDs 1 through 5 (step 1)
+          "1,9,2"   - stepped IDs 1, 3, 5, 7, 9 (step 2)
         """
         if not sorted_ids:
             return []
@@ -900,7 +900,7 @@ class EntitySelectionBar(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# EntitySelectionDialog — kept for 3 modal Geometry Point usages
+# EntitySelectionDialog - kept for 3 modal Geometry Point usages
 # ---------------------------------------------------------------------------
 
 class EntitySelectionDialog(QDialog):

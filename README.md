@@ -9,7 +9,7 @@ This is a major release with coordinate system protection, enhanced display opti
 ### ✨ New Features
 
 - **Coordinate System Protection:**
-  - Global Rectangular (CID 0), Cylindrical (CID 1), and Spherical (CID 2) coordinate systems are now immutable — they cannot be deleted or overwritten by any tool, import, or generator.
+  - Global Rectangular (CID 0), Cylindrical (CID 1), and Spherical (CID 2) coordinate systems are now immutable - they cannot be deleted or overwritten by any tool, import, or generator.
   - Protection enforced at the command level (`AddCoordCommand`, `DeleteCoordCommand`) and guaranteed after every fresh model/generator creation.
 
 - **CSys Display Options (Display Tab):**

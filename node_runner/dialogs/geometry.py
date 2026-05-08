@@ -79,7 +79,7 @@ class CreateGeometryPointDialog(QDialog):
                     continue
                 # Columns: ID (optional), CSys (ignored), X, Y, Z
                 point_id = int(row[0]) if row[0] is not None else None
-                # row[1] is CSys — ignored for now
+                # row[1] is CSys - ignored for now
                 x = float(row[2]) if len(row) > 2 and row[2] is not None else 0.0
                 y = float(row[3]) if len(row) > 3 and row[3] is not None else 0.0
                 z = float(row[4]) if len(row) > 4 and row[4] is not None else 0.0

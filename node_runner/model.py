@@ -33,7 +33,7 @@ def _humanize_bdf_error(card_name, raw_msg):
         }
         kind = kind_map.get(m.group(1), m.group(1).title())
         ids = m.group(2).strip()
-        return f"Duplicate {kind} ID(s): [{ids}] — already defined earlier in the file"
+        return f"Duplicate {kind} ID(s): [{ids}] - already defined earlier in the file"
 
     # --- Field type errors ---
     # "eid = '3.0' (field #1) on card must be an integer (not float)."
@@ -46,7 +46,7 @@ def _humanize_bdf_error(card_name, raw_msg):
         field_num = m.group(3)
         expected = m.group(4)
         return (f"Field '{field_name}' (#{field_num}) has value '{value}' "
-                f"— expected {expected}")
+                f"- expected {expected}")
 
     # --- Positive ID assertion ---
     # "eid=0 must be positive; elem=\n..."
@@ -60,11 +60,11 @@ def _humanize_bdf_error(card_name, raw_msg):
     if 'len(card)' in msg or 'nfields' in msg:
         m = re.search(r'len\(card\)\s*=\s*(\d+)', msg)
         n = m.group(1) if m else '?'
-        return f"Card has too few fields ({n}) — data may be truncated or malformed"
+        return f"Card has too few fields ({n}) - data may be truncated or malformed"
 
     # --- Unknown card type ---
     if 'not a valid key' in msg.lower() or 'not found' in msg.lower():
-        return f"Unsupported card type '{card_name}' — not recognized by the parser"
+        return f"Unsupported card type '{card_name}' - not recognized by the parser"
 
     # --- General cleanup: strip "self." prefixes, trim multiline ---
     msg = msg.replace('self.', '')
@@ -2060,7 +2060,7 @@ class NastranModelGenerator:
         """Expand selection by one layer of adjacent elements within angle threshold.
 
         Unlike select_adjacent_elements (full BFS), this only adds immediate
-        neighbors — exactly one ring of expansion.
+        neighbors - exactly one ring of expansion.
 
         Returns:
             set[int]: seed_eids plus one layer of neighbors.
@@ -2144,7 +2144,7 @@ class NastranModelGenerator:
         for eid in selected_set:
             neighbors = adjacency.get(eid, set())
             if not neighbors:
-                # Isolated element — no neighbors, treat as boundary
+                # Isolated element - no neighbors, treat as boundary
                 continue
             # Check if ALL neighbors are also selected
             if neighbors.issubset(selected_set):
@@ -2158,7 +2158,7 @@ class NastranModelGenerator:
         CTRIA3 → 4 CTRIA3s (3 midside nodes)
 
         Shared edges between selected elements reuse the same midside node.
-        This method is **pure calculation** — it does NOT mutate the model.
+        This method is **pure calculation** - it does NOT mutate the model.
 
         Args:
             eids_to_split: list of element IDs to split.
@@ -2167,7 +2167,7 @@ class NastranModelGenerator:
             dict with keys:
                 'new_node_data': [(nid, x, y, z), ...] for AddNodesCommand
                 'new_element_params': [{'eid':.., 'pid':.., 'nodes':.., 'type':..}, ...]
-                'valid_eids': [int] — eids that were actually split
+                'valid_eids': [int] - eids that were actually split
         """
         import numpy as np
 
@@ -2397,7 +2397,7 @@ class NastranModelGenerator:
                 fixed_lines.append(line)
                 continue
 
-            # Fix 1: Malformed GRID* lines — 'GRID* <nid> <x> <y> <z>'
+            # Fix 1: Malformed GRID* lines - 'GRID* <nid> <x> <y> <z>'
             if re.match(r'^GRID\*\s+\d', line):
                 parts = line.split()
                 if len(parts) >= 5:
@@ -2506,7 +2506,7 @@ class NastranModelGenerator:
                 fixed_lines.append(line)
                 continue
 
-            # Parse fields — comma-separated or fixed-width
+            # Parse fields - comma-separated or fixed-width
             if ',' in stripped:
                 # Already free-field: split on commas, strip each
                 parts = stripped.split(',')
@@ -2564,7 +2564,7 @@ class NastranModelGenerator:
             # If field 3 (index 2) has a decimal point, it's X1 not CP
             if card_upper == 'GRID' and len(fields) >= 4:
                 if '.' in fields[2]:
-                    # CP was omitted — insert blank CP
+                    # CP was omitted - insert blank CP
                     fields = [fields[0], fields[1], ''] + fields[2:]
 
             # CBAR/CBEAM: detect blank X1/G0 field
@@ -2646,7 +2646,7 @@ class NastranModelGenerator:
                     fields.append(val if val else None)
                 return fields, card_name, True
         else:
-            # Multi-line card with continuations — pass raw lines
+            # Multi-line card with continuations - pass raw lines
             clean = [l.rstrip('\n').rstrip('\r') for l in card_lines]
             first = clean[0]
             if ',' in first:
@@ -2697,7 +2697,7 @@ class NastranModelGenerator:
                 break
             if not stripped or stripped.startswith('$'):
                 continue
-            # Continuation lines — skip
+            # Continuation lines - skip
             if (stripped.startswith('+') or stripped.startswith('*')
                     or (line[0] == ' ' and stripped
                         and stripped[0].isdigit())):
@@ -2770,7 +2770,7 @@ class NastranModelGenerator:
                 parsed, card_name, is_list = (
                     NastranModelGenerator._parse_card_fields(card_lines))
             except Exception:
-                # Can't even parse fields — skip
+                # Can't even parse fields - skip
                 orig_ln = (orig_card_starts[cidx][0]
                            if cidx < len(orig_card_starts) else -1)
                 skipped.append(SkippedCard(
@@ -3243,7 +3243,7 @@ def load_op2_results(filepath):
     all_sc_ids.update(op2.spc_forces.keys())
     gpf_dict = getattr(op2, 'grid_point_forces', {})
     all_sc_ids.update(gpf_dict.keys())
-    # Stress tables — try several element types
+    # Stress tables - try several element types
     for stress_dict in (getattr(op2, 'cquad4_stress', {}),
                         getattr(op2, 'ctria3_stress', {})):
         all_sc_ids.update(stress_dict.keys())

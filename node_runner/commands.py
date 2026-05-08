@@ -255,7 +255,7 @@ class TransformNodesCommand(Command):
 class MergeNodesCommand(Command):
     """Merge coincident node groups.
 
-    This is the most expensive undo command — it must snapshot the full state
+    This is the most expensive undo command - it must snapshot the full state
     of all affected nodes, elements, SPCs, and loads before merging.
     """
 
@@ -809,7 +809,7 @@ class DeleteConstraintCommand(Command):
 class AddCoordCommand(Command):
     """Add a coordinate system (CORD2R, CORD2C, or CORD2S)."""
 
-    # Global/absolute coordinate systems — must never be overwritten.
+    # Global/absolute coordinate systems - must never be overwritten.
     _PROTECTED_CIDS = frozenset({0, 1, 2})
 
     def __init__(self, params: dict):
@@ -866,7 +866,7 @@ class AddCoordCommand(Command):
 class DeleteCoordCommand(Command):
     """Delete a coordinate system by CID, snapshotting for undo."""
 
-    # Global/absolute coordinate systems — must never be deleted or modified.
+    # Global/absolute coordinate systems - must never be deleted or modified.
     _PROTECTED_CIDS = frozenset({0, 1, 2})
 
     def __init__(self, cid: int):

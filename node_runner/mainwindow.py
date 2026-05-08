@@ -83,7 +83,7 @@ class SelectionOverlay:
     """VTK 2D actor overlay for selection feedback: box, circle, polygon.
 
     Uses vtkActor2D + vtkPolyDataMapper2D so drawing happens inside
-    VTK's own render pipeline — no Qt widget compositing issues.
+    VTK's own render pipeline - no Qt widget compositing issues.
     Coordinates are in VTK display space (origin at bottom-left).
     """
 
@@ -645,7 +645,7 @@ class MainWindow(QMainWindow):
         # Apply persisted background settings
         self._apply_background()
 
-        # Selection bar — floating dialog, created once and shown/hidden per workflow
+        # Selection bar - floating dialog, created once and shown/hidden per workflow
         from node_runner.dialogs.selection import EntitySelectionBar
         self.selection_bar = EntitySelectionBar(self)
 
@@ -884,7 +884,7 @@ class MainWindow(QMainWindow):
         # --- Model menu (merged: old Model + Mesh + Edit items) ---
         model_menu = menu_bar.addMenu("&Model")
 
-        # Section 1: Create — Nodes, Elements, Properties, Materials, Coords
+        # Section 1: Create - Nodes, Elements, Properties, Materials, Coords
         create_nodes_action = QAction("Nodes...", self)
         create_nodes_action.triggered.connect(self._create_nodes)
         model_menu.addAction(create_nodes_action)
@@ -1609,13 +1609,13 @@ class MainWindow(QMainWindow):
         self._highlight_entities('Node', self._measurement_picks)
 
         if picked_so_far < self._measurement_pick_count:
-            # Need more picks — re-arm on next event loop tick
+            # Need more picks - re-arm on next event loop tick
             # (interactor.py lines 89-90 auto-disable picking after each pick)
             remaining = self._measurement_pick_count - picked_so_far
             self._update_status(f"Pick node {picked_so_far + 1} of {self._measurement_pick_count}...")
             QtCore.QTimer.singleShot(0, self._rearm_measurement_picker)
         else:
-            # All picks collected — invoke the callback
+            # All picks collected - invoke the callback
             callback = self._measurement_callback
             self._measurement_callback = None
             self._measurement_pick_count = 0
@@ -2039,7 +2039,7 @@ class MainWindow(QMainWindow):
             self._update_status("Split cancelled: No elements selected.")
             return
 
-        # Pure calculation — no model mutation yet
+        # Pure calculation - no model mutation yet
         result = self.current_generator.split_shell_elements(selected_eids)
 
         if not result['valid_eids']:
@@ -3441,11 +3441,11 @@ class MainWindow(QMainWindow):
 
         # Show nodes if available, otherwise elements
         if node_rows:
-            title = f"Group '{name}' — Nodes ({len(node_rows)})"
+            title = f"Group '{name}' - Nodes ({len(node_rows)})"
             dlg = NodeElementInfoDialog(title, node_rows, node_columns, self, column_tooltips=node_tooltips)
             dlg.exec()
         if elem_rows:
-            title = f"Group '{name}' — Elements ({len(elem_rows)})"
+            title = f"Group '{name}' - Elements ({len(elem_rows)})"
             dlg = NodeElementInfoDialog(title, elem_rows, elem_columns, self, column_tooltips=elem_tooltips)
             dlg.exec()
         if not node_rows and not elem_rows:
@@ -4351,7 +4351,7 @@ class MainWindow(QMainWindow):
             return
         model = self.current_generator.model
 
-        # Check if we have an active analysis set — use it if available
+        # Check if we have an active analysis set - use it if available
         active_set = self.analysis_sets.get(self.active_analysis_set_id)
         if active_set:
             return self._apply_case_control_from_set(model, active_set)
@@ -4421,7 +4421,7 @@ class MainWindow(QMainWindow):
         # 4. Case control deck
         subcases = active_set.subcases
         if not subcases:
-            # No subcases — write global output requests only
+            # No subcases - write global output requests only
             from pyNastran.bdf.case_control_deck import CaseControlDeck
             lines = ['CEND']
             model.case_control_deck = CaseControlDeck(lines, log=None)
@@ -4723,14 +4723,14 @@ class MainWindow(QMainWindow):
             from node_runner.dialogs.info import NodeElementInfoDialog
             columns = ['NID', 'X', 'Y', 'Z', 'CP', 'CD', 'PS', 'SEID']
             tooltips = {
-                'NID': 'Node ID — unique identifier for this grid point',
+                'NID': 'Node ID - unique identifier for this grid point',
                 'X': 'X coordinate in the position coordinate system (CP)',
                 'Y': 'Y coordinate in the position coordinate system (CP)',
                 'Z': 'Z coordinate in the position coordinate system (CP)',
-                'CP': 'Position Coordinate System — the coordinate system in which X, Y, Z are defined. 0 = basic rectangular.',
-                'CD': 'Displacement Coordinate System — the coordinate system for displacement, force, and constraint output. 0 = basic rectangular.',
-                'PS': 'Permanent Single-point Constraints — DOFs permanently constrained at this node (digits 1-6 map to T1, T2, T3, R1, R2, R3).',
-                'SEID': 'Superelement ID — 0 means the node belongs to the residual structure.',
+                'CP': 'Position Coordinate System - the coordinate system in which X, Y, Z are defined. 0 = basic rectangular.',
+                'CD': 'Displacement Coordinate System - the coordinate system for displacement, force, and constraint output. 0 = basic rectangular.',
+                'PS': 'Permanent Single-point Constraints - DOFs permanently constrained at this node (digits 1-6 map to T1, T2, T3, R1, R2, R3).',
+                'SEID': 'Superelement ID - 0 means the node belongs to the residual structure.',
             }
             rows = []
             for nid in selected_ids:
@@ -4756,10 +4756,10 @@ class MainWindow(QMainWindow):
             all_elements = {**self.current_generator.model.elements, **self.current_generator.model.rigid_elements}
             columns = ['EID', 'Type', 'PID', 'MID', 'Nodes']
             tooltips = {
-                'EID': 'Element ID — unique identifier for this element',
+                'EID': 'Element ID - unique identifier for this element',
                 'Type': 'Element type (e.g. CQUAD4, CTRIA3, CBEAM, CBUSH, RBE2)',
-                'PID': 'Property ID — references the property card that defines element thickness, material, etc.',
-                'MID': 'Material ID — the material referenced by this element\'s property',
+                'PID': 'Property ID - references the property card that defines element thickness, material, etc.',
+                'MID': 'Material ID - the material referenced by this element\'s property',
                 'Nodes': 'Grid point IDs defining this element\'s connectivity',
             }
             rows = []
@@ -4916,7 +4916,7 @@ class MainWindow(QMainWindow):
             self.plotter.remove_actor('picking_mode_text')
             if self.default_interactor_style:
                 self.plotter.interactor.SetInteractorStyle(self.default_interactor_style)
-            # Selection bar is embedded — no need to show/activate it after picking
+            # Selection bar is embedded - no need to show/activate it after picking
             if self.active_sub_dialog and not self.active_sub_dialog.isVisible():
                 self.active_sub_dialog.show()
                 self.active_sub_dialog.activateWindow()
@@ -4989,7 +4989,7 @@ class MainWindow(QMainWindow):
         all_elements = {**model.elements, **model.rigid_elements}
         for eid, elem in all_elements.items():
             try:
-                # RBE2/RBE3 don't have .nodes — get node IDs via independent/dependent
+                # RBE2/RBE3 don't have .nodes - get node IDs via independent/dependent
                 if elem.type in ['RBE2', 'RBE3']:
                     try:
                         nodes_used_by_elements.update(elem.independent_nodes + elem.dependent_nodes)
@@ -5568,7 +5568,7 @@ class MainWindow(QMainWindow):
         import copy
         new_list = [copy.deepcopy(c) for i, c in enumerate(load_list) if i != entry_index]
         if not new_list and sid not in model.tempds:
-            # Removing last entry and no TEMPD for this SID — delete entire set
+            # Removing last entry and no TEMPD for this SID - delete entire set
             from node_runner.commands import DeleteLoadCommand
             cmd = DeleteLoadCommand(sid)
             self.command_manager.execute(cmd, model)
@@ -6228,7 +6228,7 @@ class MainWindow(QMainWindow):
                                 f"Failed to save screenshot:\n{str(e)}")
 
     def _toggle_presentation_mode(self, checked):
-        """Toggle presentation mode — fullscreen with UI hidden."""
+        """Toggle presentation mode - fullscreen with UI hidden."""
         self.menuBar().setVisible(not checked)
         self.statusBar().setVisible(not checked)
         # Hide the sidebar tabs container
@@ -6828,7 +6828,7 @@ class MainWindow(QMainWindow):
             sid = params['sid']
             load_type = params.pop('type')
 
-            # Always append to the load set — never delete-and-replace.
+            # Always append to the load set - never delete-and-replace.
             # Use the Load Set Manager to edit/remove individual entries.
             cmd = AddLoadCommand(load_type, params)
             self.command_manager.execute(cmd, model)
@@ -6849,7 +6849,7 @@ class MainWindow(QMainWindow):
             model = self.current_generator.model
             sid = params['sid']
 
-            # Always append to the constraint set — never delete-and-replace.
+            # Always append to the constraint set - never delete-and-replace.
             cmd = AddConstraintCommand(params)
             self.command_manager.execute(cmd, model)
 
@@ -7409,7 +7409,7 @@ class MainWindow(QMainWindow):
         self.plotter.add_mesh(pv.Arrow(start=origin, direction=z_axis, scale=scale, **arrow_kw),
                               color='blue', name=f"coord_{cid}_z", reset_camera=False)
 
-        # Label — honour the "Show Labels" checkbox
+        # Label - honour the "Show Labels" checkbox
         if self.show_csys_labels_check.isChecked():
             label_map = {0: "CID 0: Global Rect", 1: "CID 1: Global Cyl",
                          2: "CID 2: Global Sph"}
@@ -8394,7 +8394,7 @@ class MainWindow(QMainWindow):
         if data and data[0] == 'analysis_set':
             self._set_active_analysis_set(data[1])
         elif data and data[0] in ('analysis_subcase', 'analysis_params'):
-            # Selected a child — use the parent set's ID
+            # Selected a child - use the parent set's ID
             self._set_active_analysis_set(data[1])
         else:
             QMessageBox.information(self, "No Selection",

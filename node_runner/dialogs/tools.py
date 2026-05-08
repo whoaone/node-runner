@@ -511,7 +511,7 @@ class DuplicateElementDialog(QDialog):
         for i, (sig, eids) in enumerate(sorted(dup_groups.items(), key=lambda x: x[1][0])):
             keep_eid = eids[0]
             delete_eids = eids[1:]
-            item_text = f"Group {i+1}: EIDs {eids} — keep {keep_eid}, delete {', '.join(str(e) for e in delete_eids)}"
+            item_text = f"Group {i+1}: EIDs {eids} - keep {keep_eid}, delete {', '.join(str(e) for e in delete_eids)}"
             item = QListWidgetItem(item_text)
             item.setData(Qt.UserRole, {'keep': keep_eid, 'delete': delete_eids})
             self.results_list.addItem(item)

@@ -412,7 +412,7 @@ class CreateLoadCombinationDialog(QDialog):
                 types = set(c.type for c in cards)
                 type_str = ", ".join(sorted(types))
             else:
-                type_str = "—"
+                type_str = "-"
             type_item = QTableWidgetItem(type_str)
             type_item.setFlags(Qt.ItemIsEnabled)
             self.table.setItem(row, 3, type_item)
@@ -525,7 +525,7 @@ class SubcaseEditorDialog(QDialog):
 
     def _make_sid_combo(self, sid_list, default=None):
         combo = QComboBox()
-        combo.addItem("—")
+        combo.addItem("-")
         for sid in sid_list:
             combo.addItem(str(sid))
         if default is not None:
@@ -559,10 +559,10 @@ class SubcaseEditorDialog(QDialog):
         self.table.setCellWidget(row, 2, self._make_sid_combo(self._spc_sids, spc_sid))
         # METHOD combo (EIGRL SIDs)
         self.table.setCellWidget(row, 3, self._make_sid_combo(self._eigrl_sids, method_sid))
-        # STATSUB combo (subcase IDs — use generic editable field)
+        # STATSUB combo (subcase IDs - use generic editable field)
         statsub_combo = QComboBox()
         statsub_combo.setEditable(True)
-        statsub_combo.addItem("—")
+        statsub_combo.addItem("-")
         # Add existing subcase IDs as options
         for r in range(self.table.rowCount() - 1):
             try:
@@ -599,19 +599,19 @@ class SubcaseEditorDialog(QDialog):
             method_combo = self.table.cellWidget(row, 3)
             statsub_combo = self.table.cellWidget(row, 4)
 
-            load_text = load_combo.currentText() if load_combo else "—"
-            spc_text = spc_combo.currentText() if spc_combo else "—"
-            method_text = method_combo.currentText() if method_combo else "—"
-            statsub_text = statsub_combo.currentText() if statsub_combo else "—"
+            load_text = load_combo.currentText() if load_combo else "-"
+            spc_text = spc_combo.currentText() if spc_combo else "-"
+            method_text = method_combo.currentText() if method_combo else "-"
+            statsub_text = statsub_combo.currentText() if statsub_combo else "-"
 
-            load_sid = int(load_text) if load_text != "—" else None
-            spc_sid = int(spc_text) if spc_text != "—" else None
+            load_sid = int(load_text) if load_text != "-" else None
+            spc_sid = int(spc_text) if spc_text != "-" else None
             try:
-                method_sid = int(method_text) if method_text != "—" else None
+                method_sid = int(method_text) if method_text != "-" else None
             except ValueError:
                 method_sid = None
             try:
-                statsub_id = int(statsub_text) if statsub_text != "—" else None
+                statsub_id = int(statsub_text) if statsub_text != "-" else None
             except ValueError:
                 statsub_id = None
 

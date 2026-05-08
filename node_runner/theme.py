@@ -1,4 +1,4 @@
-"""Node Runner theme system — premium dark and light palettes with QSS."""
+"""Node Runner theme system - premium dark and light palettes with QSS."""
 
 from PySide6 import QtCore
 from PySide6.QtGui import QPalette, QColor
@@ -48,7 +48,7 @@ dark_palette.setColor(QPalette.Disabled, QPalette.Highlight, QColor("#45475a"))
 dark_palette.setColor(QPalette.Disabled, QPalette.HighlightedText, QColor("#6c7086"))
 
 # ---------------------------------------------------------------------------
-# Light palette  (kept minimal — system defaults + overrides)
+# Light palette  (kept minimal - system defaults + overrides)
 # ---------------------------------------------------------------------------
 light_palette = QPalette()
 

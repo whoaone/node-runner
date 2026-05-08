@@ -1,4 +1,4 @@
-"""Analysis Set Manager — AnalysisSet dataclass, manager dialog, and output requests dialog."""
+"""Analysis Set Manager - AnalysisSet dataclass, manager dialog, and output requests dialog."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class AnalysisSet:
     name: str
     sol_type: int | None = None  # None, 101, 103, 105, 106
 
-    # Output requests — global defaults for all subcases
+    # Output requests - global defaults for all subcases
     output_requests: dict = field(default_factory=lambda: {
         'displacement': 'NONE',
         'velocity': 'NONE',
@@ -229,12 +229,12 @@ class AnalysisSetManagerDialog(QDialog):
         layout.addRow("SID:", self.eigrl_sid_input)
 
         self.eigrl_v1_input = QLineEdit("")
-        self.eigrl_v1_input.setPlaceholderText("Optional — lower frequency bound")
+        self.eigrl_v1_input.setPlaceholderText("Optional - lower frequency bound")
         self.eigrl_v1_input.setValidator(QDoubleValidator())
         layout.addRow("V1 (Lower Freq):", self.eigrl_v1_input)
 
         self.eigrl_v2_input = QLineEdit("")
-        self.eigrl_v2_input.setPlaceholderText("Optional — upper frequency bound")
+        self.eigrl_v2_input.setPlaceholderText("Optional - upper frequency bound")
         self.eigrl_v2_input.setValidator(QDoubleValidator())
         layout.addRow("V2 (Upper Freq):", self.eigrl_v2_input)
 
@@ -395,7 +395,7 @@ class AnalysisSetManagerDialog(QDialog):
         eigrl_enabled = aset.sol_type in (103, 105)
         self.eigrl_tab_widget.setEnabled(eigrl_enabled)
 
-        # Params tab — Common widgets
+        # Params tab - Common widgets
         common_param_names = {name for name, _, _, _, _ in COMMON_PARAMS}
         for param_name, (wtype, widget) in self._common_param_widgets.items():
             value = aset.params.get(param_name)
@@ -417,7 +417,7 @@ class AnalysisSetManagerDialog(QDialog):
             elif wtype == 'float':
                 widget.setText(str(effective) if effective is not None else "")
 
-        # Params tab — Custom table (non-common params only)
+        # Params tab - Custom table (non-common params only)
         self.params_table.setRowCount(0)
         for pname, pval in aset.params.items():
             if pname not in common_param_names:
@@ -458,7 +458,7 @@ class AnalysisSetManagerDialog(QDialog):
         else:
             aset.eigrl = None
 
-        # Params — Common widgets
+        # Params - Common widgets
         aset.params = {}
         for param_name, (wtype, widget) in self._common_param_widgets.items():
             if wtype == 'combo':
@@ -478,7 +478,7 @@ class AnalysisSetManagerDialog(QDialog):
                     except ValueError:
                         aset.params[param_name] = text
 
-        # Params — Custom table
+        # Params - Custom table
         for r in range(self.params_table.rowCount()):
             pname_item = self.params_table.item(r, 0)
             pval_item = self.params_table.item(r, 1)
@@ -625,7 +625,7 @@ class AnalysisSetManagerDialog(QDialog):
         self.subcases_table.setCellWidget(row, 1, self._make_sid_combo(load_sids, load_sid))
         self.subcases_table.setCellWidget(row, 2, self._make_sid_combo(spc_sids, spc_sid))
 
-        # METHOD — editable combo
+        # METHOD - editable combo
         method_combo = QComboBox()
         method_combo.setEditable(True)
         method_combo.addItem("\u2014")
@@ -633,7 +633,7 @@ class AnalysisSetManagerDialog(QDialog):
             method_combo.setCurrentText(str(method_sid))
         self.subcases_table.setCellWidget(row, 3, method_combo)
 
-        # STATSUB — editable combo
+        # STATSUB - editable combo
         statsub_combo = QComboBox()
         statsub_combo.setEditable(True)
         statsub_combo.addItem("\u2014")

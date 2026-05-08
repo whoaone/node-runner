@@ -96,7 +96,7 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
                 and not self.main_window.picking_target_callback):
 
             if self._selection_mode == 'polygon' and self._polygon_active:
-                # Adding another polygon vertex — handled in release
+                # Adding another polygon vertex - handled in release
                 self._area_select_active = True
                 return
 
@@ -182,18 +182,18 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
                     self.main_window._update_polygon_overlay(
                         self._polygon_points)
                     self.main_window._update_status(
-                        f"Polygon: {n} point{'s' if n != 1 else ''} — "
+                        f"Polygon: {n} point{'s' if n != 1 else ''} - "
                         f"double-click or Enter to finish, Esc to cancel")
                     return
                 else:
-                    # Drag in polygon mode — ignore
+                    # Drag in polygon mode - ignore
                     return
             elif self._selection_mode == 'circle':
                 if is_click:
-                    # Single click in circle mode — do a normal pick
+                    # Single click in circle mode - do a normal pick
                     self.perform_pick(current_pos)
                 else:
-                    # Drag completed — do circle area pick
+                    # Drag completed - do circle area pick
                     self.perform_circle_pick(self._circle_center, current_pos)
                 self._circle_center = None
                 return
@@ -390,7 +390,7 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
             polygon: (M, 2) array of polygon vertex coordinates
 
         Returns:
-            (N,) boolean array — True for points inside the polygon
+            (N,) boolean array - True for points inside the polygon
         """
         n_poly = len(polygon)
         inside = np.zeros(len(points_2d), dtype=bool)

@@ -94,7 +94,7 @@ class NodeElementInfoDialog(QDialog):
 
 
 class GroupEditorDialog(QDialog):
-    """Edit group contents — view and remove nodes/elements."""
+    """Edit group contents - view and remove nodes/elements."""
 
     def __init__(self, group_name, group_data, model, parent=None):
         super().__init__(parent)
