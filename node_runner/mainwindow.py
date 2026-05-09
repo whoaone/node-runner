@@ -1387,20 +1387,21 @@ class MainWindow(QMainWindow):
     _LOD_DISPLAY_TARGET = 10_000       # target display size after stride
 
     def _add_node_cloud(self, node_points, name='nodes_actor'):
-        """Render a node cloud with vtkPointGaussianMapper.
+        """Render a node cloud with anti-aliased points.
 
-        The Gaussian mapper splats each point as a smooth, anti-aliased
-        circular gaussian. Result: crisp dots that look "printed" instead
-        of the rectangular GL_POINTS blob look produced by raw add_points.
+        Tries PyVista's ``style='points_gaussian'`` first - it routes through
+        ``vtkPointGaussianMapper`` internally with the proper shader plumbing.
+        If that style isn't available on the active PyVista build, falls
+        back to flat ``render_points_as_spheres=False`` points which still
+        look cleaner than the legacy sphere render.
 
-        Above _LOD_DECIMATE_THRESHOLD points, we stride-sample down to
-        ~_LOD_DISPLAY_TARGET to keep huge clouds readable and snappy.
-        The full set of nodes is still owned by self.current_grid for
+        Above ``_LOD_DECIMATE_THRESHOLD`` points, we stride-sample down to
+        ~``_LOD_DISPLAY_TARGET`` to keep huge clouds readable and snappy.
+        The full set of nodes is still owned by ``self.current_grid`` for
         picking; this only thins the standalone display cloud.
 
         Returns the vtkActor (so callers can apply additional styling).
         """
-        import vtk
         n_total = len(node_points)
         decimated = False
         if (
@@ -1412,42 +1413,44 @@ class MainWindow(QMainWindow):
             decimated = True
 
         poly = pv.PolyData(node_points)
-        actor = self.plotter.add_points(
-            poly,
-            color=self.node_color,
-            point_size=self.node_size,
-            render_points_as_spheres=False,
-            name=name,
-        )
+
+        # Preferred path: PyVista's native Gaussian point style. PyVista
+        # configures vtkPointGaussianMapper with the right shader internally;
+        # this avoids the broken-shader pitfalls of swapping the mapper by
+        # hand (an empty SplatShaderCode compiles to a non-functional
+        # fragment program and triggers wglMakeCurrent failures on Windows).
+        actor = None
+        try:
+            actor = self.plotter.add_mesh(
+                poly,
+                style='points_gaussian',
+                color=self.node_color,
+                point_size=self.node_size,
+                emissive=False,
+                render_points_as_spheres=False,
+                name=name,
+                reset_camera=False,
+            )
+        except Exception:
+            actor = None
+
+        # Fallback: plain anti-aliased flat points. Works on every PyVista
+        # build; loses the Gaussian splat falloff but still looks clean and,
+        # critically, will not blow up the GL context.
+        if actor is None:
+            actor = self.plotter.add_points(
+                poly,
+                color=self.node_color,
+                point_size=self.node_size,
+                render_points_as_spheres=False,
+                name=name,
+            )
+
         if decimated:
-            # Surface a one-line hint so the user understands why the cloud
-            # appears thinner than the model's true node count.
             self._update_status(
                 f"Adaptive LOD: showing ~{len(node_points):,} of "
                 f"{n_total:,} nodes (toggle in Settings).",
             )
-
-        try:
-            mapper = vtk.vtkPointGaussianMapper()
-            mapper.SetInputData(poly)
-            # Scale the splat radius relative to the model's diagonal so the
-            # cloud reads at any zoom level. node_size acts as a unitless
-            # multiplier (the size spinbox stays meaningful 1..20).
-            bounds = poly.bounds
-            diag = (
-                (bounds[1] - bounds[0]) ** 2
-                + (bounds[3] - bounds[2]) ** 2
-                + (bounds[5] - bounds[4]) ** 2
-            ) ** 0.5
-            base_diag = max(diag, 1.0)
-            mapper.SetScaleFactor(self.node_size * 0.0008 * base_diag)
-            mapper.SetEmissive(False)
-            mapper.SetSplatShaderCode("")  # use the built-in Gaussian preset
-            actor.SetMapper(mapper)
-        except Exception:
-            # If anything in the mapper swap fails, the original add_points
-            # actor is still on the renderer; we silently fall back to it.
-            pass
 
         return actor
 
