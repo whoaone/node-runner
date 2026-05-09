@@ -262,6 +262,17 @@ class MainWindow(QMainWindow):
             self._units = "SI"
         self._loaded_filepath: str | None = None
 
+        # --- Phase 4: performance and LOD settings ---
+        self._adaptive_lod_enabled = _settings.value(
+            "render/adaptive_lod", True, type=bool,
+        )
+        self._ghost_mode_enabled = _settings.value(
+            "render/ghost_mode", False, type=bool,
+        )
+        self._parallel_parsing_enabled = _settings.value(
+            "import/parallel_parsing", False, type=bool,
+        )
+
         self.command_manager = CommandManager(max_history=20)
         self.subcases = []  # Case control deck subcase definitions (legacy)
         self.geometry_store = GeometryStore()
@@ -1272,6 +1283,14 @@ class MainWindow(QMainWindow):
         self.show_free_edges_action = QAction("Show Free Edges", self, checkable=True)
         self.show_free_edges_action.toggled.connect(self._toggle_free_edges_visibility)
         view_menu.addAction(self.show_free_edges_action)
+
+        # Phase 4.2: ghost mode toggle. When on, hidden groups render as
+        # translucent wireframe overlays instead of vanishing.
+        self.ghost_mode_action = QAction("Ghost Hidden Groups", self, checkable=True)
+        self.ghost_mode_action.setChecked(self._ghost_mode_enabled)
+        self.ghost_mode_action.toggled.connect(self._toggle_ghost_mode)
+        view_menu.addAction(self.ghost_mode_action)
+
         view_menu.addSeparator()
         display_settings_action = QAction("Display Settings...", self)
         display_settings_action.triggered.connect(self._open_display_settings)
@@ -1295,6 +1314,21 @@ class MainWindow(QMainWindow):
         units_action = QAction("Units...", self)
         units_action.triggered.connect(self._open_units_dialog)
         settings_menu.addAction(units_action)
+        settings_menu.addSeparator()
+        # Phase 4.1: adaptive node decimation toggle.
+        self.adaptive_lod_action = QAction(
+            "Adaptive Node LOD (decimate huge clouds)", self, checkable=True,
+        )
+        self.adaptive_lod_action.setChecked(self._adaptive_lod_enabled)
+        self.adaptive_lod_action.toggled.connect(self._toggle_adaptive_lod)
+        settings_menu.addAction(self.adaptive_lod_action)
+        # Phase 4.3: parallel BDF parsing (experimental, opt-in).
+        self.parallel_parsing_action = QAction(
+            "Parallel BDF Parsing (experimental)", self, checkable=True,
+        )
+        self.parallel_parsing_action.setChecked(self._parallel_parsing_enabled)
+        self.parallel_parsing_action.toggled.connect(self._toggle_parallel_parsing)
+        settings_menu.addAction(self.parallel_parsing_action)
 
         help_menu = menu_bar.addMenu("&Help")
         about_action = QAction("&About...", self)
@@ -1348,6 +1382,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Could not save file: {e}")
 
     # --- Phase 3: Gaussian-mapped node rendering ---
+    # --- Phase 4.1: adaptive decimation ---
+    _LOD_DECIMATE_THRESHOLD = 50_000   # cloud size that triggers stride
+    _LOD_DISPLAY_TARGET = 10_000       # target display size after stride
+
     def _add_node_cloud(self, node_points, name='nodes_actor'):
         """Render a node cloud with vtkPointGaussianMapper.
 
@@ -1355,14 +1393,24 @@ class MainWindow(QMainWindow):
         circular gaussian. Result: crisp dots that look "printed" instead
         of the rectangular GL_POINTS blob look produced by raw add_points.
 
-        We still go through PyVista's add_points() to register the actor in
-        the plotter's name registry (so remove_actor('nodes_actor') keeps
-        working) and to inherit user-controlled color from the actor's
-        property. Then we swap the mapper to the Gaussian variant.
+        Above _LOD_DECIMATE_THRESHOLD points, we stride-sample down to
+        ~_LOD_DISPLAY_TARGET to keep huge clouds readable and snappy.
+        The full set of nodes is still owned by self.current_grid for
+        picking; this only thins the standalone display cloud.
 
         Returns the vtkActor (so callers can apply additional styling).
         """
         import vtk
+        n_total = len(node_points)
+        decimated = False
+        if (
+            self._adaptive_lod_enabled
+            and n_total > self._LOD_DECIMATE_THRESHOLD
+        ):
+            stride = max(1, n_total // self._LOD_DISPLAY_TARGET)
+            node_points = node_points[::stride]
+            decimated = True
+
         poly = pv.PolyData(node_points)
         actor = self.plotter.add_points(
             poly,
@@ -1371,6 +1419,13 @@ class MainWindow(QMainWindow):
             render_points_as_spheres=False,
             name=name,
         )
+        if decimated:
+            # Surface a one-line hint so the user understands why the cloud
+            # appears thinner than the model's true node count.
+            self._update_status(
+                f"Adaptive LOD: showing ~{len(node_points):,} of "
+                f"{n_total:,} nodes (toggle in Settings).",
+            )
 
         try:
             mapper = vtk.vtkPointGaussianMapper()
@@ -1542,6 +1597,45 @@ class MainWindow(QMainWindow):
             QSettings("NodeRunner", "NodeRunner").setValue("display/units", self._units)
             self._refresh_status_widgets()
             self._update_status(f"Units set to {self._units}.")
+
+    # --- Phase 4 toggles ---
+    def _toggle_ghost_mode(self, on):
+        """View -> Ghost Hidden Groups."""
+        from PySide6.QtCore import QSettings
+        self._ghost_mode_enabled = bool(on)
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "render/ghost_mode", self._ghost_mode_enabled,
+        )
+        # Force a visibility refresh so the ghost actor appears or vanishes.
+        if self.current_generator and self.current_grid:
+            self._update_plot_visibility()
+        self._update_status(
+            f"Ghost mode {'enabled' if on else 'disabled'}.",
+        )
+
+    def _toggle_adaptive_lod(self, on):
+        """Settings -> Adaptive Node LOD."""
+        from PySide6.QtCore import QSettings
+        self._adaptive_lod_enabled = bool(on)
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "render/adaptive_lod", self._adaptive_lod_enabled,
+        )
+        if self.current_generator and self.current_grid:
+            self._update_plot_visibility()
+        self._update_status(
+            f"Adaptive LOD {'enabled' if on else 'disabled'}.",
+        )
+
+    def _toggle_parallel_parsing(self, on):
+        """Settings -> Parallel BDF Parsing (experimental)."""
+        from PySide6.QtCore import QSettings
+        self._parallel_parsing_enabled = bool(on)
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "import/parallel_parsing", self._parallel_parsing_enabled,
+        )
+        self._update_status(
+            f"Parallel parsing {'enabled' if on else 'disabled'}.",
+        )
 
     # --- NEW: Handler for the "License..." menu action ---
     def _show_license_dialog(self):
@@ -7834,6 +7928,30 @@ class MainWindow(QMainWindow):
                 hidden_eids.update(grp.get("elements", []))
             if hidden_eids:
                 visibility_mask[np.isin(self.current_grid.cell_data['EID'], list(hidden_eids))] = False
+                # Phase 4.2: ghost-mode overlay - render hidden groups as a
+                # translucent wireframe shadow instead of fully removing them
+                # from view, so the user keeps spatial context.
+                self.plotter.remove_actor('ghost_actor', render=False)
+                if self._ghost_mode_enabled:
+                    ghost_idx = np.where(np.isin(
+                        self.current_grid.cell_data['EID'], list(hidden_eids),
+                    ))[0]
+                    if ghost_idx.size > 0:
+                        ghost_grid = self.current_grid.extract_cells(ghost_idx)
+                        self.plotter.add_mesh(
+                            ghost_grid,
+                            name='ghost_actor',
+                            style='wireframe',
+                            color='#6c7086',  # Catppuccin overlay-1: muted gray
+                            opacity=0.3,
+                            line_width=1,
+                            pickable=False,
+                            reset_camera=False,
+                        )
+            else:
+                self.plotter.remove_actor('ghost_actor', render=False)
+        else:
+            self.plotter.remove_actor('ghost_actor', render=False)
 
         self._last_visibility_mask = visibility_mask.copy()
         self._rebuild_plot(visibility_mask=visibility_mask)

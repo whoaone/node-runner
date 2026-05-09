@@ -2998,6 +2998,143 @@ class NastranModelGenerator:
         return m
 
     @staticmethod
+    def _read_bdf_parallel(filepath, n_workers=4):
+        """Phase 4.3: experimental parallel BDF parser.
+
+        Splits the bulk-data section across worker threads, parses each
+        chunk into its own pyNastran BDF, then dict-merges them into a
+        master BDF. Returns the same shape as `_read_bdf_robust`:
+        ``(model, lenient_result_or_None)``.
+
+        Falls back to `_read_bdf_robust` (single-threaded) on any of:
+          - file too small to benefit (< 50_000 lines; overhead exceeds gain)
+          - INCLUDE statements present (cross-file refs unsupported here)
+          - any worker fails to parse its chunk
+          - the chunked merge raises an exception
+
+        Caveats:
+          - Cross-references between cards in different chunks are not
+            resolved at parse time; the master model relies on
+            pyNastran's lazy resolution.
+          - Some less common cards may not survive a dict-level merge;
+            on a failure we silently fall back. Users opting in via the
+            Settings menu should keep the option OFF for production runs
+            until this path matures.
+        """
+        import concurrent.futures
+        import io
+        import os
+        import tempfile
+        from cpylog import SimpleLogger
+
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+                all_lines = fh.readlines()
+        except OSError:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        if len(all_lines) < 50_000:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        # Locate bulk-data range and detect INCLUDE statements.
+        bulk_start_idx = 0
+        bulk_end_idx = len(all_lines)
+        has_begin_bulk = False
+        has_include = False
+        for i, line in enumerate(all_lines):
+            u = line.lstrip().upper()
+            if u.startswith('INCLUDE'):
+                has_include = True
+                break
+            if u.startswith('BEGIN BULK'):
+                bulk_start_idx = i + 1
+                has_begin_bulk = True
+            elif u.startswith('ENDDATA'):
+                bulk_end_idx = i
+                break
+
+        if has_include:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        bulk_lines = (
+            all_lines[bulk_start_idx:bulk_end_idx]
+            if has_begin_bulk else all_lines
+        )
+
+        # Chunk at safe boundaries: don't split before a continuation
+        # marker line ('+' or '*' in column 0).
+        n = len(bulk_lines)
+        if n_workers < 1:
+            n_workers = 1
+        target_chunk = max(1, n // n_workers)
+        chunks = []
+        i = 0
+        while i < n:
+            end = min(i + target_chunk, n)
+            while end < n and bulk_lines[end][:1] in ('+', '*'):
+                end += 1
+            chunks.append(bulk_lines[i:end])
+            i = end
+
+        if len(chunks) <= 1:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        def _parse_chunk(chunk_lines):
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.bdf', delete=False, encoding='utf-8',
+            ) as tmp:
+                tmp.writelines(chunk_lines)
+                tmp_path = tmp.name
+            try:
+                silent = SimpleLogger(level='critical')
+                devnull = io.StringIO()
+                return NastranModelGenerator._try_read_bdf(
+                    tmp_path, punch=True, silent_log=silent, devnull=devnull,
+                )
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=n_workers,
+            ) as ex:
+                parsed = list(ex.map(_parse_chunk, chunks))
+        except Exception:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        # Merge chunks into a master BDF using dict updates.
+        master = BDF(debug=False)
+        try:
+            for chunk_bdf in parsed:
+                master.nodes.update(chunk_bdf.nodes)
+                master.elements.update(chunk_bdf.elements)
+                master.properties.update(chunk_bdf.properties)
+                master.materials.update(chunk_bdf.materials)
+                # Preserve the global default coords (CID 0/1/2).
+                for cid, coord in chunk_bdf.coords.items():
+                    if cid not in (0, 1, 2):
+                        master.coords[cid] = coord
+                # Loads / SPCs / MPCs are dicts-of-lists keyed by SID.
+                for sid, load_list in getattr(chunk_bdf, 'loads', {}).items():
+                    master.loads.setdefault(sid, []).extend(load_list)
+                for sid, spc_list in getattr(chunk_bdf, 'spcs', {}).items():
+                    master.spcs.setdefault(sid, []).extend(spc_list)
+                for sid, mpc_list in getattr(chunk_bdf, 'mpcs', {}).items():
+                    master.mpcs.setdefault(sid, []).extend(mpc_list)
+                for attr in ('rigid_elements', 'masses', 'plotels'):
+                    src = getattr(chunk_bdf, attr, None)
+                    dst = getattr(master, attr, None)
+                    if isinstance(src, dict) and isinstance(dst, dict):
+                        dst.update(src)
+        except Exception:
+            return NastranModelGenerator._read_bdf_robust(filepath)
+
+        return (master, None)
+
+    @staticmethod
     def _read_bdf_robust(filepath):
         """Read a BDF file with multiple fallback strategies.
 

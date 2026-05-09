@@ -2,31 +2,32 @@
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
-## What's New in v3.0.0 (in progress)
+## Changelog for v3.0.0
 
-A multi-phase upgrade rolling out across four phases. Each phase ships when verified.
+A four-phase upgrade across the export engine, UX layer, rendering pipeline, and performance.
 
-### Phase 1: Engine foundations (landed locally)
-- Flexible Nastran export: choose Short (8-char), Long (16-char), or Free (comma-separated) field formats per save.
-- Import auto-detection: BDF field format is sniffed on open and pre-fills the next save dialog.
-- Persistent status bar: `Model | Nodes | Export | Units` always visible.
-- New Settings menu: Export Defaults..., Units...
-- Group export now respects the chosen field format.
+### Engine: flexible export and format detection
+- Choose Short (8-char), Long (16-char), or Free (comma-separated) field format per save via the new Export Options dialog.
+- BDF field format is auto-detected on open (`detect_bdf_field_format`) and pre-fills the next save dialog.
+- New Settings menu: Export Defaults..., Units... Both persist via QSettings.
+- Persistent status bar shows `Model | Nodes | Export | Units` at all times.
+- Group export respects the chosen field format.
 
-### Phase 2: UX layer (planned)
-- Command Palette (Ctrl+P) over all menu actions.
-- Multi-threaded BDF import with progress + cancel.
-- Render debouncing for snappier scene rebuilds.
+### UX: command palette, threaded import, render debouncer
+- Ctrl+P opens a fuzzy-search Command Palette across all menu actions (124 auto-harvested from the menu bar).
+- File Open / Import run on a QThread with a modal progress dialog and Cancel button. UI stays responsive during heavy parses.
+- 16ms render debouncer (`_request_render`) coalesces render bursts.
 
-### Phase 3: Rendering polish (planned)
-- High-fidelity point rendering via vtkPointGaussianMapper (kills the "green blob" look).
-- Default node color moves off neon green to the existing theme accent.
-- Distance-based opacity fade for far-away nodes.
+### Rendering: kill the green blob
+- Node cloud renders through `vtkPointGaussianMapper` for crisp, anti-aliased circular splats instead of GL_POINTS rectangles.
+- ScaleFactor sized to the model diagonal; cloud reads at any zoom level.
+- Default node size 5 -> 3, default node color neon green -> theme accent (Catppuccin blue).
+- Selection highlight uses Catppuccin peach instead of yellow.
 
-### Phase 4: Performance and LOD (planned)
-- Adaptive node occlusion when zoomed out.
-- Ghosting mode for inactive groups.
-- Parallel BDF parsing across CPU cores.
+### Performance: adaptive LOD, ghost mode, parallel parsing
+- Adaptive node decimation: above 50,000 points the displayed cloud strides down to ~10,000 for snappy rendering. Toggleable in Settings; full picking-resolution preserved on the underlying mesh.
+- Ghost mode (View > Ghost Hidden Groups): hidden groups render as translucent wireframe overlays so you keep spatial context.
+- Experimental parallel BDF parsing (Settings > Parallel BDF Parsing): chunks the bulk-data section across worker threads and dict-merges the results. Falls back to single-threaded on small files, INCLUDE directives, or any chunked-parse failure. Default OFF.
 
 ## Changelog for v2.0.0
 

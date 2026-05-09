@@ -40,6 +40,7 @@ class BdfReadWorker(QObject):
     @Slot()
     def run(self):
         try:
+            from PySide6.QtCore import QSettings
             from node_runner.model import (
                 NastranModelGenerator, detect_bdf_field_format,
             )
@@ -48,9 +49,22 @@ class BdfReadWorker(QObject):
             if self._cancelled:
                 return
 
-            self.progress.emit("Parsing BDF...")
+            settings = QSettings("NodeRunner", "NodeRunner")
+            use_parallel = bool(settings.value(
+                "import/parallel_parsing", False, type=bool,
+            ))
+
             generator = NastranModelGenerator()
-            model, lenient_result = NastranModelGenerator._read_bdf_robust(self._filepath)
+            if use_parallel:
+                self.progress.emit("Parsing BDF (parallel, experimental)...")
+                model, lenient_result = NastranModelGenerator._read_bdf_parallel(
+                    self._filepath,
+                )
+            else:
+                self.progress.emit("Parsing BDF...")
+                model, lenient_result = NastranModelGenerator._read_bdf_robust(
+                    self._filepath,
+                )
             generator.model = model
             if self._cancelled:
                 return
