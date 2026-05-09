@@ -38,3 +38,6 @@ from node_runner.dialogs.geometry import (
 from node_runner.dialogs.export import (
     ExportOptionsDialog, ExportDefaultsDialog, UnitsDialog,
 )
+from node_runner.dialogs.command_palette import (
+    CommandPaletteDialog, install_command_palette_shortcut,
+)

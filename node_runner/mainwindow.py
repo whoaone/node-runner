@@ -307,6 +307,11 @@ class MainWindow(QMainWindow):
     def initUI(self):
         self._create_menu_bar()
         self._build_status_widgets()
+        self._action_registry = self._build_action_registry()
+        from node_runner.dialogs import install_command_palette_shortcut
+        self._command_palette_shortcut = install_command_palette_shortcut(
+            self, lambda: self._action_registry,
+        )
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -646,6 +651,15 @@ class MainWindow(QMainWindow):
         self.plotter = QtInteractor(self)
         self.plotter.set_background('#1e1e2e')
         self.plotter.installEventFilter(self)  # Catch ESC for presentation mode
+
+        # Phase 2.3: Render debouncer. _request_render() coalesces a burst
+        # of render() calls into one frame on a 16ms timer. Existing direct
+        # self.plotter.render() calls keep working unchanged; new code can
+        # opt in by calling self._request_render() instead.
+        self._render_timer = QtCore.QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(16)
+        self._render_timer.timeout.connect(lambda: self.plotter.render())
 
         # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
         self._selection_overlay = SelectionOverlay(self.plotter)
@@ -1328,6 +1342,63 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._update_status(f"File save failed: {e}", is_error=True)
             QMessageBox.critical(self, "Error", f"Could not save file: {e}")
+
+    # --- Phase 2.3: render request (debounced) ---
+    def _request_render(self):
+        """Schedule a plotter render on the next 16ms tick, coalescing bursts.
+
+        Multiple calls within the timer window collapse into a single
+        render() call. Direct ``self.plotter.render()`` calls elsewhere
+        in the codebase still execute immediately and bypass this debouncer
+        (intentional: code that needs an immediate render keeps working).
+        """
+        if hasattr(self, "_render_timer") and self._render_timer is not None:
+            self._render_timer.start()
+        else:
+            # Defensive: render synchronously if the timer was not yet built.
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    # --- Phase 2: flat action registry harvested from the menu bar ---
+    @staticmethod
+    def _clean_menu_label(text):
+        """Strip '&' Qt mnemonics, keeping a literal '&&' as one '&'."""
+        return text.replace("&&", "\x00").replace("&", "").replace("\x00", "&")
+
+    def _build_action_registry(self):
+        """Walk the menu bar and return a flat list of [(path, kw, QAction)].
+
+        Only leaf actions (those that do nothing but trigger a slot) are
+        added. Separators and sub-menu containers are skipped. The path is
+        a `Parent > Child > Leaf` label with mnemonics stripped.
+        """
+        registry = []
+
+        def visit(menu, prefix):
+            for act in menu.actions():
+                if act.isSeparator():
+                    continue
+                label = self._clean_menu_label(act.text()).strip()
+                if not label:
+                    continue
+                full = f"{prefix} > {label}" if prefix else label
+                sub = act.menu()
+                if sub is not None:
+                    visit(sub, full)
+                else:
+                    keywords = " ".join((label, prefix or "")).lower()
+                    registry.append((full, keywords, act))
+
+        bar = self.menuBar()
+        for top_act in bar.actions():
+            sub = top_act.menu()
+            if sub is None:
+                continue
+            top_label = self._clean_menu_label(top_act.text()).strip()
+            visit(sub, top_label)
+        return registry
 
     # --- Phase 1: persistent status-bar widgets (model / nodes / export / units) ---
     def _build_status_widgets(self):
@@ -6001,39 +6072,53 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
-        try:
-            generator, lenient_result, detected_format = self._parse_bdf_to_generator(filepath)
-            self._ensure_default_coords(generator.model)
-            self.command_manager.clear()
-            self.subcases = []
-            self.geometry_store.clear()
-            self.sol_type = None
-            self.eigrl_cards = []
-            self.analysis_sets.clear()
-            self.active_analysis_set_id = None
-            self.op2_results = None
-            self.results_widget.setVisible(False)
-            self.groups.clear()
-            self._hidden_groups.clear()
-            self._isolate_mode = None
-            self._populate_groups_list()
-            self._update_viewer(generator)
-            self._on_model_loaded(filepath, detected_format)
+        from node_runner.workers import run_bdf_import_threaded
 
-            fname = os.path.basename(filepath)
-            if lenient_result and lenient_result.skipped:
-                n = len(lenient_result.skipped)
-                self._update_status(
-                    f"Opened {fname} ({n} card{'s' if n != 1 else ''} skipped)")
-                LenientImportReportDialog(fname, lenient_result, self).exec()
-            elif lenient_result:
-                self._update_status(
-                    f"Opened {fname} (lenient mode, all cards OK)")
-            else:
-                self._update_status(f"Displayed {fname}")
-        except Exception as e:
-            self._update_status(f"File open failed.", is_error=True)
-            QMessageBox.critical(self, "Error", f"Could not open/parse file: {e}")
+        def on_success(generator, lenient_result, detected_format):
+            try:
+                self._ensure_default_coords(generator.model)
+                self.command_manager.clear()
+                self.subcases = []
+                self.geometry_store.clear()
+                self.sol_type = None
+                self.eigrl_cards = []
+                self.analysis_sets.clear()
+                self.active_analysis_set_id = None
+                self.op2_results = None
+                self.results_widget.setVisible(False)
+                self.groups.clear()
+                self._hidden_groups.clear()
+                self._isolate_mode = None
+                self._populate_groups_list()
+                self._update_viewer(generator)
+                self._on_model_loaded(filepath, detected_format)
+
+                fname = os.path.basename(filepath)
+                if lenient_result and lenient_result.skipped:
+                    n = len(lenient_result.skipped)
+                    self._update_status(
+                        f"Opened {fname} ({n} card{'s' if n != 1 else ''} skipped)")
+                    LenientImportReportDialog(fname, lenient_result, self).exec()
+                elif lenient_result:
+                    self._update_status(
+                        f"Opened {fname} (lenient mode, all cards OK)")
+                else:
+                    self._update_status(f"Displayed {fname}")
+            except Exception as e:
+                self._update_status("File open failed.", is_error=True)
+                QMessageBox.critical(self, "Error", f"Post-parse handling failed: {e}")
+
+        def on_failure(msg):
+            self._update_status("File open failed.", is_error=True)
+            QMessageBox.critical(self, "Error", f"Could not open/parse file: {msg}")
+
+        thread, worker, dialog = run_bdf_import_threaded(
+            self, filepath, on_success, on_failure,
+        )
+        # Hold references so QThread/Qt doesn't garbage-collect them.
+        self._active_import_thread = thread
+        self._active_import_worker = worker
+        self._active_import_dialog = dialog
 
 
     def _import_cad_file(self):
@@ -6108,49 +6193,66 @@ class MainWindow(QMainWindow):
                 self._update_status("Import cancelled.")
                 return
 
-        try:
-            filename = os.path.basename(filepath)
-            if option == 'new':
-                generator, lenient_result, detected_format = self._parse_bdf_to_generator(filepath)
-                self._ensure_default_coords(generator.model)
-                self.command_manager.clear()
-                # Phase 8: Reset groups on import-new
-                self.groups.clear()
-                self._hidden_groups.clear()
-                self._isolate_mode = None
-                self._populate_groups_list()
-                self._update_viewer(generator)
-                self._on_model_loaded(filepath, detected_format)
+        filename = os.path.basename(filepath)
 
-                if lenient_result and lenient_result.skipped:
-                    n = len(lenient_result.skipped)
-                    self._update_status(
-                        f"Opened {filename} ({n} card{'s' if n != 1 else ''} skipped)")
-                    LenientImportReportDialog(filename, lenient_result, self).exec()
-                elif lenient_result:
-                    self._update_status(
-                        f"Opened {filename} (lenient mode, all cards OK)")
-                else:
-                    self._update_status(f"Opened new model from {filename}")
-            
-            elif option == 'append':
-                # This calls our new backend method
+        if option == 'new':
+            from node_runner.workers import run_bdf_import_threaded
+
+            def on_success(generator, lenient_result, detected_format):
+                try:
+                    self._ensure_default_coords(generator.model)
+                    self.command_manager.clear()
+                    self.groups.clear()
+                    self._hidden_groups.clear()
+                    self._isolate_mode = None
+                    self._populate_groups_list()
+                    self._update_viewer(generator)
+                    self._on_model_loaded(filepath, detected_format)
+
+                    if lenient_result and lenient_result.skipped:
+                        n = len(lenient_result.skipped)
+                        self._update_status(
+                            f"Opened {filename} ({n} card{'s' if n != 1 else ''} skipped)")
+                        LenientImportReportDialog(filename, lenient_result, self).exec()
+                    elif lenient_result:
+                        self._update_status(
+                            f"Opened {filename} (lenient mode, all cards OK)")
+                    else:
+                        self._update_status(f"Opened new model from {filename}")
+                except Exception as e:
+                    self._update_status("File import failed.", is_error=True)
+                    QMessageBox.critical(self, "Error", f"Post-parse handling failed: {e}")
+
+            def on_failure(msg):
+                self._update_status("File import failed.", is_error=True)
+                QMessageBox.critical(self, "Error", f"Could not import file: {msg}")
+
+            thread, worker, dlg = run_bdf_import_threaded(
+                self, filepath, on_success, on_failure,
+            )
+            self._active_import_thread = thread
+            self._active_import_worker = worker
+            self._active_import_dialog = dlg
+            return
+
+        # Append path stays synchronous: it operates on the current model in
+        # place, which is harder to thread safely without rework. It is also
+        # typically fast (small/medium decks).
+        try:
+            if option == 'append':
                 summary = self.current_generator.import_and_append_bdf(filepath)
-                
                 self._ensure_default_coords(self.current_generator.model)
 
-                # Create a summary message of what was imported
                 summary_parts = [f"{count} {name}" for name, count in summary.items() if count > 0]
                 if summary_parts:
                     message = f"Appended {', '.join(summary_parts)} from {filename}."
                 else:
                     message = f"No new cards were appended from {filename}."
-                
+
                 self._update_status(message)
                 self._update_viewer(self.current_generator, reset_camera=False)
-
         except Exception as e:
-            self._update_status(f"File import failed.", is_error=True)
+            self._update_status("File import failed.", is_error=True)
             QMessageBox.critical(self, "Error", f"Could not import file: {e}")
 
 
@@ -6482,7 +6584,8 @@ class MainWindow(QMainWindow):
             self.plotter.set_background(preset["color"])
         elif preset["mode"] == "gradient":
             self.plotter.set_background(preset["bottom"], top=preset["top"])
-        self.plotter.render()
+        # Debounced render: a burst of preset changes coalesces to one frame.
+        self._request_render()
         
     def _set_coloring_mode(self, mode):
         self.color_mode = mode
