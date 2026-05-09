@@ -42,3 +42,7 @@ from node_runner.dialogs.command_palette import (
     CommandPaletteDialog, install_command_palette_shortcut,
 )
 from node_runner.dialogs.cross_section import CrossSectionDialog
+from node_runner.dialogs.mesh_edit import (
+    SmoothNodesDialog, MirrorElementsDialog, CopyElementsDialog,
+    CombineTriasDialog,
+)

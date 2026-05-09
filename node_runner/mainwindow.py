@@ -1000,6 +1000,26 @@ class MainWindow(QMainWindow):
         edit_mats_action = QAction("Materials...", self)
         edit_mats_action.triggered.connect(self._open_material_editor)
         modify_menu.addAction(edit_mats_action)
+        # --- Theme A: mesh-editing operations ---
+        modify_menu.addSeparator()
+        split_quad_action = QAction("Split QUAD into TRIA...", self)
+        split_quad_action.triggered.connect(self._open_split_quad_tool)
+        modify_menu.addAction(split_quad_action)
+        refine_action = QAction("Refine Elements (1-into-4)...", self)
+        refine_action.triggered.connect(self._open_refine_tool)
+        modify_menu.addAction(refine_action)
+        combine_action = QAction("Combine TRIA into QUAD...", self)
+        combine_action.triggered.connect(self._open_combine_tool)
+        modify_menu.addAction(combine_action)
+        smooth_action = QAction("Smooth Nodes...", self)
+        smooth_action.triggered.connect(self._open_smooth_tool)
+        modify_menu.addAction(smooth_action)
+        mirror_elem_action = QAction("Mirror Elements...", self)
+        mirror_elem_action.triggered.connect(self._open_mirror_elements_tool)
+        modify_menu.addAction(mirror_elem_action)
+        copy_elem_action = QAction("Copy Elements...", self)
+        copy_elem_action.triggered.connect(self._open_copy_elements_tool)
+        modify_menu.addAction(copy_elem_action)
 
         # Section 4: Mesh Operations (moved from Mesh menu)
         model_menu.addSeparator()
@@ -2119,6 +2139,227 @@ class MainWindow(QMainWindow):
         self._update_viewer(self.current_generator, reset_camera=False)
         if normals_were_visible:
             self._toggle_element_normals_visibility()
+
+    # --- Theme A: mesh-edit handlers (split / refine / combine / smooth /
+    #     mirror / copy). Each follows the existing flip-normals pattern:
+    #     gather a selection via _start_selection, then run the matching
+    #     Command via the command_manager so undo/redo works. ---
+
+    def _eligible_eids_for_quads(self):
+        if not self.current_generator:
+            return []
+        return [
+            eid for eid, e in self.current_generator.model.elements.items()
+            if e.type in ('CQUAD4', 'CMEMBRAN')
+        ]
+
+    def _eligible_eids_for_trias(self):
+        if not self.current_generator:
+            return []
+        return [
+            eid for eid, e in self.current_generator.model.elements.items()
+            if e.type == 'CTRIA3'
+        ]
+
+    def _eligible_eids_for_shells(self):
+        if not self.current_generator:
+            return []
+        return [
+            eid for eid, e in self.current_generator.model.elements.items()
+            if e.type in ('CQUAD4', 'CMEMBRAN', 'CTRIA3')
+        ]
+
+    def _eligible_eids_all(self):
+        if not self.current_generator:
+            return []
+        return list(self.current_generator.model.elements.keys())
+
+    def _open_split_quad_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        eids = self._eligible_eids_for_quads()
+        if not eids:
+            QMessageBox.warning(self, "No Quads", "No CQUAD4 elements in the model.")
+            return
+        self._start_selection(
+            'Element', eids, self._on_split_quad_accept,
+            self._build_select_by_data(),
+        )
+
+    def _on_split_quad_accept(self):
+        from node_runner.commands import SplitQuadCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Split cancelled: no elements selected.")
+            return
+        cmd = SplitQuadCommand(selected)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Split {len(selected)} quad(s) into trias.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_refine_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        eids = self._eligible_eids_for_shells()
+        if not eids:
+            QMessageBox.warning(self, "No Shells", "No shell elements in the model.")
+            return
+        self._start_selection(
+            'Element', eids, self._on_refine_accept,
+            self._build_select_by_data(),
+        )
+
+    def _on_refine_accept(self):
+        from node_runner.commands import RefineElementsCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Refine cancelled: no elements selected.")
+            return
+        cmd = RefineElementsCommand(selected)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Refined {len(selected)} element(s) (1 -> 4 each).")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_combine_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        eids = self._eligible_eids_for_trias()
+        if not eids:
+            QMessageBox.warning(self, "No Trias", "No CTRIA3 elements in the model.")
+            return
+        from node_runner.dialogs import CombineTriasDialog
+        dlg = CombineTriasDialog(self)
+        if not dlg.exec():
+            return
+        self._combine_angle_tol = dlg.angle_tol_deg
+        self._start_selection(
+            'Element', eids, self._on_combine_accept,
+            self._build_select_by_data(),
+        )
+
+    def _on_combine_accept(self):
+        from node_runner.commands import CombineTriasCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Combine cancelled: no elements selected.")
+            return
+        cmd = CombineTriasCommand(selected, angle_tol_deg=self._combine_angle_tol)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        n_quads = len(cmd._new_quads)
+        self._update_status(
+            f"Combined {len(selected)} triangle(s) into {n_quads} quad(s)."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_smooth_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Nodes", "The model has no nodes to smooth.")
+            return
+        from node_runner.dialogs import SmoothNodesDialog
+        dlg = SmoothNodesDialog(self)
+        if not dlg.exec():
+            return
+        self._smooth_iter = dlg.iterations
+        self._smooth_factor = dlg.factor
+        self._smooth_pin = dlg.pin_free_edges
+        all_nids = list(self.current_generator.model.nodes.keys())
+        self._start_selection(
+            'Node', all_nids, self._on_smooth_accept,
+            self._build_select_by_data(),
+        )
+
+    def _on_smooth_accept(self):
+        from node_runner.commands import SmoothNodesCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Smooth cancelled: no nodes selected.")
+            return
+        cmd = SmoothNodesCommand(
+            selected,
+            iterations=self._smooth_iter,
+            factor=self._smooth_factor,
+            pin_free_edges=self._smooth_pin,
+        )
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Smoothed {len(selected)} node(s) ({self._smooth_iter} iterations).",
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_mirror_elements_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model has no elements to mirror.")
+            return
+        from node_runner.dialogs import MirrorElementsDialog
+        dlg = MirrorElementsDialog(parent=self)
+        if not dlg.exec():
+            return
+        self._mirror_plane = dlg.plane
+        self._mirror_value = dlg.value
+        self._mirror_weld_tol = dlg.weld_tol
+        self._start_selection(
+            'Element', self._eligible_eids_all(),
+            self._on_mirror_accept, self._build_select_by_data(),
+        )
+
+    def _on_mirror_accept(self):
+        from node_runner.commands import MirrorElementsCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Mirror cancelled: no elements selected.")
+            return
+        cmd = MirrorElementsCommand(
+            selected,
+            plane=self._mirror_plane,
+            plane_value=self._mirror_value,
+            weld_tol=self._mirror_weld_tol,
+        )
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Mirrored {len(cmd._created_eids)} element(s) across "
+            f"{self._mirror_plane}={self._mirror_value}."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_copy_elements_tool(self):
+        if self.selection_bar.isVisible():
+            return
+        if not self.current_generator or not self.current_generator.model.elements:
+            QMessageBox.warning(self, "No Elements", "The model has no elements to copy.")
+            return
+        from node_runner.dialogs import CopyElementsDialog
+        dlg = CopyElementsDialog(self)
+        if not dlg.exec():
+            return
+        self._copy_translate = dlg.translation
+        self._start_selection(
+            'Element', self._eligible_eids_all(),
+            self._on_copy_accept, self._build_select_by_data(),
+        )
+
+    def _on_copy_accept(self):
+        from node_runner.commands import CopyElementsCommand
+        selected = self.selection_bar.get_selected_ids()
+        self._end_selection_mode()
+        if not selected:
+            self._update_status("Copy cancelled: no elements selected.")
+            return
+        cmd = CopyElementsCommand(selected, translate=self._copy_translate)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Copied {len(cmd._created_eids)} element(s) by "
+            f"{self._copy_translate}."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
 
     def _auto_orient_normals(self):
         """Run BFS auto-orient on all shell elements for consistent normals."""

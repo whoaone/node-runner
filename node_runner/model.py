@@ -1281,11 +1281,140 @@ class NastranModelGenerator:
                 min_a, max_a = self._calculate_interior_angles(node_coords)
                 metrics['min_angle'] = min_a
                 metrics['max_angle'] = max_a
+            elif element.type in ('CTETRA', 'CTETRA4', 'CTETRA10') and len(node_coords) >= 4:
+                pts = node_coords[:4]
+                metrics['aspect'] = self._calculate_solid_aspect_ratio(pts, edges=(
+                    (0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3),
+                ))
+                metrics['volume'] = self._calculate_tet_volume(pts)
+                metrics['jacobian'] = self._calculate_tet_jacobian(pts)
+            elif element.type in ('CHEXA', 'CHEXA8', 'CHEXA20') and len(node_coords) >= 8:
+                pts = node_coords[:8]
+                metrics['aspect'] = self._calculate_solid_aspect_ratio(pts, edges=(
+                    (0, 1), (1, 2), (2, 3), (3, 0),
+                    (4, 5), (5, 6), (6, 7), (7, 4),
+                    (0, 4), (1, 5), (2, 6), (3, 7),
+                ))
+                metrics['volume'] = self._calculate_hex_volume(pts)
+                metrics['jacobian'] = self._calculate_hex_jacobian(pts)
+            elif element.type in ('CPENTA', 'CPENTA6', 'CPENTA15') and len(node_coords) >= 6:
+                pts = node_coords[:6]
+                metrics['aspect'] = self._calculate_solid_aspect_ratio(pts, edges=(
+                    (0, 1), (1, 2), (2, 0),
+                    (3, 4), (4, 5), (5, 3),
+                    (0, 3), (1, 4), (2, 5),
+                ))
+                metrics['volume'] = self._calculate_penta_volume(pts)
 
             if metrics:
                 quality_data[eid] = metrics
 
         return quality_data
+
+    @staticmethod
+    def _calculate_solid_aspect_ratio(points, edges):
+        """Generic solid aspect ratio: max edge / min edge."""
+        ls = []
+        for a, b in edges:
+            ls.append(float(np.linalg.norm(points[a] - points[b])))
+        ls = [l for l in ls if l > 1e-12]
+        if not ls:
+            return 0.0
+        return max(ls) / min(ls)
+
+    @staticmethod
+    def _calculate_tet_volume(points):
+        p0, p1, p2, p3 = points
+        return float(abs(np.dot(p1 - p0, np.cross(p2 - p0, p3 - p0))) / 6.0)
+
+    @staticmethod
+    def _calculate_tet_jacobian(points):
+        """Min Jacobian determinant ratio across the 4 corners of a tet."""
+        p0, p1, p2, p3 = points
+        # Tet has constant Jacobian for linear shape functions, but we
+        # report the determinant magnitude normalized by ideal-tet volume
+        # of the same edge length.
+        edge_lens = [
+            float(np.linalg.norm(p1 - p0)),
+            float(np.linalg.norm(p2 - p0)),
+            float(np.linalg.norm(p3 - p0)),
+        ]
+        if min(edge_lens) < 1e-12:
+            return 0.0
+        v = abs(np.dot(p1 - p0, np.cross(p2 - p0, p3 - p0)))
+        # Ideal tet volume scaled to mean edge length
+        mean_edge = sum(edge_lens) / 3.0
+        ideal_v = (mean_edge ** 3) / (6.0 * np.sqrt(2.0))
+        if ideal_v < 1e-12:
+            return 0.0
+        return float(v / 6.0 / ideal_v)
+
+    @staticmethod
+    def _calculate_hex_volume(points):
+        """Hex volume via 6-tet decomposition sharing diagonal 0-6.
+
+        For a unit cube this returns 1.0 exactly. The decomposition uses
+        the body diagonal from corner 0 to corner 6 as the common edge
+        across all six tets.
+        """
+        p = points
+        tets = (
+            (0, 1, 2, 6),
+            (0, 2, 3, 6),
+            (0, 3, 7, 6),
+            (0, 7, 4, 6),
+            (0, 4, 5, 6),
+            (0, 5, 1, 6),
+        )
+        v = 0.0
+        for a, b, c, d in tets:
+            v += abs(np.dot(p[b] - p[a], np.cross(p[c] - p[a], p[d] - p[a]))) / 6.0
+        return float(v)
+
+    @staticmethod
+    def _calculate_hex_jacobian(points):
+        """Min/max Jacobian determinant ratio at the 8 corners of a hex.
+
+        At each corner we form the local edge frame from the three edges
+        leaving that corner and compute its determinant. Returns
+        min(det) / max(det) - 1.0 is a perfect cube; <0 indicates inverted.
+        """
+        p = points
+        # Corner -> three edge-neighbors (along x, y, z faces of unit hex)
+        corners = (
+            (0, 1, 3, 4),
+            (1, 2, 0, 5),
+            (2, 3, 1, 6),
+            (3, 0, 2, 7),
+            (4, 5, 7, 0),
+            (5, 6, 4, 1),
+            (6, 7, 5, 2),
+            (7, 4, 6, 3),
+        )
+        dets = []
+        for c, a, b, d in corners:
+            v1 = points[a] - points[c]
+            v2 = points[b] - points[c]
+            v3 = points[d] - points[c]
+            dets.append(float(np.dot(v1, np.cross(v2, v3))))
+        dets = [abs(x) for x in dets if abs(x) > 1e-12]
+        if not dets:
+            return 0.0
+        return min(dets) / max(dets)
+
+    @staticmethod
+    def _calculate_penta_volume(points):
+        """Wedge / penta volume via 3-tet decomposition."""
+        p = points
+        tets = (
+            (0, 1, 2, 5),
+            (0, 1, 5, 4),
+            (0, 4, 5, 3),
+        )
+        v = 0.0
+        for a, b, c, d in tets:
+            v += abs(np.dot(p[b] - p[a], np.cross(p[c] - p[a], p[d] - p[a]))) / 6.0
+        return float(v)
 
     def _calculate_quad_warp(self, points):
         """Calculates the warping angle of a quad element in degrees."""

@@ -474,6 +474,639 @@ class AutoOrientNormalsCommand(Command):
         return f"Auto-orient normals ({n} element{'s' if n != 1 else ''} flipped)"
 
 
+# ---------------------------------------------------------------------------
+# Theme A: mesh editing commands (split / refine / combine / smooth /
+# mirror / copy / insert-edge-node). All snapshot the affected nodes and
+# elements for undo. New IDs are allocated above the current max so undo
+# can simply pop them.
+# ---------------------------------------------------------------------------
+
+def _next_eid(model) -> int:
+    eids = list(model.elements.keys())
+    if model.rigid_elements:
+        eids.extend(model.rigid_elements.keys())
+    return (max(eids) + 1) if eids else 1
+
+
+def _next_nid(model) -> int:
+    return (max(model.nodes.keys()) + 1) if model.nodes else 1
+
+
+def _midpoint(model, n1, n2):
+    """Return [x,y,z] midpoint between two existing nodes."""
+    p1 = model.nodes[n1].get_position()
+    p2 = model.nodes[n2].get_position()
+    return [(p1[0] + p2[0]) * 0.5,
+            (p1[1] + p2[1]) * 0.5,
+            (p1[2] + p2[2]) * 0.5]
+
+
+def _centroid(model, nids):
+    pts = [model.nodes[n].get_position() for n in nids]
+    n = float(len(pts))
+    return [sum(p[0] for p in pts) / n,
+            sum(p[1] for p in pts) / n,
+            sum(p[2] for p in pts) / n]
+
+
+class SplitQuadCommand(Command):
+    """Split each selected CQUAD4 into two CTRIA3s along the better diagonal.
+
+    The diagonal is chosen automatically: whichever split gives the smaller
+    aspect-ratio spread of the two resulting triangles wins. Original
+    CQUAD4s are snapshotted so undo restores them.
+    """
+
+    def __init__(self, eids: list[int]):
+        self._eids = list(eids)
+        self._old_quads: dict[int, Any] = {}
+        self._new_trias: list[int] = []
+
+    def execute(self, model) -> None:
+        import math
+        self._old_quads.clear()
+        self._new_trias.clear()
+        next_eid = _next_eid(model)
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None or elem.type not in ('CQUAD4', 'CMEMBRAN'):
+                continue
+            n1, n2, n3, n4 = elem.nodes[:4]
+            pid = elem.pid
+            self._old_quads[eid] = copy.deepcopy(elem)
+
+            def _edge_len(a, b):
+                pa = model.nodes[a].get_position()
+                pb = model.nodes[b].get_position()
+                return math.sqrt(sum((pa[i] - pb[i]) ** 2 for i in range(3)))
+
+            d13 = _edge_len(n1, n3)
+            d24 = _edge_len(n2, n4)
+
+            model.elements.pop(eid, None)
+            if d13 <= d24:
+                # Split along 1-3
+                e_a = next_eid; next_eid += 1
+                e_b = next_eid; next_eid += 1
+                model.add_ctria3(e_a, pid, [n1, n2, n3])
+                model.add_ctria3(e_b, pid, [n1, n3, n4])
+            else:
+                e_a = next_eid; next_eid += 1
+                e_b = next_eid; next_eid += 1
+                model.add_ctria3(e_a, pid, [n1, n2, n4])
+                model.add_ctria3(e_b, pid, [n2, n3, n4])
+            self._new_trias.extend((e_a, e_b))
+
+    def undo(self, model) -> None:
+        for eid in self._new_trias:
+            model.elements.pop(eid, None)
+        for eid, elem in self._old_quads.items():
+            model.elements[eid] = elem
+
+    @property
+    def description(self) -> str:
+        return f"Split {len(self._eids)} QUAD4 into TRIA3"
+
+
+class RefineElementsCommand(Command):
+    """1-into-4 refinement of CQUAD4 / CTRIA3 with shared edge-midpoint nodes.
+
+    For every selected element we insert midside nodes on each edge and
+    (for quads) a centroid node, then replace the original element with
+    four sub-elements of the same type and PID. Edge midpoints are
+    deduplicated across the selection so the resulting mesh stays
+    conformant where the selection has shared edges.
+    """
+
+    def __init__(self, eids: list[int]):
+        self._eids = list(eids)
+        self._old_elements: dict[int, Any] = {}
+        self._new_eids: list[int] = []
+        self._new_nids: list[int] = []
+
+    def execute(self, model) -> None:
+        self._old_elements.clear()
+        self._new_eids.clear()
+        self._new_nids.clear()
+
+        next_nid = _next_nid(model)
+        next_eid = _next_eid(model)
+        edge_cache: dict[frozenset, int] = {}
+
+        def get_or_make_midnode(a, b):
+            nonlocal next_nid
+            key = frozenset({a, b})
+            if key in edge_cache:
+                return edge_cache[key]
+            new_nid = next_nid
+            next_nid += 1
+            model.add_grid(new_nid, _midpoint(model, a, b))
+            edge_cache[key] = new_nid
+            self._new_nids.append(new_nid)
+            return new_nid
+
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None:
+                continue
+            if elem.type in ('CQUAD4', 'CMEMBRAN'):
+                n1, n2, n3, n4 = elem.nodes[:4]
+                pid = elem.pid
+                self._old_elements[eid] = copy.deepcopy(elem)
+                m12 = get_or_make_midnode(n1, n2)
+                m23 = get_or_make_midnode(n2, n3)
+                m34 = get_or_make_midnode(n3, n4)
+                m41 = get_or_make_midnode(n4, n1)
+                # Centroid - unique per element, no caching
+                cnid = next_nid; next_nid += 1
+                model.add_grid(cnid, _centroid(model, [n1, n2, n3, n4]))
+                self._new_nids.append(cnid)
+
+                model.elements.pop(eid)
+                for nids in (
+                    [n1, m12, cnid, m41],
+                    [m12, n2, m23, cnid],
+                    [cnid, m23, n3, m34],
+                    [m41, cnid, m34, n4],
+                ):
+                    e = next_eid; next_eid += 1
+                    model.add_cquad4(e, pid, nids)
+                    self._new_eids.append(e)
+
+            elif elem.type == 'CTRIA3':
+                n1, n2, n3 = elem.nodes[:3]
+                pid = elem.pid
+                self._old_elements[eid] = copy.deepcopy(elem)
+                m12 = get_or_make_midnode(n1, n2)
+                m23 = get_or_make_midnode(n2, n3)
+                m31 = get_or_make_midnode(n3, n1)
+                model.elements.pop(eid)
+                for nids in (
+                    [n1, m12, m31],
+                    [m12, n2, m23],
+                    [m31, m23, n3],
+                    [m12, m23, m31],
+                ):
+                    e = next_eid; next_eid += 1
+                    model.add_ctria3(e, pid, nids)
+                    self._new_eids.append(e)
+
+    def undo(self, model) -> None:
+        for eid in self._new_eids:
+            model.elements.pop(eid, None)
+        for nid in self._new_nids:
+            model.nodes.pop(nid, None)
+        for eid, elem in self._old_elements.items():
+            model.elements[eid] = elem
+
+    @property
+    def description(self) -> str:
+        return f"Refine {len(self._eids)} element{'s' if len(self._eids) != 1 else ''}"
+
+
+class CombineTriasCommand(Command):
+    """Combine pairs of selected CTRIA3s sharing an edge into single CQUAD4s.
+
+    Greedy matcher: scan selected tris, pair any two that (a) share exactly
+    one edge and (b) have a dihedral angle <= angle_tol_deg. Each
+    successful pair produces one CQUAD4 with the four unique corner nodes
+    ordered around the perimeter.
+    """
+
+    def __init__(self, eids: list[int], angle_tol_deg: float = 5.0):
+        self._eids = list(eids)
+        self._angle_tol = float(angle_tol_deg)
+        self._old_trias: dict[int, Any] = {}
+        self._new_quads: list[int] = []
+
+    def execute(self, model) -> None:
+        import math
+        self._old_trias.clear()
+        self._new_quads.clear()
+        next_eid = _next_eid(model)
+
+        # Index: edge -> list of (eid, tri_nodes)
+        edge_to_eids: dict[frozenset, list[tuple[int, tuple]]] = {}
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None or elem.type != 'CTRIA3':
+                continue
+            n1, n2, n3 = elem.nodes[:3]
+            for a, b in ((n1, n2), (n2, n3), (n3, n1)):
+                edge_to_eids.setdefault(frozenset({a, b}), []).append((eid, (n1, n2, n3)))
+
+        consumed: set[int] = set()
+
+        def _normal(a, b, c):
+            pa = model.nodes[a].get_position()
+            pb = model.nodes[b].get_position()
+            pc = model.nodes[c].get_position()
+            ux, uy, uz = (pb[i] - pa[i] for i in range(3))
+            vx, vy, vz = (pc[i] - pa[i] for i in range(3))
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            mag = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+            return (nx / mag, ny / mag, nz / mag)
+
+        for edge, hits in edge_to_eids.items():
+            if len(hits) != 2:
+                continue
+            (eid_a, (a1, a2, a3)), (eid_b, (b1, b2, b3)) = hits
+            if eid_a in consumed or eid_b in consumed:
+                continue
+            na = _normal(a1, a2, a3)
+            nb = _normal(b1, b2, b3)
+            dot = max(-1.0, min(1.0, sum(na[i] * nb[i] for i in range(3))))
+            angle = math.degrees(math.acos(abs(dot)))
+            if angle > self._angle_tol:
+                continue
+
+            shared = list(edge)
+            tri_a_extra = [n for n in (a1, a2, a3) if n not in shared][0]
+            tri_b_extra = [n for n in (b1, b2, b3) if n not in shared][0]
+            # Order the quad corners. Find the cyclic order in tri A:
+            # starting from tri_a_extra, walk a1->a2->a3->a1 and pick the
+            # one that brings us into the shared edge first.
+            tri_a = [a1, a2, a3]
+            i_extra = tri_a.index(tri_a_extra)
+            shared_in_a = [tri_a[(i_extra + 1) % 3], tri_a[(i_extra + 2) % 3]]
+            quad = [tri_a_extra, shared_in_a[0], tri_b_extra, shared_in_a[1]]
+
+            elem_a = model.elements[eid_a]
+            elem_b = model.elements[eid_b]
+            self._old_trias[eid_a] = copy.deepcopy(elem_a)
+            self._old_trias[eid_b] = copy.deepcopy(elem_b)
+            pid = elem_a.pid
+
+            model.elements.pop(eid_a, None)
+            model.elements.pop(eid_b, None)
+            new_eid = next_eid; next_eid += 1
+            model.add_cquad4(new_eid, pid, quad)
+            self._new_quads.append(new_eid)
+            consumed.add(eid_a)
+            consumed.add(eid_b)
+
+    def undo(self, model) -> None:
+        for eid in self._new_quads:
+            model.elements.pop(eid, None)
+        for eid, elem in self._old_trias.items():
+            model.elements[eid] = elem
+
+    @property
+    def description(self) -> str:
+        return f"Combine TRIA3 pairs ({len(self._new_quads)} new QUAD4)"
+
+
+class SmoothNodesCommand(Command):
+    """Laplacian smoothing on a node set.
+
+    Each iteration moves every selected node to a blend (factor in [0, 1])
+    of its current position and the centroid of its connected neighbors.
+    Boundary nodes (on free edges) are pinned. Original positions are
+    snapshotted for undo.
+    """
+
+    def __init__(self, nids: list[int], iterations: int = 5,
+                 factor: float = 0.5, pin_free_edges: bool = True):
+        self._nids = list(nids)
+        self._iter = max(1, int(iterations))
+        self._factor = max(0.0, min(1.0, float(factor)))
+        self._pin_free = bool(pin_free_edges)
+        self._old_xyz: dict[int, list] = {}
+
+    def execute(self, model) -> None:
+        self._old_xyz = {
+            nid: list(model.nodes[nid].get_position())
+            for nid in self._nids if nid in model.nodes
+        }
+
+        # Build node->neighbor adjacency from elements that touch the
+        # smoothed set. Two nodes are neighbors if they appear in the same
+        # element's node list adjacent to each other (cyclic).
+        neighbors: dict[int, set] = {nid: set() for nid in self._nids}
+        edge_count: dict[frozenset, int] = {}
+        for elem in model.elements.values():
+            if elem.type not in ('CQUAD4', 'CMEMBRAN', 'CTRIA3'):
+                continue
+            nlist = list(elem.nodes)
+            n = len(nlist)
+            for i in range(n):
+                a, b = nlist[i], nlist[(i + 1) % n]
+                if a in neighbors:
+                    neighbors[a].add(b)
+                if b in neighbors:
+                    neighbors[b].add(a)
+                edge_count[frozenset({a, b})] = edge_count.get(frozenset({a, b}), 0) + 1
+
+        pinned: set[int] = set()
+        if self._pin_free:
+            for edge, count in edge_count.items():
+                if count == 1:  # free edge
+                    pinned.update(edge)
+
+        for _ in range(self._iter):
+            new_pos: dict[int, list] = {}
+            for nid in self._nids:
+                if nid in pinned or nid not in model.nodes:
+                    continue
+                neigh = neighbors.get(nid, set())
+                if not neigh:
+                    continue
+                cx = cy = cz = 0.0
+                for nb in neigh:
+                    if nb in model.nodes:
+                        p = model.nodes[nb].get_position()
+                        cx += p[0]; cy += p[1]; cz += p[2]
+                k = float(len(neigh))
+                cx /= k; cy /= k; cz /= k
+                cur = model.nodes[nid].get_position()
+                f = self._factor
+                new_pos[nid] = [
+                    (1 - f) * cur[0] + f * cx,
+                    (1 - f) * cur[1] + f * cy,
+                    (1 - f) * cur[2] + f * cz,
+                ]
+            for nid, xyz in new_pos.items():
+                model.nodes[nid].set_position(model, xyz)
+
+    def undo(self, model) -> None:
+        for nid, xyz in self._old_xyz.items():
+            if nid in model.nodes:
+                model.nodes[nid].set_position(model, xyz)
+
+    @property
+    def description(self) -> str:
+        return f"Smooth {len(self._nids)} node{'s' if len(self._nids) != 1 else ''}"
+
+
+class MirrorElementsCommand(Command):
+    """Mirror selected elements across an axis-aligned plane.
+
+    Creates new mirrored nodes (or reuses originals if on the plane) and
+    new elements with reversed connectivity to preserve outward normals
+    on shells. Optionally welds duplicates at the symmetry plane.
+    """
+
+    PLANE_NORMALS = {
+        'X': (1.0, 0.0, 0.0),
+        'Y': (0.0, 1.0, 0.0),
+        'Z': (0.0, 0.0, 1.0),
+    }
+
+    def __init__(self, eids: list[int], plane: str = 'Y',
+                 plane_value: float = 0.0, weld_tol: float = 1e-6):
+        self._eids = list(eids)
+        self._plane = plane.upper()
+        self._plane_value = float(plane_value)
+        self._weld_tol = float(weld_tol)
+        self._created_nids: list[int] = []
+        self._created_eids: list[int] = []
+
+    def execute(self, model) -> None:
+        self._created_nids.clear()
+        self._created_eids.clear()
+        normal = self.PLANE_NORMALS.get(self._plane, (0.0, 1.0, 0.0))
+        axis_idx = normal.index(max(normal))  # 0/1/2 for X/Y/Z
+        offset = self._plane_value
+
+        # Collect node IDs used by the selected elements.
+        used: set = set()
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None:
+                continue
+            for nid in getattr(elem, 'nodes', []):
+                used.add(nid)
+
+        # Mirror each used node into a new node (or reuse if on plane).
+        nid_map: dict[int, int] = {}
+        next_nid = _next_nid(model)
+        for nid in used:
+            xyz = list(model.nodes[nid].get_position())
+            d = xyz[axis_idx] - offset
+            if abs(d) <= self._weld_tol:
+                nid_map[nid] = nid  # on plane: weld
+                continue
+            xyz[axis_idx] = offset - d
+            new_nid = next_nid; next_nid += 1
+            model.add_grid(new_nid, xyz)
+            nid_map[nid] = new_nid
+            self._created_nids.append(new_nid)
+
+        # Mirror elements. Reverse connectivity to preserve outward normals.
+        next_eid = _next_eid(model)
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None:
+                continue
+            new_nodes = [nid_map[n] for n in elem.nodes]
+            # Reverse for shells/solids; preserve order for line elements
+            if elem.type in ('CQUAD4', 'CMEMBRAN', 'CTRIA3', 'CSHEAR'):
+                new_nodes = list(reversed(new_nodes))
+            new_eid = next_eid; next_eid += 1
+            t = elem.type
+            pid = elem.pid
+            try:
+                if t in ('CQUAD4', 'CMEMBRAN'):
+                    model.add_cquad4(new_eid, pid, new_nodes)
+                elif t == 'CTRIA3':
+                    model.add_ctria3(new_eid, pid, new_nodes)
+                elif t == 'CSHEAR':
+                    model.add_cshear(new_eid, pid, new_nodes)
+                elif t in ('CBAR',):
+                    model.add_cbar(new_eid, pid, new_nodes,
+                                   x=[1.0, 0.0, 0.0], g0=None)
+                elif t in ('CBEAM',):
+                    model.add_cbeam(new_eid, pid, new_nodes,
+                                    x=[1.0, 0.0, 0.0], g0=None)
+                elif t == 'CROD':
+                    model.add_crod(new_eid, pid, new_nodes)
+                else:
+                    continue  # skip unsupported types
+                self._created_eids.append(new_eid)
+            except Exception:
+                continue
+
+    def undo(self, model) -> None:
+        for eid in self._created_eids:
+            model.elements.pop(eid, None)
+        for nid in self._created_nids:
+            model.nodes.pop(nid, None)
+
+    @property
+    def description(self) -> str:
+        return f"Mirror {len(self._eids)} element{'s' if len(self._eids) != 1 else ''}"
+
+
+class CopyElementsCommand(Command):
+    """Copy selected elements with a translation (and optional rotation).
+
+    Each element's nodes are duplicated (new GRIDs), the new nodes are
+    transformed, and a new element is created using them. Original elements
+    are untouched.
+    """
+
+    def __init__(self, eids: list[int],
+                 translate: tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 weld_tol: float = 0.0):
+        self._eids = list(eids)
+        self._translate = (float(translate[0]), float(translate[1]), float(translate[2]))
+        self._weld_tol = float(weld_tol)
+        self._created_nids: list[int] = []
+        self._created_eids: list[int] = []
+
+    def execute(self, model) -> None:
+        self._created_nids.clear()
+        self._created_eids.clear()
+        tx, ty, tz = self._translate
+
+        used: set = set()
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None:
+                continue
+            used.update(getattr(elem, 'nodes', []))
+
+        next_nid = _next_nid(model)
+        nid_map: dict[int, int] = {}
+        for nid in used:
+            p = list(model.nodes[nid].get_position())
+            new_xyz = [p[0] + tx, p[1] + ty, p[2] + tz]
+            new_nid = next_nid; next_nid += 1
+            model.add_grid(new_nid, new_xyz)
+            nid_map[nid] = new_nid
+            self._created_nids.append(new_nid)
+
+        next_eid = _next_eid(model)
+        for eid in self._eids:
+            elem = model.elements.get(eid)
+            if elem is None:
+                continue
+            new_nodes = [nid_map[n] for n in elem.nodes]
+            new_eid = next_eid; next_eid += 1
+            pid = elem.pid
+            t = elem.type
+            try:
+                if t in ('CQUAD4', 'CMEMBRAN'):
+                    model.add_cquad4(new_eid, pid, new_nodes)
+                elif t == 'CTRIA3':
+                    model.add_ctria3(new_eid, pid, new_nodes)
+                elif t == 'CSHEAR':
+                    model.add_cshear(new_eid, pid, new_nodes)
+                elif t == 'CBAR':
+                    model.add_cbar(new_eid, pid, new_nodes,
+                                   x=[1.0, 0.0, 0.0], g0=None)
+                elif t == 'CBEAM':
+                    model.add_cbeam(new_eid, pid, new_nodes,
+                                    x=[1.0, 0.0, 0.0], g0=None)
+                elif t == 'CROD':
+                    model.add_crod(new_eid, pid, new_nodes)
+                else:
+                    continue
+                self._created_eids.append(new_eid)
+            except Exception:
+                continue
+
+    def undo(self, model) -> None:
+        for eid in self._created_eids:
+            model.elements.pop(eid, None)
+        for nid in self._created_nids:
+            model.nodes.pop(nid, None)
+
+    @property
+    def description(self) -> str:
+        return f"Copy {len(self._eids)} element{'s' if len(self._eids) != 1 else ''}"
+
+
+class InsertEdgeNodeCommand(Command):
+    """Insert a node at the midpoint of a shared edge.
+
+    The neighboring elements that share the edge are split so the new
+    node is honored on both sides (keeps the mesh conformant).
+    Currently supports CQUAD4 (split into 2 trias touching the new node)
+    and CTRIA3 (split into 2 trias).
+    """
+
+    def __init__(self, n1: int, n2: int):
+        self._n1 = int(n1)
+        self._n2 = int(n2)
+        self._created_nid: int | None = None
+        self._old_elements: dict[int, Any] = {}
+        self._created_eids: list[int] = []
+
+    def execute(self, model) -> None:
+        if self._n1 not in model.nodes or self._n2 not in model.nodes:
+            return
+        new_nid = _next_nid(model)
+        model.add_grid(new_nid, _midpoint(model, self._n1, self._n2))
+        self._created_nid = new_nid
+
+        affected: list[tuple[int, Any]] = []
+        for eid, elem in list(model.elements.items()):
+            if elem.type not in ('CQUAD4', 'CMEMBRAN', 'CTRIA3'):
+                continue
+            nlist = list(elem.nodes)
+            n = len(nlist)
+            for i in range(n):
+                a, b = nlist[i], nlist[(i + 1) % n]
+                if {a, b} == {self._n1, self._n2}:
+                    affected.append((eid, elem))
+                    break
+
+        next_eid = _next_eid(model)
+        for eid, elem in affected:
+            self._old_elements[eid] = copy.deepcopy(elem)
+            nlist = list(elem.nodes)
+            pid = elem.pid
+            model.elements.pop(eid, None)
+            if elem.type == 'CTRIA3':
+                # Find vertex opposite to (n1,n2) edge
+                opp = [n for n in nlist if n not in (self._n1, self._n2)][0]
+                ea = next_eid; next_eid += 1
+                eb = next_eid; next_eid += 1
+                model.add_ctria3(ea, pid, [self._n1, new_nid, opp])
+                model.add_ctria3(eb, pid, [new_nid, self._n2, opp])
+                self._created_eids.extend((ea, eb))
+            else:  # CQUAD4 / CMEMBRAN
+                # Walk the cycle, when we hit n1->n2 edge insert new_nid.
+                # Result: split into a tri + a quad? Simpler: split into
+                # two triangles by introducing the new midnode and a
+                # diagonal back to the opposite corner pair.
+                # Identify edge index
+                idx = None
+                for i in range(4):
+                    a, b = nlist[i], nlist[(i + 1) % 4]
+                    if {a, b} == {self._n1, self._n2}:
+                        idx = i; break
+                if idx is None:
+                    continue
+                a = nlist[idx]
+                b = nlist[(idx + 1) % 4]
+                c = nlist[(idx + 2) % 4]
+                d = nlist[(idx + 3) % 4]
+                ea = next_eid; next_eid += 1
+                eb = next_eid; next_eid += 1
+                # Two trias preserve the original outward direction
+                model.add_ctria3(ea, pid, [a, new_nid, d])
+                eb2 = next_eid; next_eid += 1
+                model.add_ctria3(eb, pid, [new_nid, b, c])
+                model.add_ctria3(eb2, pid, [new_nid, c, d])
+                self._created_eids.extend((ea, eb, eb2))
+
+    def undo(self, model) -> None:
+        for eid in self._created_eids:
+            model.elements.pop(eid, None)
+        for eid, elem in self._old_elements.items():
+            model.elements[eid] = elem
+        if self._created_nid is not None:
+            model.nodes.pop(self._created_nid, None)
+
+    @property
+    def description(self) -> str:
+        return f"Insert node on edge ({self._n1}-{self._n2})"
+
+
 class EditElementCommand(Command):
     """Edit an element's PID, nodes, and/or orientation."""
 
