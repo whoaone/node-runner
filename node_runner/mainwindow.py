@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import math
 import random
 import re
 import numpy as np
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QGridLayout, QTreeWidget, QTreeWidgetItem, QSplitter,
     QDialogButtonBox, QTreeWidgetItemIterator, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QRadioButton,
-    QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox,
+    QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox, QDockWidget,
 )
 from PySide6.QtGui import (QPalette, QColor, QAction, QActionGroup, QDoubleValidator,
                            QPainter, QPen, QBrush, QPolygonF, QPixmap, QIcon)
@@ -290,6 +291,15 @@ class MainWindow(QMainWindow):
         self._anim_timer = QtCore.QTimer(self)
         self._anim_timer.timeout.connect(self._on_animation_tick)
 
+        # --- Theme B: result interaction state ---
+        self._probe_enabled = False
+        self._probe_tooltip = None  # lazy-created QLabel tooltip
+        self._result_browser_dock = None  # built in initUI when OP2 loads
+        self._vector_overlay_widget = None
+        self._anim_timeline_widget = None
+        # Active expression for custom contour. Empty string -> normal contour.
+        self._contour_expression = ""
+
         # --- Phase 8: Group management ---
         self.groups: dict[str, dict] = {}  # { "name": {"nodes": [], "elements": [], "gid": int} }
         self._next_group_id: int = 1
@@ -327,6 +337,7 @@ class MainWindow(QMainWindow):
         self._command_palette_shortcut = install_command_palette_shortcut(
             self, lambda: self._action_registry,
         )
+        self._build_result_browser_dock()
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
@@ -765,6 +776,14 @@ class MainWindow(QMainWindow):
         iren.AddObserver(vtk.vtkCommand.MouseWheelForwardEvent, lambda *_: self._schedule_glyph_refresh())
         iren.AddObserver(vtk.vtkCommand.MouseWheelBackwardEvent, lambda *_: self._schedule_glyph_refresh())
         iren.AddObserver(vtk.vtkCommand.EndInteractionEvent, lambda *_: self._schedule_glyph_refresh())
+        # Theme B1: probe hover. We throttle to ~10 Hz via a lightweight
+        # timer so we don't pick on every mouse-move event (60+ Hz).
+        self._probe_throttle = QtCore.QTimer(self)
+        self._probe_throttle.setSingleShot(True)
+        self._probe_throttle.setInterval(80)
+        self._probe_throttle.timeout.connect(self._do_probe_pick)
+        iren.AddObserver(vtk.vtkCommand.MouseMoveEvent,
+                         lambda *_: self._on_probe_mouse_move())
 
         self.statusBar().showMessage("Ready.")
 
@@ -1241,6 +1260,11 @@ class MainWindow(QMainWindow):
         fbd_action = QAction("Free Body Diagram...", self)
         fbd_action.triggered.connect(self._show_free_body_diagram)
         tools_menu.addAction(fbd_action)
+        # Theme B: Probe tool. Hovering over nodes/elements while this is
+        # checked surfaces a tooltip with their results.
+        self.probe_mode_action = QAction("Probe Mode", self, checkable=True)
+        self.probe_mode_action.toggled.connect(self._toggle_probe_mode)
+        tools_menu.addAction(self.probe_mode_action)
         tools_menu.addSeparator()
         model_check_menu = tools_menu.addMenu("Model Check")
         mass_props_action = QAction("Mass Properties...", self)
@@ -1641,6 +1665,383 @@ class MainWindow(QMainWindow):
             QSettings("NodeRunner", "NodeRunner").setValue("display/units", self._units)
             self._refresh_status_widgets()
             self._update_status(f"Units set to {self._units}.")
+
+    # --- Theme B: result browser dock + probe + expression contour ---
+    def _build_result_browser_dock(self):
+        """Construct the right-side Results dock (hidden until OP2 loads)."""
+        from node_runner.dialogs import (
+            ResultBrowserDock, AnimationTimelineWidget, VectorOverlayWidget,
+        )
+        self._result_browser_dock = ResultBrowserDock(self)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._result_browser_dock)
+        self._result_browser_dock.entity_picked.connect(self._on_result_entity_picked)
+        self._result_browser_dock.expression_changed.connect(self._on_expression_changed)
+
+        # Animation timeline widget (added to the dock's titlebar/footer area
+        # by stacking it as a separate dock just below).
+        self._anim_timeline_widget = AnimationTimelineWidget(self)
+        self._anim_timeline_widget.phase_changed.connect(self._on_timeline_phase_changed)
+        anim_dock = QDockWidget("Animation", self)
+        anim_dock.setObjectName("AnimationDock")
+        anim_dock.setWidget(self._anim_timeline_widget)
+        anim_dock.hide()
+        self._anim_dock = anim_dock
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, anim_dock)
+        # Tabbed with the result browser by default.
+        self.tabifyDockWidget(self._result_browser_dock, anim_dock)
+
+        # Vector overlay widget similarly tabbed.
+        self._vector_overlay_widget = VectorOverlayWidget(self)
+        self._vector_overlay_widget.overlay_toggled.connect(self._on_vector_overlay_toggled)
+        self._vector_overlay_widget.scale_changed.connect(self._on_vector_overlay_scale)
+        vec_dock = QDockWidget("Vectors", self)
+        vec_dock.setObjectName("VectorDock")
+        vec_dock.setWidget(self._vector_overlay_widget)
+        vec_dock.hide()
+        self._vector_dock = vec_dock
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, vec_dock)
+        self.tabifyDockWidget(self._result_browser_dock, vec_dock)
+
+    def _show_result_panels(self, on: bool):
+        """Show/hide the Theme B docks based on whether an OP2 is loaded."""
+        for d in (self._result_browser_dock, self._anim_dock, self._vector_dock):
+            if d is None:
+                continue
+            if on:
+                d.show()
+            else:
+                d.hide()
+
+    def _populate_result_browser(self):
+        """Push current OP2 + model data into the result browser table model."""
+        if not self._result_browser_dock or not self.op2_results:
+            return
+        sc_id = self._current_subcase_id_for_results()
+        if sc_id is None:
+            return
+        sc = self.op2_results['subcases'].get(sc_id, {})
+        # Nodes table: NID, |U|, Ux, Uy, Uz
+        disps = sc.get('displacements', {}) or {}
+        if disps:
+            nids = sorted(disps.keys())
+            ux = np.array([disps[n][0] for n in nids])
+            uy = np.array([disps[n][1] for n in nids])
+            uz = np.array([disps[n][2] for n in nids])
+            mag = np.sqrt(ux * ux + uy * uy + uz * uz)
+            self._result_browser_dock.update_nodal_results(
+                ['NID', '|U|', 'Ux', 'Uy', 'Uz'],
+                {'NID': np.array(nids, dtype=int), '|U|': mag,
+                 'Ux': ux, 'Uy': uy, 'Uz': uz},
+            )
+        # Elements table: EID, vonMises, MaxPrin, MinPrin, Oxx, Oyy, Txy
+        stresses = sc.get('stresses', {}) or {}
+        if stresses:
+            eids = sorted(stresses.keys())
+            vm = np.array([stresses[e].get('von_mises', 0.0) for e in eids])
+            maxp = np.array([stresses[e].get('max_principal', 0.0) for e in eids])
+            minp = np.array([stresses[e].get('min_principal', 0.0) for e in eids])
+            oxx = np.array([stresses[e].get('oxx', 0.0) for e in eids])
+            oyy = np.array([stresses[e].get('oyy', 0.0) for e in eids])
+            txy = np.array([stresses[e].get('txy', 0.0) for e in eids])
+            self._result_browser_dock.update_element_results(
+                ['EID', 'vonMises', 'MaxPrin', 'MinPrin', 'Oxx', 'Oyy', 'Txy'],
+                {'EID': np.array(eids, dtype=int), 'vonMises': vm,
+                 'MaxPrin': maxp, 'MinPrin': minp,
+                 'Oxx': oxx, 'Oyy': oyy, 'Txy': txy},
+            )
+
+    def _current_subcase_id_for_results(self):
+        """Best-effort current subcase ID for the result browser."""
+        if not self.op2_results:
+            return None
+        # The existing UI tracks this via self.results_subcase_combo
+        try:
+            sc_id = self.results_subcase_combo.currentData()
+        except Exception:
+            sc_id = None
+        if sc_id is None:
+            keys = sorted(self.op2_results['subcases'].keys())
+            sc_id = keys[0] if keys else None
+        return sc_id
+
+    def _on_result_entity_picked(self, entity_type: str, entity_id: int):
+        """Double-click on a row -> highlight and zoom to the entity in 3D."""
+        if not self.current_generator:
+            return
+        try:
+            self._highlight_entities(entity_type, [entity_id])
+        except Exception:
+            pass
+
+    def _on_expression_changed(self, expr: str):
+        """Apply / clear a custom contour expression. Empty string -> revert."""
+        self._contour_expression = (expr or "").strip()
+        if self._contour_expression:
+            self._update_status(f"Contour expression: {self._contour_expression}")
+        else:
+            self._update_status("Contour expression cleared.")
+        # Trigger a re-render in results-color mode so the contour updates.
+        if self.color_mode == "results":
+            self._update_plot_visibility()
+
+    def _evaluate_contour_expression(self, eids):
+        """Evaluate the active expression against the current OP2 stresses
+        for the given element IDs. Returns a numpy array aligned to eids,
+        or None if no active expression / no OP2 loaded."""
+        if not self._contour_expression or not self.op2_results:
+            return None
+        sc_id = self._current_subcase_id_for_results()
+        if sc_id is None:
+            return None
+        sc = self.op2_results['subcases'].get(sc_id, {})
+        stresses = sc.get('stresses', {}) or {}
+        strains = sc.get('strains', {}) or {}
+        n = len(eids)
+        # Build named arrays. Missing values default to 0 so users get a
+        # sensible result even if some elements weren't in the OP2.
+        def col(d, key):
+            return np.array([d.get(int(e), {}).get(key, 0.0) for e in eids])
+        variables = {
+            'stress_vm':         col(stresses, 'von_mises'),
+            'stress_max_prin':   col(stresses, 'max_principal'),
+            'stress_min_prin':   col(stresses, 'min_principal'),
+            'oxx':               col(stresses, 'oxx'),
+            'oyy':               col(stresses, 'oyy'),
+            'txy':               col(stresses, 'txy'),
+            'strain_vm':         col(strains, 'von_mises'),
+            'strain_max_prin':   col(strains, 'max_principal'),
+            'strain_min_prin':   col(strains, 'min_principal'),
+            'exx':               col(strains, 'exx'),
+            'eyy':               col(strains, 'eyy'),
+            'gxy':               col(strains, 'gxy'),
+            'eid':               np.array(eids, dtype=float),
+        }
+        try:
+            from node_runner.expression import evaluate, ExpressionError
+            result = evaluate(self._contour_expression, variables)
+            if result.ndim == 0:
+                result = np.full(n, float(result))
+            return result.astype(float)
+        except Exception as exc:
+            self._update_status(f"Expression error: {exc}", is_error=True)
+            return None
+
+    # --- Probe tool (hover) ---
+
+    def _toggle_probe_mode(self, on: bool):
+        self._probe_enabled = bool(on)
+        if not on and self._probe_tooltip is not None:
+            self._probe_tooltip.hide()
+        self._update_status(f"Probe mode {'enabled' if on else 'disabled'}.")
+
+    def _ensure_probe_tooltip(self):
+        if self._probe_tooltip is None:
+            from PySide6.QtWidgets import QLabel
+            tip = QLabel(self)
+            tip.setWindowFlag(QtCore.Qt.ToolTip, True)
+            tip.setStyleSheet(
+                "QLabel { background: #1e1e2e; color: #cdd6f4; "
+                "padding: 6px 8px; border: 1px solid #45475a; "
+                "font-family: monospace; font-size: 11px; }"
+            )
+            tip.hide()
+            self._probe_tooltip = tip
+        return self._probe_tooltip
+
+    def _show_probe_tip(self, screen_pos, lines: list[str]):
+        tip = self._ensure_probe_tooltip()
+        tip.setText("\n".join(lines))
+        tip.adjustSize()
+        tip.move(screen_pos.x() + 16, screen_pos.y() + 16)
+        tip.show()
+
+    def _on_probe_mouse_move(self):
+        """Re-arm the probe throttle. The actual pick happens in _do_probe_pick
+        after the user has stopped moving for ~80 ms - keeps things smooth."""
+        if not self._probe_enabled:
+            return
+        self._probe_throttle.start()
+
+    def _do_probe_pick(self):
+        """Run a point + cell pick at the current cursor position; show a
+        tooltip if anything was hit."""
+        if not self._probe_enabled or not self.current_generator:
+            return
+        try:
+            iren = self.plotter.interactor
+            x, y = iren.GetEventPosition()
+            renderer = self.plotter.renderer
+
+            # Try element pick first (cells visible on top); fall back to node
+            cell_picker = vtk.vtkCellPicker()
+            cell_picker.SetTolerance(0.005)
+            cell_picker.Pick(x, y, 0, renderer)
+            cell_id = cell_picker.GetCellId()
+            picked_actor = cell_picker.GetActor()
+            if picked_actor and cell_id != -1:
+                dataset = picked_actor.GetMapper().GetInput()
+                if dataset and 'EID' in dataset.cell_data:
+                    eid = int(dataset.cell_data['EID'][cell_id])
+                    self._probe_element(eid)
+                    return
+
+            # Fallback to node pick
+            point_picker = vtk.vtkPointPicker()
+            point_picker.Pick(x, y, 0, renderer)
+            point_id = point_picker.GetPointId()
+            picked_actor = point_picker.GetActor()
+            if picked_actor and point_id != -1:
+                dataset = picked_actor.GetMapper().GetInput()
+                if dataset and 'vtkOriginalPointIds' in dataset.point_data:
+                    orig = int(dataset.point_data['vtkOriginalPointIds'][point_id])
+                    if 0 <= orig < len(self.current_node_ids_sorted):
+                        self._probe_node(self.current_node_ids_sorted[orig])
+                        return
+
+            # Nothing hit - hide tooltip if it was up
+            if self._probe_tooltip is not None:
+                self._probe_tooltip.hide()
+        except Exception:
+            # Probe is best-effort; never let a hover failure break interaction.
+            pass
+
+    def _probe_node(self, nid: int):
+        if not self._probe_enabled or not self.current_generator:
+            return
+        if nid not in self.current_generator.model.nodes:
+            return
+        xyz = self.current_generator.model.nodes[nid].get_position()
+        lines = [f"Node {nid}",
+                 f"  xyz = ({xyz[0]:.4g}, {xyz[1]:.4g}, {xyz[2]:.4g})"]
+        if self.op2_results:
+            sc_id = self._current_subcase_id_for_results()
+            sc = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
+            disp = sc.get('displacements', {}).get(nid)
+            if disp:
+                mag = (disp[0] ** 2 + disp[1] ** 2 + disp[2] ** 2) ** 0.5
+                lines.append(f"  |U| = {mag:.4g}")
+                lines.append(f"  U   = ({disp[0]:.4g}, {disp[1]:.4g}, {disp[2]:.4g})")
+        from PySide6.QtGui import QCursor
+        self._show_probe_tip(QCursor.pos(), lines)
+
+    def _probe_element(self, eid: int):
+        if not self._probe_enabled or not self.current_generator:
+            return
+        elem = self.current_generator.model.elements.get(eid)
+        if elem is None:
+            return
+        lines = [f"Element {eid} ({elem.type})", f"  PID = {elem.pid}"]
+        if self.op2_results:
+            sc_id = self._current_subcase_id_for_results()
+            sc = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
+            s = sc.get('stresses', {}).get(eid)
+            if s:
+                lines.append(f"  vonMises = {s.get('von_mises', 0.0):.4g}")
+                lines.append(f"  MaxPrin  = {s.get('max_principal', 0.0):.4g}")
+                lines.append(f"  MinPrin  = {s.get('min_principal', 0.0):.4g}")
+        from PySide6.QtGui import QCursor
+        self._show_probe_tip(QCursor.pos(), lines)
+
+    # --- Vector overlay handlers ---
+
+    def _on_vector_overlay_toggled(self, key: str, on: bool):
+        if not self.current_generator or not self.op2_results:
+            return
+        actor_name = f"vec_overlay_{key}"
+        self.plotter.remove_actor(actor_name, render=False)
+        if not on:
+            self._request_render()
+            return
+        sc_id = self._current_subcase_id_for_results()
+        sc = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
+        scale = self._vector_overlay_widget.scale_spin.value()
+        diag = max(self.current_grid.length, 1e-6) if self.current_grid is not None else 1.0
+        length = scale * diag
+
+        if key == 'disp':
+            disps = sc.get('displacements', {}) or {}
+            if not disps:
+                return
+            nids = sorted(disps.keys())
+            pts, vecs = [], []
+            for nid in nids:
+                if nid in self.current_generator.model.nodes:
+                    pts.append(self.current_generator.model.nodes[nid].get_position())
+                    d = disps[nid]
+                    vecs.append([d[0], d[1], d[2]])
+            if not pts:
+                return
+            arr_pts = np.array(pts)
+            arr_vecs = np.array(vecs)
+            mags = np.linalg.norm(arr_vecs, axis=1)
+            mmax = mags.max() if mags.size else 1.0
+            if mmax < 1e-30:
+                return
+            arr_vecs = arr_vecs * (length / mmax)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#89b4fa', name=actor_name)
+        elif key == 'reac':
+            spcf = sc.get('spc_forces', {}) or {}
+            if not spcf:
+                return
+            nids = sorted(spcf.keys())
+            pts, vecs = [], []
+            for nid in nids:
+                if nid in self.current_generator.model.nodes:
+                    pts.append(self.current_generator.model.nodes[nid].get_position())
+                    f = spcf[nid]
+                    vecs.append([f[0], f[1], f[2]])
+            if not pts:
+                return
+            arr_pts = np.array(pts); arr_vecs = np.array(vecs)
+            mags = np.linalg.norm(arr_vecs, axis=1)
+            mmax = mags.max() if mags.size else 1.0
+            if mmax < 1e-30:
+                return
+            arr_vecs = arr_vecs * (length / mmax)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#fab387', name=actor_name)
+        elif key == 'prin':
+            stresses = sc.get('stresses', {}) or {}
+            if not stresses or self.current_grid is None:
+                return
+            # Place arrows at element centroids; magnitude = max-principal,
+            # direction approximated as +X (we don't have full tensor here).
+            cell_data = self.current_grid.cell_data.get('EID') if hasattr(self.current_grid, 'cell_data') else None
+            if cell_data is None:
+                return
+            centers = self.current_grid.cell_centers().points
+            pts, vecs = [], []
+            for i, eid in enumerate(cell_data):
+                s = stresses.get(int(eid))
+                if not s:
+                    continue
+                pts.append(centers[i])
+                v = s.get('max_principal', 0.0)
+                vecs.append([v, 0.0, 0.0])
+            if not pts:
+                return
+            arr_pts = np.array(pts); arr_vecs = np.array(vecs)
+            mags = np.abs(arr_vecs[:, 0])
+            mmax = mags.max() if mags.size else 1.0
+            if mmax < 1e-30:
+                return
+            arr_vecs = arr_vecs * (length / mmax)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#f38ba8', name=actor_name)
+        self._request_render()
+
+    def _on_vector_overlay_scale(self, _new_scale):
+        # Re-issue all currently-on overlays so their length scale updates.
+        if self._vector_overlay_widget is None:
+            return
+        for key in ('disp', 'prin', 'reac'):
+            cb = getattr(self._vector_overlay_widget, f"check_{key}")
+            if cb.isChecked():
+                self._on_vector_overlay_toggled(key, True)
+
+    def _on_timeline_phase_changed(self, phase: float):
+        """User scrubbed/played the animation timeline. Update mode-shape phase."""
+        self._anim_phase = float(phase) * 2 * math.pi
+        # Reuse existing animation tick logic
+        self._on_animation_tick()
 
     # --- Cross-section controls ---
     def _open_cross_section_dialog(self):
@@ -9304,6 +9705,9 @@ class MainWindow(QMainWindow):
             self.op2_results = load_op2_results(filepath)
             self.results_widget.setVisible(True)
             self._populate_results_combos()
+            # Theme B: surface the result browser dock and seed it with this OP2.
+            self._populate_result_browser()
+            self._show_result_panels(True)
             subcases = sorted(self.op2_results['subcases'].keys())
             self._update_status(f"Loaded results: {os.path.basename(filepath)} "
                                f"({len(subcases)} subcases)")

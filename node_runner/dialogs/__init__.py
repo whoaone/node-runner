@@ -51,3 +51,6 @@ from node_runner.dialogs.loads_extra import (
     CreateMpcDialog, CreateRbarDialog, CreateRbe1Dialog,
     CreateRsplineDialog, CreateBoltDialog,
 )
+from node_runner.dialogs.result_browser import (
+    ResultBrowserDock, AnimationTimelineWidget, VectorOverlayWidget,
+)

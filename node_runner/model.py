@@ -3782,6 +3782,33 @@ def load_op2_results(filepath):
                             'von_mises': float(row[7]) if len(row) > 7 else 0.0,
                         }
 
+        # --- Element Strains (Theme B6) ---
+        sc_data['strains'] = {}
+        for strain_name in ('cquad4_strain', 'ctria3_strain'):
+            strain_dict = getattr(op2, strain_name, {})
+            if sc_id not in strain_dict:
+                continue
+            strain_obj = strain_dict[sc_id]
+            eids = strain_obj.element_node[:, 0]
+            nodes_col = strain_obj.element_node[:, 1]
+            sdata = strain_obj.data
+            slast = sdata[-1]
+            for i in range(len(eids)):
+                if nodes_col[i] != 0:
+                    continue
+                eid = int(eids[i])
+                if eid in sc_data['strains']:
+                    continue
+                row = slast[i]
+                sc_data['strains'][eid] = {
+                    'exx': float(row[1]) if len(row) > 1 else 0.0,
+                    'eyy': float(row[2]) if len(row) > 2 else 0.0,
+                    'gxy': float(row[3]) if len(row) > 3 else 0.0,
+                    'max_principal': float(row[5]) if len(row) > 5 else 0.0,
+                    'min_principal': float(row[6]) if len(row) > 6 else 0.0,
+                    'von_mises': float(row[7]) if len(row) > 7 else 0.0,
+                }
+
         # --- Grid Point Forces ---
         if sc_id in gpf_dict:
             gpf_obj = gpf_dict[sc_id]
