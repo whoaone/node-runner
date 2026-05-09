@@ -5341,7 +5341,27 @@ class MainWindow(QMainWindow):
 
         self.current_node_ids_sorted = sorted(model.nodes.keys())
         node_map = {nid: i for i, nid in enumerate(self.current_node_ids_sorted)}
-        node_coords = np.array([model.nodes[nid].get_position() for nid in self.current_node_ids_sorted])
+        # Build node coordinates with periodic UI yield. On a 1M-node model
+        # the naive list comprehension stalls the main thread for 5-15s
+        # and Windows marks the app "Not Responding"; batching with
+        # processEvents keeps it alive.
+        from PySide6.QtWidgets import QApplication
+        n_nodes = len(self.current_node_ids_sorted)
+        if n_nodes > 50_000:
+            self._update_status(f"Loading {n_nodes:,} nodes...")
+            QApplication.processEvents()
+            _coords_list = []
+            _model_nodes = model.nodes
+            BATCH = 100_000
+            for i, nid in enumerate(self.current_node_ids_sorted):
+                _coords_list.append(_model_nodes[nid].get_position())
+                if i and i % BATCH == 0:
+                    self._update_status(f"Loading nodes: {i:,} / {n_nodes:,}")
+                    QApplication.processEvents()
+            node_coords = np.array(_coords_list)
+            del _coords_list
+        else:
+            node_coords = np.array([model.nodes[nid].get_position() for nid in self.current_node_ids_sorted])
 
         nodes_used_by_elements = set()
         shells_conn, trias_conn, beams_conn, rods_conn, bush_conn = [], [], [], [], []
@@ -5359,7 +5379,26 @@ class MainWindow(QMainWindow):
         gap_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
 
         all_elements = {**model.elements, **model.rigid_elements}
-        for eid, elem in all_elements.items():
+
+        # Heavy Python loop below: iterating > 1M elements would lock the
+        # UI thread for tens of seconds and Windows would mark the app as
+        # "Not Responding". Yield to Qt's event loop every YIELD_EVERY
+        # iterations so the window keeps painting and the user can see
+        # progress.
+        from PySide6.QtWidgets import QApplication
+        n_elems = len(all_elements)
+        YIELD_EVERY = 50_000
+        _heavy = n_elems > YIELD_EVERY
+        if _heavy:
+            self._update_status(f"Building scene from {n_elems:,} elements...")
+            QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+        for _idx, (eid, elem) in enumerate(all_elements.items()):
+            if _heavy and _idx and _idx % YIELD_EVERY == 0:
+                self._update_status(
+                    f"Building scene: {_idx:,} / {n_elems:,} elements...",
+                )
+                QApplication.processEvents()
             try:
                 # RBE2/RBE3 don't have .nodes - get node IDs via independent/dependent
                 if elem.type in ['RBE2', 'RBE3']:
@@ -5405,6 +5444,13 @@ class MainWindow(QMainWindow):
                     gap_data['PID'].append(elem.pid); gap_data['EID'].append(eid); gap_data['type'].append(elem.type); gap_data['is_shell'].append(0)
             except KeyError as e:
                 print(f"Warning: Skipping element {eid} due to missing node {e}.")
+
+        if _heavy:
+            QApplication.restoreOverrideCursor()
+            self._update_status(
+                f"Scene built: {n_elems:,} elements. Rendering...",
+            )
+            QApplication.processEvents()
 
         # PLOTELs are rendered separately but their nodes should not appear as free nodes
         for eid, elem in model.plotels.items():
