@@ -940,26 +940,51 @@ class MirrorElementsCommand(Command):
 
 
 class CopyElementsCommand(Command):
-    """Copy selected elements with a translation (and optional rotation).
+    """Copy selected elements with a translation and optional rotation.
 
-    Each element's nodes are duplicated (new GRIDs), the new nodes are
-    transformed, and a new element is created using them. Original elements
-    are untouched.
+    The transform applied to each duplicated node is rotate-then-translate:
+    first rotate `angle_deg` around `axis` (X/Y/Z) at `center`, then add
+    `translate`. Original elements/nodes are untouched.
     """
 
     def __init__(self, eids: list[int],
                  translate: tuple[float, float, float] = (0.0, 0.0, 0.0),
+                 axis: str = 'Z',
+                 angle_deg: float = 0.0,
+                 center: tuple[float, float, float] = (0.0, 0.0, 0.0),
                  weld_tol: float = 0.0):
         self._eids = list(eids)
         self._translate = (float(translate[0]), float(translate[1]), float(translate[2]))
+        self._axis = axis.upper() if isinstance(axis, str) else 'Z'
+        self._angle_deg = float(angle_deg)
+        self._center = (float(center[0]), float(center[1]), float(center[2]))
         self._weld_tol = float(weld_tol)
         self._created_nids: list[int] = []
         self._created_eids: list[int] = []
 
+    @staticmethod
+    def _rotation_matrix(axis: str, angle_rad: float):
+        import math
+        c, s = math.cos(angle_rad), math.sin(angle_rad)
+        if axis == 'X':
+            return [[1.0, 0.0, 0.0],
+                    [0.0,  c,  -s],
+                    [0.0,  s,   c]]
+        if axis == 'Y':
+            return [[ c, 0.0,  s],
+                    [0.0, 1.0, 0.0],
+                    [-s, 0.0,  c]]
+        return [[ c, -s, 0.0],
+                [ s,  c, 0.0],
+                [0.0, 0.0, 1.0]]
+
     def execute(self, model) -> None:
+        import math
         self._created_nids.clear()
         self._created_eids.clear()
         tx, ty, tz = self._translate
+        cx, cy, cz = self._center
+        R = self._rotation_matrix(self._axis, math.radians(self._angle_deg))
 
         used: set = set()
         for eid in self._eids:
@@ -972,7 +997,12 @@ class CopyElementsCommand(Command):
         nid_map: dict[int, int] = {}
         for nid in used:
             p = list(model.nodes[nid].get_position())
-            new_xyz = [p[0] + tx, p[1] + ty, p[2] + tz]
+            # Rotate around center, then translate.
+            dx, dy, dz = p[0] - cx, p[1] - cy, p[2] - cz
+            rx = R[0][0] * dx + R[0][1] * dy + R[0][2] * dz
+            ry = R[1][0] * dx + R[1][1] * dy + R[1][2] * dz
+            rz = R[2][0] * dx + R[2][1] * dy + R[2][2] * dz
+            new_xyz = [rx + cx + tx, ry + cy + ty, rz + cz + tz]
             new_nid = next_nid; next_nid += 1
             model.add_grid(new_nid, new_xyz)
             nid_map[nid] = new_nid

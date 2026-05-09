@@ -44,7 +44,7 @@ from node_runner.dialogs.command_palette import (
 from node_runner.dialogs.cross_section import CrossSectionDialog
 from node_runner.dialogs.mesh_edit import (
     SmoothNodesDialog, MirrorElementsDialog, CopyElementsDialog,
-    CombineTriasDialog,
+    CombineTriasDialog, InsertEdgeNodeDialog,
 )
 from node_runner.dialogs.loads_extra import (
     CreatePload1Dialog, CreatePload2Dialog, CreateSpcdDialog,

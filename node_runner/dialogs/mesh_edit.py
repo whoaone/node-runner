@@ -130,17 +130,17 @@ class MirrorElementsDialog(QDialog):
 
 
 class CopyElementsDialog(QDialog):
-    """Translation vector (dx, dy, dz) for the element-copy command."""
+    """Translation vector + optional rotation about an axis at a center."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Copy Elements")
-        self.setMinimumWidth(320)
+        self.setMinimumWidth(360)
         layout = QVBoxLayout(self)
 
         layout.addWidget(QLabel(
-            "Duplicate the selected elements (with their nodes) and "
-            "translate the copies by the offset below."
+            "Duplicate the selected elements (with their nodes), translate, "
+            "and optionally rotate. The order is rotate-then-translate."
         ))
 
         grid = QGridLayout()
@@ -156,6 +156,29 @@ class CopyElementsDialog(QDialog):
             self.spins.append(sp)
         layout.addLayout(grid)
 
+        rot_box = QGroupBox("Rotation (optional)")
+        rot_layout = QGridLayout(rot_box)
+        rot_layout.addWidget(QLabel("Axis:"), 0, 0)
+        self.axis_combo = QComboBox()
+        self.axis_combo.addItems(["X", "Y", "Z"])
+        rot_layout.addWidget(self.axis_combo, 0, 1)
+        rot_layout.addWidget(QLabel("Angle (deg):"), 1, 0)
+        self.angle_spin = QDoubleSpinBox()
+        self.angle_spin.setRange(-360.0, 360.0)
+        self.angle_spin.setDecimals(3)
+        self.angle_spin.setValue(0.0)
+        rot_layout.addWidget(self.angle_spin, 1, 1)
+        rot_layout.addWidget(QLabel("Center xyz:"), 2, 0)
+        center_row = QHBoxLayout()
+        self.center_spins = []
+        for default in (0.0, 0.0, 0.0):
+            sp = QDoubleSpinBox()
+            sp.setRange(-1e9, 1e9); sp.setDecimals(6); sp.setValue(default)
+            center_row.addWidget(sp)
+            self.center_spins.append(sp)
+        rot_layout.addLayout(center_row, 2, 1)
+        layout.addWidget(rot_box)
+
         row = QHBoxLayout()
         row.addStretch(1)
         cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
@@ -166,6 +189,61 @@ class CopyElementsDialog(QDialog):
     @property
     def translation(self):
         return tuple(float(s.value()) for s in self.spins)
+
+    @property
+    def rotation_axis(self):
+        return self.axis_combo.currentText()
+
+    @property
+    def rotation_angle_deg(self):
+        return float(self.angle_spin.value())
+
+    @property
+    def rotation_center(self):
+        return tuple(float(s.value()) for s in self.center_spins)
+
+
+class InsertEdgeNodeDialog(QDialog):
+    """Two node IDs defining the edge to split, plus the resulting position
+    (currently always the midpoint - parameter UI reserved for future)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Insert Node on Edge")
+        self.setMinimumWidth(340)
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            "Insert a node at the midpoint of the edge defined by two "
+            "existing nodes. Every element sharing that edge is split so "
+            "the new node is honored on both sides."
+        ))
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Edge node 1:"), 0, 0)
+        self.n1_spin = QSpinBox()
+        self.n1_spin.setRange(1, 999_999_999)
+        grid.addWidget(self.n1_spin, 0, 1)
+        grid.addWidget(QLabel("Edge node 2:"), 1, 0)
+        self.n2_spin = QSpinBox()
+        self.n2_spin.setRange(1, 999_999_999)
+        grid.addWidget(self.n2_spin, 1, 1)
+        layout.addLayout(grid)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        ok = QPushButton("Insert"); ok.setDefault(True); ok.clicked.connect(self.accept)
+        row.addWidget(cancel); row.addWidget(ok)
+        layout.addLayout(row)
+
+    @property
+    def n1(self):
+        return int(self.n1_spin.value())
+
+    @property
+    def n2(self):
+        return int(self.n2_spin.value())
 
 
 class CombineTriasDialog(QDialog):

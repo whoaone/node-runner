@@ -1055,6 +1055,9 @@ class MainWindow(QMainWindow):
         copy_elem_action = QAction("Copy Elements...", self)
         copy_elem_action.triggered.connect(self._open_copy_elements_tool)
         modify_menu.addAction(copy_elem_action)
+        insert_edge_node_action = QAction("Insert Node on Edge...", self)
+        insert_edge_node_action.triggered.connect(self._open_insert_edge_node_tool)
+        modify_menu.addAction(insert_edge_node_action)
 
         # Section 4: Mesh Operations (moved from Mesh menu)
         model_menu.addSeparator()
@@ -2003,24 +2006,57 @@ class MainWindow(QMainWindow):
             stresses = sc.get('stresses', {}) or {}
             if not stresses or self.current_grid is None:
                 return
-            # Place arrows at element centroids; magnitude = max-principal,
-            # direction approximated as +X (we don't have full tensor here).
             cell_data = self.current_grid.cell_data.get('EID') if hasattr(self.current_grid, 'cell_data') else None
             if cell_data is None:
                 return
             centers = self.current_grid.cell_centers().points
+
+            # Compute the in-plane principal direction at each element from
+            # the (oxx, oyy, txy) stress tensor and re-express it in world
+            # coordinates using the element's local plane normal. The shell
+            # element's local x is taken as (n2 - n1); local z is the face
+            # normal; local y closes the right-hand triad.
             pts, vecs = [], []
             for i, eid in enumerate(cell_data):
                 s = stresses.get(int(eid))
                 if not s:
                     continue
+                elem = self.current_generator.model.elements.get(int(eid))
+                if elem is None or elem.type not in ('CQUAD4', 'CMEMBRAN', 'CTRIA3'):
+                    continue
+                try:
+                    nlist = elem.nodes
+                    p0 = np.asarray(self.current_generator.model.nodes[nlist[0]].get_position())
+                    p1 = np.asarray(self.current_generator.model.nodes[nlist[1]].get_position())
+                    p2 = np.asarray(self.current_generator.model.nodes[nlist[2]].get_position())
+                except (KeyError, IndexError):
+                    continue
+                ex = p1 - p0
+                ex_n = np.linalg.norm(ex)
+                if ex_n < 1e-12:
+                    continue
+                ex = ex / ex_n
+                ez = np.cross(ex, p2 - p0)
+                ez_n = np.linalg.norm(ez)
+                if ez_n < 1e-12:
+                    continue
+                ez = ez / ez_n
+                ey = np.cross(ez, ex)
+                # In-plane stress tensor (oxx, oyy, txy) -> principal angle
+                # measured from ex toward ey: theta = 0.5 * atan2(2*txy, oxx-oyy)
+                oxx = float(s.get('oxx', 0.0))
+                oyy = float(s.get('oyy', 0.0))
+                txy = float(s.get('txy', 0.0))
+                denom = oxx - oyy
+                theta = 0.5 * math.atan2(2.0 * txy, denom) if abs(denom) + abs(txy) > 1e-30 else 0.0
+                d_local = math.cos(theta) * ex + math.sin(theta) * ey
+                mag = float(s.get('max_principal', 0.0))
                 pts.append(centers[i])
-                v = s.get('max_principal', 0.0)
-                vecs.append([v, 0.0, 0.0])
+                vecs.append([d_local[0] * mag, d_local[1] * mag, d_local[2] * mag])
             if not pts:
                 return
             arr_pts = np.array(pts); arr_vecs = np.array(vecs)
-            mags = np.abs(arr_vecs[:, 0])
+            mags = np.linalg.norm(arr_vecs, axis=1)
             mmax = mags.max() if mags.size else 1.0
             if mmax < 1e-30:
                 return
@@ -2769,6 +2805,9 @@ class MainWindow(QMainWindow):
         if not dlg.exec():
             return
         self._copy_translate = dlg.translation
+        self._copy_axis = dlg.rotation_axis
+        self._copy_angle = dlg.rotation_angle_deg
+        self._copy_center = dlg.rotation_center
         self._start_selection(
             'Element', self._eligible_eids_all(),
             self._on_copy_accept, self._build_select_by_data(),
@@ -2781,11 +2820,50 @@ class MainWindow(QMainWindow):
         if not selected:
             self._update_status("Copy cancelled: no elements selected.")
             return
-        cmd = CopyElementsCommand(selected, translate=self._copy_translate)
+        cmd = CopyElementsCommand(
+            selected,
+            translate=self._copy_translate,
+            axis=self._copy_axis,
+            angle_deg=self._copy_angle,
+            center=self._copy_center,
+        )
         self.command_manager.execute(cmd, self.current_generator.model)
+        rot_note = (f", rotate {self._copy_angle:.2f} deg about {self._copy_axis}"
+                    if abs(self._copy_angle) > 1e-9 else "")
         self._update_status(
             f"Copied {len(cmd._created_eids)} element(s) by "
-            f"{self._copy_translate}."
+            f"{self._copy_translate}{rot_note}."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _open_insert_edge_node_tool(self):
+        if not self.current_generator or not self.current_generator.model.nodes:
+            QMessageBox.warning(self, "No Nodes", "The model has no nodes.")
+            return
+        from node_runner.dialogs import InsertEdgeNodeDialog
+        from node_runner.commands import InsertEdgeNodeCommand
+        dlg = InsertEdgeNodeDialog(self)
+        if not dlg.exec():
+            return
+        n1, n2 = dlg.n1, dlg.n2
+        if n1 == n2:
+            QMessageBox.warning(self, "Same node",
+                                "Edge endpoints must be two different node IDs.")
+            return
+        if n1 not in self.current_generator.model.nodes or \
+                n2 not in self.current_generator.model.nodes:
+            QMessageBox.warning(self, "Unknown nodes",
+                                f"Node {n1} or {n2} not found in the model.")
+            return
+        cmd = InsertEdgeNodeCommand(n1, n2)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        if cmd._created_nid is None:
+            self._update_status("Edge insert: no elements share that edge.",
+                                is_error=True)
+            return
+        self._update_status(
+            f"Inserted node {cmd._created_nid} on edge ({n1}-{n2}); "
+            f"split {len(cmd._old_elements)} element(s)."
         )
         self._update_viewer(self.current_generator, reset_camera=False)
 
@@ -5882,6 +5960,19 @@ class MainWindow(QMainWindow):
             self._current_selection_nids = list(entity_ids) if entity_ids else []
         elif entity_type == 'Element':
             self._current_selection_eids = list(entity_ids) if entity_ids else []
+
+        # Theme B3: sync to result browser. When a single entity is highlighted
+        # and the dock is up, scroll the matching row into view + select it.
+        if (self._result_browser_dock is not None
+                and self._result_browser_dock.isVisible()
+                and entity_ids and len(entity_ids) == 1):
+            try:
+                if entity_type == 'Node':
+                    self._result_browser_dock.select_node(int(entity_ids[0]))
+                elif entity_type == 'Element':
+                    self._result_browser_dock.select_element(int(entity_ids[0]))
+            except Exception:
+                pass
 
         if not entity_ids or not self.current_generator or not self.current_grid:
             self.plotter.render()
