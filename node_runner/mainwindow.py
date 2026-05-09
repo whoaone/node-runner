@@ -275,9 +275,15 @@ class MainWindow(QMainWindow):
         self._ghost_mode_enabled = _settings.value(
             "render/ghost_mode", False, type=bool,
         )
-        self._parallel_parsing_enabled = _settings.value(
-            "import/parallel_parsing", False, type=bool,
-        )
+        # NOTE: Parallel parsing was an experimental opt-in. It turned out
+        # to be slower than single-threaded due to GIL contention on
+        # pyNastran's pure-Python card parsing, and a stale "True" left
+        # in the user's QSettings caused massive import hangs. We reset
+        # the flag to False on every launch and ignore it in the worker.
+        # The flag stays in QSettings so existing reads don't crash.
+        self._parallel_parsing_enabled = False
+        if _settings.value("import/parallel_parsing", False, type=bool):
+            _settings.setValue("import/parallel_parsing", False)
 
         self.command_manager = CommandManager(max_history=20)
         self.subcases = []  # Case control deck subcase definitions (legacy)
@@ -337,11 +343,15 @@ class MainWindow(QMainWindow):
     def initUI(self):
         self._create_menu_bar()
         self._build_status_widgets()
+        # Action registry is built AFTER the menu so we can index every
+        # QAction the menu created. The Ctrl+P shortcut is owned by
+        # self.command_palette_action under Tools (set via setShortcut),
+        # which makes it both discoverable in the menu and reachable via
+        # the keyboard. We do not also install a stand-alone QShortcut -
+        # having two bindings on the same key produces an "ambiguous
+        # shortcut" warning and either path can win unpredictably.
         self._action_registry = self._build_action_registry()
-        from node_runner.dialogs import install_command_palette_shortcut
-        self._command_palette_shortcut = install_command_palette_shortcut(
-            self, lambda: self._action_registry,
-        )
+        self._command_palette_shortcut = None  # legacy attribute, kept for tests
         self._build_result_browser_dock()
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1273,6 +1283,15 @@ class MainWindow(QMainWindow):
         self.probe_mode_action = QAction("Probe Mode", self, checkable=True)
         self.probe_mode_action.toggled.connect(self._toggle_probe_mode)
         tools_menu.addAction(self.probe_mode_action)
+        # Command palette - same shortcut as install_command_palette_shortcut,
+        # but having a menu entry makes it discoverable and provides a
+        # second way to fire it if the global shortcut gets eaten by a
+        # focused widget.
+        tools_menu.addSeparator()
+        self.command_palette_action = QAction("Command Palette...", self)
+        self.command_palette_action.setShortcut("Ctrl+P")
+        self.command_palette_action.triggered.connect(self._open_command_palette)
+        tools_menu.addAction(self.command_palette_action)
         tools_menu.addSeparator()
         # Femap-style unit conversion - the tool itself is unitless, but
         # this rescales the whole model by user-supplied factors.
@@ -1419,13 +1438,16 @@ class MainWindow(QMainWindow):
         self.adaptive_lod_action.setChecked(self._adaptive_lod_enabled)
         self.adaptive_lod_action.toggled.connect(self._toggle_adaptive_lod)
         settings_menu.addAction(self.adaptive_lod_action)
-        # Phase 4.3: parallel BDF parsing (experimental, opt-in).
+        # Parallel BDF parsing toggle has been retired (was slower than
+        # single-threaded due to GIL contention; left stale-True values
+        # in some users' QSettings causing huge import hangs). The
+        # action is kept as a hidden no-op so any external code or
+        # registry references don't NoneType-crash.
         self.parallel_parsing_action = QAction(
-            "Parallel BDF Parsing (experimental)", self, checkable=True,
+            "Parallel BDF Parsing (retired)", self, checkable=True,
         )
-        self.parallel_parsing_action.setChecked(self._parallel_parsing_enabled)
+        self.parallel_parsing_action.setVisible(False)
         self.parallel_parsing_action.toggled.connect(self._toggle_parallel_parsing)
-        settings_menu.addAction(self.parallel_parsing_action)
 
         help_menu = menu_bar.addMenu("&Help")
         about_action = QAction("&About...", self)
@@ -1683,6 +1705,15 @@ class MainWindow(QMainWindow):
             QSettings("NodeRunner", "NodeRunner").setValue("display/units", self._units)
             self._refresh_status_widgets()
             self._update_status(f"Units set to {self._units}.")
+
+    def _open_command_palette(self):
+        """Open the command palette imperatively. Same path as Ctrl+P."""
+        from node_runner.dialogs import CommandPaletteDialog
+        registry = getattr(self, '_action_registry', None) or []
+        if not registry:
+            return
+        dlg = CommandPaletteDialog(registry, parent=self)
+        dlg.exec()
 
     # --- Theme B: result browser dock + probe + expression contour ---
     def _build_result_browser_dock(self):

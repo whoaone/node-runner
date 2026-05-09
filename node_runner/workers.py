@@ -40,7 +40,6 @@ class BdfReadWorker(QObject):
     @Slot()
     def run(self):
         try:
-            from PySide6.QtCore import QSettings
             from node_runner.model import (
                 NastranModelGenerator, detect_bdf_field_format,
             )
@@ -49,22 +48,20 @@ class BdfReadWorker(QObject):
             if self._cancelled:
                 return
 
-            settings = QSettings("NodeRunner", "NodeRunner")
-            use_parallel = bool(settings.value(
-                "import/parallel_parsing", False, type=bool,
-            ))
-
+            # NOTE: the parallel parser path (model._read_bdf_parallel) is
+            # currently SLOWER than the single-threaded one for typical
+            # files - pyNastran's card parsing is mostly pure Python and
+            # the GIL serializes the workers, so 4 threads end up
+            # competing for the same lock and fighting cache locality.
+            # The path is kept in model.py for future improvement, but
+            # the worker does not invoke it. Re-enabling it requires
+            # replacing pyNastran's Python parsers with something that
+            # actually releases the GIL during the bulk-data scan.
+            self.progress.emit("Parsing BDF...")
             generator = NastranModelGenerator()
-            if use_parallel:
-                self.progress.emit("Parsing BDF (parallel, experimental)...")
-                model, lenient_result = NastranModelGenerator._read_bdf_parallel(
-                    self._filepath,
-                )
-            else:
-                self.progress.emit("Parsing BDF...")
-                model, lenient_result = NastranModelGenerator._read_bdf_robust(
-                    self._filepath,
-                )
+            model, lenient_result = NastranModelGenerator._read_bdf_robust(
+                self._filepath,
+            )
             generator.model = model
             if self._cancelled:
                 return

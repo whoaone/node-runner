@@ -51,8 +51,11 @@ class TestMainWindow:
         # Femap-style: units field hides itself when no hint set
         assert main_window._status_units_lbl.text() == ""
 
-    def test_command_palette_shortcut(self, main_window):
-        assert main_window._command_palette_shortcut is not None
+    def test_command_palette_action_with_shortcut(self, main_window):
+        # Command palette is reached via Tools > Command Palette... with
+        # Ctrl+P bound to the action (not a separate QShortcut).
+        assert main_window.command_palette_action is not None
+        assert main_window.command_palette_action.shortcut().toString() == "Ctrl+P"
 
     def test_action_registry_populated(self, main_window):
         # We harvested at least 100 actions from the menu
