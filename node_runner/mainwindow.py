@@ -224,7 +224,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Node Runner v3.0.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
-        self.node_size, self.node_color = 5, '#00FF00'
+        # Phase 3: smaller default size and theme accent (Catppuccin blue),
+        # paired with vtkPointGaussianMapper-rendered nodes for a crisp,
+        # anti-aliased look instead of the old neon-green blob.
+        from node_runner.theme import ACCENT as _THEME_ACCENT
+        self.node_size, self.node_color = 3, _THEME_ACCENT
         self.edge_color, self.edge_width = '#000000', 1
         self.beam_width = 2
         self.elem_shrink = 0.0
@@ -1342,6 +1346,55 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._update_status(f"File save failed: {e}", is_error=True)
             QMessageBox.critical(self, "Error", f"Could not save file: {e}")
+
+    # --- Phase 3: Gaussian-mapped node rendering ---
+    def _add_node_cloud(self, node_points, name='nodes_actor'):
+        """Render a node cloud with vtkPointGaussianMapper.
+
+        The Gaussian mapper splats each point as a smooth, anti-aliased
+        circular gaussian. Result: crisp dots that look "printed" instead
+        of the rectangular GL_POINTS blob look produced by raw add_points.
+
+        We still go through PyVista's add_points() to register the actor in
+        the plotter's name registry (so remove_actor('nodes_actor') keeps
+        working) and to inherit user-controlled color from the actor's
+        property. Then we swap the mapper to the Gaussian variant.
+
+        Returns the vtkActor (so callers can apply additional styling).
+        """
+        import vtk
+        poly = pv.PolyData(node_points)
+        actor = self.plotter.add_points(
+            poly,
+            color=self.node_color,
+            point_size=self.node_size,
+            render_points_as_spheres=False,
+            name=name,
+        )
+
+        try:
+            mapper = vtk.vtkPointGaussianMapper()
+            mapper.SetInputData(poly)
+            # Scale the splat radius relative to the model's diagonal so the
+            # cloud reads at any zoom level. node_size acts as a unitless
+            # multiplier (the size spinbox stays meaningful 1..20).
+            bounds = poly.bounds
+            diag = (
+                (bounds[1] - bounds[0]) ** 2
+                + (bounds[3] - bounds[2]) ** 2
+                + (bounds[5] - bounds[4]) ** 2
+            ) ** 0.5
+            base_diag = max(diag, 1.0)
+            mapper.SetScaleFactor(self.node_size * 0.0008 * base_diag)
+            mapper.SetEmissive(False)
+            mapper.SetSplatShaderCode("")  # use the built-in Gaussian preset
+            actor.SetMapper(mapper)
+        except Exception:
+            # If anything in the mapper swap fails, the original add_points
+            # actor is still on the renderer; we silently fall back to it.
+            pass
+
+        return actor
 
     # --- Phase 2.3: render request (debounced) ---
     def _request_render(self):
@@ -5065,11 +5118,14 @@ class MainWindow(QMainWindow):
             for nid in entity_ids:
                 if nid in self.current_generator.model.nodes:
                     coords.append(self.current_generator.model.nodes[nid].get_position())
-            
+
             if coords:
+                # Phase 3.5: contrasting selection accent (Catppuccin peach)
+                # against the new accent-blue node default.
+                from node_runner.theme import SELECTION_ACCENT
                 self.plotter.add_points(
                     np.array(coords),
-                    color='yellow',
+                    color=SELECTION_ACCENT,
                     point_size=12,
                     render_points_as_spheres=True,
                     name='selection_highlight',
@@ -5080,8 +5136,10 @@ class MainWindow(QMainWindow):
             indices = np.isin(self.current_grid.cell_data['EID'], entity_ids)
             if np.any(indices):
                 highlight_grid = self.current_grid.extract_cells(indices)
+                # Phase 3.5: theme-coherent selection accent
+                from node_runner.theme import SELECTION_ACCENT
                 self.plotter.add_mesh(
-                    highlight_grid, style='wireframe', color='yellow',
+                    highlight_grid, style='wireframe', color=SELECTION_ACCENT,
                     line_width=5, name='selection_highlight', pickable=False,
                     reset_camera=False
                 )
@@ -6655,8 +6713,7 @@ class MainWindow(QMainWindow):
                         else:
                             node_points = None
             if node_points is not None and len(node_points) > 0:
-                self.plotter.add_points(pv.PolyData(node_points), color=self.node_color, point_size=self.node_size,
-                                        render_points_as_spheres=True, name='nodes_actor')
+                self._add_node_cloud(node_points, name='nodes_actor')
 
         grid_to_render = self.current_grid
         if visibility_mask is not None:
@@ -7004,7 +7061,9 @@ class MainWindow(QMainWindow):
 
         self.plotter.remove_actor('highlight_actor', render=False)
         if found:
-            self.plotter.add_points(np.array(coords), color='yellow', point_size=15, render_points_as_spheres=True, name='highlight_actor'); self.plotter.fly_to(coords)
+            # Phase 3.5: theme-coherent find-and-zoom highlight
+            from node_runner.theme import SELECTION_ACCENT
+            self.plotter.add_points(np.array(coords), color=SELECTION_ACCENT, point_size=15, render_points_as_spheres=True, name='highlight_actor'); self.plotter.fly_to(coords)
             self._update_status(f"Found {etype} {entity_id}.")
         else: self._update_status(f"{etype} {entity_id} not found.", is_error=True)
 

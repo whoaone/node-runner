@@ -20,6 +20,9 @@ WARNING = "#f9e2af"
 ERROR = "#f38ba8"
 SCROLLBAR_HANDLE = "#585b70"
 SCROLLBAR_BG = "#181825"
+# Phase 3: selection accent. Catppuccin Peach - contrasts with ACCENT (blue)
+# without straying from the existing palette.
+SELECTION_ACCENT = "#fab387"
 
 # ---------------------------------------------------------------------------
 # Dark palette
