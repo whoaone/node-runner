@@ -221,7 +221,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v2.0.0"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.0.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         self.node_size, self.node_color = 5, '#00FF00'

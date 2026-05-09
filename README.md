@@ -1,6 +1,32 @@
-# Node Runner v2.0.0
+# Node Runner v3.0.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
+
+## What's New in v3.0.0 (in progress)
+
+A multi-phase upgrade rolling out across four phases. Each phase ships when verified.
+
+### Phase 1: Engine foundations (landed locally)
+- Flexible Nastran export: choose Short (8-char), Long (16-char), or Free (comma-separated) field formats per save.
+- Import auto-detection: BDF field format is sniffed on open and pre-fills the next save dialog.
+- Persistent status bar: `Model | Nodes | Export | Units` always visible.
+- New Settings menu: Export Defaults..., Units...
+- Group export now respects the chosen field format.
+
+### Phase 2: UX layer (planned)
+- Command Palette (Ctrl+P) over all menu actions.
+- Multi-threaded BDF import with progress + cancel.
+- Render debouncing for snappier scene rebuilds.
+
+### Phase 3: Rendering polish (planned)
+- High-fidelity point rendering via vtkPointGaussianMapper (kills the "green blob" look).
+- Default node color moves off neon green to the existing theme accent.
+- Distance-based opacity fade for far-away nodes.
+
+### Phase 4: Performance and LOD (planned)
+- Adaptive node occlusion when zoomed out.
+- Ghosting mode for inactive groups.
+- Parallel BDF parsing across CPU cores.
 
 ## Changelog for v2.0.0
 
