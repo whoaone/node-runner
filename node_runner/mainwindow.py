@@ -706,7 +706,10 @@ class MainWindow(QMainWindow):
         # View > Cross Section opens the controls.
         from node_runner.cross_section import CrossSectionController
         self._cross_section = CrossSectionController(self.plotter)
-        self._cross_section_dialog = None
+        # Replaced the old non-modal dialog with a dockable widget that
+        # tabifies alongside Results / Animation / Vectors. Build it
+        # lazily after the result browser dock so we can tabify.
+        self._cross_section_dock = None
 
         # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
         self._selection_overlay = SelectionOverlay(self.plotter)
@@ -2127,17 +2130,45 @@ class MainWindow(QMainWindow):
 
     # --- Cross-section controls ---
     def _open_cross_section_dialog(self):
-        """View -> Cross Section..."""
-        from node_runner.dialogs import CrossSectionDialog
-        # Reuse the existing dialog if already up so we don't stack windows.
-        if self._cross_section_dialog is not None and self._cross_section_dialog.isVisible():
-            self._cross_section_dialog.raise_()
-            self._cross_section_dialog.activateWindow()
-            return
-        self._cross_section_dialog = CrossSectionDialog(
-            self._cross_section, self, parent=self,
-        )
-        self._cross_section_dialog.show()
+        """View -> Cross Section: toggle the dock visible/hidden.
+
+        The old QDialog covered the model; this version is a QDockWidget
+        tabified next to Results / Animation / Vectors. First call builds
+        the dock; subsequent calls toggle visibility and bring its tab to
+        the front when shown.
+        """
+        if self._cross_section_dock is None:
+            self._build_cross_section_dock()
+        dock = self._cross_section_dock
+        # isHidden() reflects an explicit hide(), unaffected by whether
+        # the main window is shown yet (matters during tests).
+        if not dock.isHidden():
+            dock.hide()
+        else:
+            dock.show()
+            dock.raise_()
+            dock.activateWindow()
+
+    def _build_cross_section_dock(self):
+        """Create the cross-section dock, tabified with the result docks."""
+        from node_runner.dialogs import CrossSectionDock
+        dock = CrossSectionDock(self._cross_section, self, parent=self)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+        # Tabify alongside the other right-side docks if they exist, so
+        # the user gets one column of tabs instead of stacked panels.
+        peers = [
+            getattr(self, "_result_browser_dock", None),
+            getattr(self, "_anim_dock", None),
+            getattr(self, "_vector_dock", None),
+        ]
+        for peer in peers:
+            if peer is not None:
+                try:
+                    self.tabifyDockWidget(peer, dock)
+                    break
+                except Exception:
+                    continue
+        self._cross_section_dock = dock
 
     # --- Phase 4 toggles ---
     def _open_convert_units_dialog(self):

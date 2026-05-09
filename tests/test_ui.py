@@ -164,6 +164,63 @@ class TestSettingsAndToolsMenu:
 
 
 # ---------------------------------------------------------------------------
+# Cross-section dock + plane definitions
+# ---------------------------------------------------------------------------
+
+class TestCrossSectionDock:
+
+    def test_dock_lazy_built_then_toggles(self, main_window, qtbot):
+        # Built lazily on first menu trigger.
+        assert main_window._cross_section_dock is None
+        main_window.show()
+        qtbot.waitExposed(main_window)
+        main_window._open_cross_section_dialog()
+        dock = main_window._cross_section_dock
+        assert dock is not None
+        assert dock.isVisible()
+        # Second call hides it (toggle behavior).
+        main_window._open_cross_section_dialog()
+        assert not dock.isVisible()
+
+    def test_plane_definition_axis_resolves(self):
+        from node_runner.cross_section import PlaneDefinition, METHOD_AXIS
+        d = PlaneDefinition(method=METHOD_AXIS, axis_label="+Y")
+        origin, normal = d.resolve(None)
+        assert origin == (0.0, 0.0, 0.0)
+        assert normal == (0.0, 1.0, 0.0)
+
+    def test_plane_definition_coord_value_resolves(self):
+        from node_runner.cross_section import PlaneDefinition, METHOD_COORD_VALUE
+        d = PlaneDefinition(method=METHOD_COORD_VALUE, axis_label="+X", value=1500.0)
+        origin, normal = d.resolve(None)
+        assert origin == (1500.0, 0.0, 0.0)
+        assert normal == (1.0, 0.0, 0.0)
+
+    def test_plane_definition_normal_point_resolves(self):
+        from node_runner.cross_section import PlaneDefinition, METHOD_NORMAL_POINT
+        d = PlaneDefinition(method=METHOD_NORMAL_POINT,
+                            normal=(2.0, 0.0, 0.0), point=(5.0, 6.0, 7.0))
+        origin, normal = d.resolve(None)
+        assert origin == (5.0, 6.0, 7.0)
+        assert normal == (1.0, 0.0, 0.0)  # normalized
+
+    def test_plane_definition_three_point_needs_model(self):
+        from node_runner.cross_section import (
+            PlaneDefinition, METHOD_THREE_POINT, PlaneDefinitionError,
+        )
+        d = PlaneDefinition(method=METHOD_THREE_POINT, node_ids=(1, 2, 3))
+        with pytest.raises(PlaneDefinitionError):
+            d.resolve(None)
+
+    def test_define_plane_dialog_constructs(self, main_window, qtbot):
+        from node_runner.dialogs import DefinePlaneDialog
+        dlg = DefinePlaneDialog(main_window)
+        qtbot.addWidget(dlg)
+        # Default method combo populated with 5 entries.
+        assert dlg._method_combo.count() == 5
+
+
+# ---------------------------------------------------------------------------
 # Result browser dock
 # ---------------------------------------------------------------------------
 
