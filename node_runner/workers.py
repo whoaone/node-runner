@@ -4,7 +4,7 @@ Phase 2 currently provides BDF import off the UI thread. Future phases
 will extend this with parallel parsing.
 """
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtWidgets import QProgressDialog, QApplication
 
 
@@ -116,34 +116,67 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
 
     cancelled = {"flag": False}
 
-    def _on_finished(generator, lenient_result, detected_format):
+    def _hide_dialog():
+        # CRITICAL: QProgressDialog.close() emits the `canceled` signal
+        # (because its cancel button is the default close action). If we
+        # leave _on_canceled connected, programmatic close triggers the
+        # cancel cascade and we drop the parsed result. Disconnect first.
+        try:
+            dialog.canceled.disconnect(_on_canceled)
+        except (TypeError, RuntimeError):
+            # Already disconnected (e.g., second call). Safe to ignore.
+            pass
+        try:
+            dialog.reset()
+        except Exception:
+            pass
+        dialog.hide()
         dialog.close()
+
+    def _cleanup_thread():
+        # quit() asks the worker thread's event loop to exit. We do NOT
+        # call thread.wait() here - that would block the UI thread. The
+        # worker's run() has already returned (it just emitted finished/
+        # failed), so the event loop will exit on its own.
         thread.quit()
-        thread.wait()
-        if not cancelled["flag"]:
-            on_success(generator, lenient_result, detected_format)
+
+    def _on_finished(generator, lenient_result, detected_format):
+        was_cancelled = cancelled["flag"]
+        _hide_dialog()
+        _cleanup_thread()
+        if was_cancelled:
+            return
+        on_success(generator, lenient_result, detected_format)
 
     def _on_failed(msg):
-        dialog.close()
-        thread.quit()
-        thread.wait()
-        if not cancelled["flag"]:
-            on_failure(msg)
+        was_cancelled = cancelled["flag"]
+        _hide_dialog()
+        _cleanup_thread()
+        if was_cancelled:
+            return
+        on_failure(msg)
 
     def _on_canceled():
         cancelled["flag"] = True
         worker.cancel()
-        dialog.close()
-        # Don't call thread.quit() here - the underlying parse cannot be
-        # interrupted; let it finish in the background. The worker drops
-        # the result because of the cancel flag. The QThread cleans up
-        # when its run() returns.
+        _hide_dialog()
+        # Underlying parse cannot be interrupted; let the worker finish in
+        # the background. It drops its result because cancelled is set.
 
     worker.finished.connect(_on_finished)
     worker.failed.connect(_on_failed)
     dialog.canceled.connect(_on_canceled)
 
+    # Keep strong references to the Python closures alive for as long as
+    # the worker / dialog exist. PySide6 can drop weakly-held closure
+    # connections after the enclosing function returns, which would silently
+    # skip on_success / on_failure when the signal fires.
+    worker._kept_alive = (_on_finished, _on_failed, _hide_dialog, _cleanup_thread)
+    dialog._kept_alive = (_on_canceled, _hide_dialog)
+
     thread.start()
-    # Process events so the dialog actually paints.
-    QApplication.processEvents()
+    # Don't call QApplication.processEvents() here. It used to be a "make
+    # the dialog paint" hint, but it can re-enter _on_finished if the worker
+    # finishes parsing very quickly, blocking indefinitely on Windows. The
+    # dialog paints fine through Qt's normal event loop once we return.
     return thread, worker, dialog
