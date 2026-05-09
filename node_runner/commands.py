@@ -3591,6 +3591,224 @@ class AddRsplineCommand(Command):
         return f"Add RSPLINE {self._v.get('eid')}"
 
 
+class ConvertUnitsCommand(Command):
+    """Femap-style multi-factor unit conversion.
+
+    Snapshots all node positions, properties, materials, and load values,
+    then applies the user's length / force / mass scale factors. Stress,
+    density, and moment factors are derived from those three:
+
+        stress  = force / length**2
+        density = mass / length**3
+        moment  = force * length
+
+    Undo restores the snapshot in full. Cards we don't recognize are left
+    alone (the conversion is best-effort and biased toward the common
+    aerospace/automotive cards: GRID, PSHELL, PBEAM, PBAR, PROD, MAT1,
+    FORCE, MOMENT, PLOAD1/2/4, SPCD).
+    """
+
+    def __init__(self, length: float, force: float, mass: float):
+        self._L = float(length)
+        self._F = float(force)
+        self._M = float(mass)
+        # Snapshots populated in execute()
+        self._old_node_xyz: dict[int, list] = {}
+        self._old_props: dict[int, Any] = {}
+        self._old_mats: dict[int, Any] = {}
+        self._old_loads: dict[int, Any] = {}
+        self._old_coords: dict[int, list] = {}
+
+    def _factors(self):
+        L, F, M = self._L, self._F, self._M
+        return {
+            'L': L,
+            'F': F,
+            'M': M,
+            'stress':  F / (L * L) if L != 0 else 1.0,
+            'density': M / (L ** 3) if L != 0 else 1.0,
+            'moment':  F * L,
+            'area':    L * L,
+            'moi':     L ** 4,
+        }
+
+    def execute(self, model) -> None:
+        f = self._factors()
+        L = f['L']; F = f['F']
+        stress = f['stress']; density = f['density']
+        moment = f['moment']; area = f['area']; moi = f['moi']
+
+        # --- Nodes ---
+        self._old_node_xyz = {}
+        for nid, node in model.nodes.items():
+            xyz = list(node.get_position())
+            self._old_node_xyz[nid] = xyz
+            node.set_position(model, [xyz[0] * L, xyz[1] * L, xyz[2] * L])
+
+        # --- Coord systems (origin offsets scale with length) ---
+        self._old_coords = {}
+        for cid, coord in model.coords.items():
+            if cid in (0, 1, 2):
+                continue  # global frames stay put
+            try:
+                origin = list(coord.origin)
+                self._old_coords[cid] = origin
+                coord.origin = type(coord.origin)([origin[0] * L,
+                                                   origin[1] * L,
+                                                   origin[2] * L])
+            except Exception:
+                pass
+
+        # --- Properties ---
+        self._old_props = {pid: copy.deepcopy(p) for pid, p in model.properties.items()}
+        for pid, prop in model.properties.items():
+            t = prop.type
+            try:
+                if t == 'PSHELL':
+                    if hasattr(prop, 't') and prop.t is not None:
+                        prop.t = float(prop.t) * L
+                    for attr in ('z1', 'z2'):
+                        if hasattr(prop, attr) and getattr(prop, attr) is not None:
+                            setattr(prop, attr, float(getattr(prop, attr)) * L)
+                elif t in ('PBEAM', 'PBAR'):
+                    # PBEAM stores per-station lists
+                    for attr_name, factor in (('A', area), ('area', area),
+                                              ('I1', moi), ('i1', moi),
+                                              ('I2', moi), ('i2', moi),
+                                              ('I12', moi), ('i12', moi),
+                                              ('J', moi), ('j', moi)):
+                        if not hasattr(prop, attr_name):
+                            continue
+                        val = getattr(prop, attr_name)
+                        if val is None:
+                            continue
+                        try:
+                            iter(val)
+                            setattr(prop, attr_name,
+                                    [float(v) * factor for v in val])
+                        except TypeError:
+                            try:
+                                setattr(prop, attr_name, float(val) * factor)
+                            except (TypeError, ValueError):
+                                pass
+                elif t == 'PROD':
+                    if hasattr(prop, 'A') and prop.A is not None:
+                        prop.A = float(prop.A) * area
+                    if hasattr(prop, 'J') and prop.J is not None:
+                        prop.J = float(prop.J) * moi
+                elif t == 'PSOLID':
+                    pass  # no geometric scalars to scale
+            except Exception:
+                pass
+
+        # --- Materials ---
+        self._old_mats = {mid: copy.deepcopy(m) for mid, m in model.materials.items()}
+        for mid, mat in model.materials.items():
+            t = mat.type
+            try:
+                if t == 'MAT1':
+                    if mat.e is not None:
+                        mat.e = float(mat.e) * stress
+                    if mat.g is not None:
+                        mat.g = float(mat.g) * stress
+                    if mat.rho is not None:
+                        mat.rho = float(mat.rho) * density
+                elif t in ('MAT8',):
+                    for attr in ('e11', 'e22', 'g12', 'g1z', 'g2z'):
+                        v = getattr(mat, attr, None)
+                        if v is not None:
+                            setattr(mat, attr, float(v) * stress)
+                    if getattr(mat, 'rho', None) is not None:
+                        mat.rho = float(mat.rho) * density
+            except Exception:
+                pass
+
+        # --- Loads (forces, moments, pressures, distributed, enforced disp) ---
+        # Snapshot defensively: pyNastran's deepcopy can fail on partial /
+        # malformed cards, in which case we just skip the snapshot for that
+        # SID (undo for that SID won't work, but the conversion won't crash).
+        self._old_loads = {}
+        for sid, lst in model.loads.items():
+            try:
+                self._old_loads[sid] = copy.deepcopy(lst)
+            except Exception:
+                pass
+        for sid, load_list in model.loads.items():
+            for load in load_list:
+                try:
+                    self._scale_load(load, F, moment, stress, L)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _scale_load(load, force_factor: float, moment_factor: float,
+                    stress_factor: float, length_factor: float) -> None:
+        t = load.type
+        if t == 'FORCE':
+            if getattr(load, 'mag', None) is not None:
+                load.mag = float(load.mag) * force_factor
+        elif t == 'MOMENT':
+            if getattr(load, 'mag', None) is not None:
+                load.mag = float(load.mag) * moment_factor
+        elif t in ('PLOAD2', 'PLOAD4'):
+            if hasattr(load, 'pressure') and load.pressure is not None:
+                load.pressure = float(load.pressure) * stress_factor
+            if hasattr(load, 'pressures') and load.pressures is not None:
+                try:
+                    load.pressures = [float(p) * stress_factor for p in load.pressures]
+                except TypeError:
+                    pass
+        elif t == 'PLOAD1':
+            ltype = getattr(load, 'load_type', getattr(load, 'Type', ''))
+            factor_a = factor_b = 1.0
+            if ltype in ('FX', 'FY', 'FZ', 'FXE', 'FYE', 'FZE'):
+                factor_a = factor_b = force_factor
+            elif ltype in ('MX', 'MY', 'MZ', 'MXE', 'MYE', 'MZE'):
+                factor_a = factor_b = moment_factor
+            for attr, fac in (('p1', factor_a), ('p2', factor_b)):
+                if hasattr(load, attr) and getattr(load, attr) is not None:
+                    setattr(load, attr, float(getattr(load, attr)) * fac)
+        elif t == 'SPCD':
+            # Enforced displacement values scale with length
+            for attr in ('enforced', 'd1', 'd2', 'd3'):
+                v = getattr(load, attr, None)
+                if v is None:
+                    continue
+                try:
+                    iter(v)
+                    setattr(load, attr, [float(x) * length_factor for x in v])
+                except TypeError:
+                    setattr(load, attr, float(v) * length_factor)
+        # GRAV: skip - users typically retype 9.81 vs 386.4 after switching
+        # unit systems rather than scaling the existing magnitude.
+
+    def undo(self, model) -> None:
+        # Nodes
+        for nid, xyz in self._old_node_xyz.items():
+            if nid in model.nodes:
+                model.nodes[nid].set_position(model, list(xyz))
+        # Coords
+        for cid, origin in self._old_coords.items():
+            if cid in model.coords:
+                try:
+                    model.coords[cid].origin = type(model.coords[cid].origin)(origin)
+                except Exception:
+                    pass
+        # Properties / materials / loads: replace dicts with their
+        # snapshots wholesale.
+        for pid, prop in self._old_props.items():
+            model.properties[pid] = prop
+        for mid, mat in self._old_mats.items():
+            model.materials[mid] = mat
+        for sid, lst in self._old_loads.items():
+            model.loads[sid] = lst
+
+    @property
+    def description(self) -> str:
+        return (f"Convert units (L*{self._L:g}, F*{self._F:g}, "
+                f"M*{self._M:g})")
+
+
 class AddBoltCommand(Command):
     """Bolt preload card (basic; solver-version specific in detail).
 

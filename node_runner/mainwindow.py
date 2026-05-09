@@ -258,9 +258,14 @@ class MainWindow(QMainWindow):
         self._export_format = _settings.value("export/default_format", "short")
         if self._export_format not in ("short", "long", "free"):
             self._export_format = "short"
-        self._units = _settings.value("display/units", "SI")
-        if self._units not in ("SI", "English"):
-            self._units = "SI"
+        # Node Runner is intentionally unitless (Femap-style). The "units"
+        # value is just a free-text label shown in the status bar so you
+        # remember which unit system you've been working in. To actually
+        # rescale model values, use Tools > Convert Units.
+        self._units = _settings.value("display/units", "")
+        if self._units in ("SI", "English"):
+            # Migrate legacy values from earlier 3.0.0 builds.
+            self._units = ""
         self._loaded_filepath: str | None = None
 
         # --- Phase 4: performance and LOD settings ---
@@ -1269,6 +1274,12 @@ class MainWindow(QMainWindow):
         self.probe_mode_action.toggled.connect(self._toggle_probe_mode)
         tools_menu.addAction(self.probe_mode_action)
         tools_menu.addSeparator()
+        # Femap-style unit conversion - the tool itself is unitless, but
+        # this rescales the whole model by user-supplied factors.
+        convert_units_action = QAction("Convert Units...", self)
+        convert_units_action.triggered.connect(self._open_convert_units_dialog)
+        tools_menu.addAction(convert_units_action)
+        tools_menu.addSeparator()
         model_check_menu = tools_menu.addMenu("Model Check")
         mass_props_action = QAction("Mass Properties...", self)
         mass_props_action.triggered.connect(self._show_mass_properties)
@@ -1592,7 +1603,9 @@ class MainWindow(QMainWindow):
         self._status_model_lbl = QLabel("Model: Untitled")
         self._status_nodes_lbl = QLabel("Nodes: 0")
         self._status_format_lbl = QLabel(f"Export: {self._export_format.title()}")
-        self._status_units_lbl = QLabel(f"Units: {self._units}")
+        self._status_units_lbl = QLabel(
+            f"Units: {self._units}" if self._units else ""
+        )
         for lbl in (self._status_model_lbl, self._status_nodes_lbl,
                     self._status_format_lbl, self._status_units_lbl):
             lbl.setStyleSheet("padding: 0 8px;")
@@ -1624,7 +1637,9 @@ class MainWindow(QMainWindow):
                 node_count = 0
         self._status_nodes_lbl.setText(f"Nodes: {node_count:,}")
         self._status_format_lbl.setText(f"Export: {self._export_format.title()}")
-        self._status_units_lbl.setText(f"Units: {self._units}")
+        self._status_units_lbl.setText(
+            f"Units: {self._units}" if self._units else ""
+        )
 
     def _on_model_loaded(self, filepath, detected_format):
         """Called after a successful BDF open/import.
@@ -2094,6 +2109,37 @@ class MainWindow(QMainWindow):
         self._cross_section_dialog.show()
 
     # --- Phase 4 toggles ---
+    def _open_convert_units_dialog(self):
+        """Tools > Convert Units... - run a Femap-style multi-factor scaling."""
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model",
+                                "Open or create a model before converting units.")
+            return
+        from node_runner.dialogs import UnitConversionDialog
+        from node_runner.commands import ConvertUnitsCommand
+        dlg = UnitConversionDialog(self)
+        if not dlg.exec():
+            return
+        f = dlg.factors
+        if any(v <= 0 for v in f.values()):
+            QMessageBox.warning(self, "Invalid factors",
+                                "All factors must be positive non-zero numbers.")
+            return
+        cmd = ConvertUnitsCommand(
+            length=f['length'], force=f['force'], mass=f['mass'],
+        )
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Unit conversion applied: L*{f['length']:g}, "
+            f"F*{f['force']:g}, M*{f['mass']:g}. Use Edit > Undo to revert."
+        )
+        # If the user opted in, also refresh the unit hint label after
+        # conversion so the status bar reflects the new system.
+        if dlg.update_label_hint:
+            self._open_units_dialog()
+        # Force a viewer rebuild so the rescaled coordinates take effect.
+        self._update_viewer(self.current_generator, reset_camera=True)
+
     def _toggle_ghost_mode(self, on):
         """View -> Ghost Hidden Groups."""
         from PySide6.QtCore import QSettings

@@ -160,35 +160,49 @@ class ExportDefaultsDialog(QDialog):
 
 
 class UnitsDialog(QDialog):
-    """Settings-menu dialog for choosing display units (SI / English).
+    """Settings-menu dialog for setting a free-text unit-system hint.
 
-    Cosmetic for now: drives the status-bar Units label only. No engineering
-    unit conversion is performed on the model.
+    Node Runner is intentionally unitless (Femap-style): the model is just
+    numbers. This dialog only sets a label that appears in the status bar
+    so you remember which unit system you're working in. To actually
+    rescale the model values, use **Tools > Convert Units...**.
     """
 
-    def __init__(self, current_units="SI", parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Units")
-        self.setModal(True)
-        self.setMinimumWidth(320)
+    SUGGESTIONS = ("", "mm / N / t", "mm / N / kg", "m / N / kg",
+                   "in / lbf / slug", "in / lbf / lbf-s2/in")
 
-        self._selected_units = current_units if current_units in ("SI", "English") else "SI"
+    def __init__(self, current_units="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Unit Label")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        self._selected_units = str(current_units or "")
 
         layout = QVBoxLayout(self)
-        header = QLabel("Display units shown in the status bar:")
+        header = QLabel(
+            "Unit-system hint shown in the status bar. Free text - no "
+            "validation, no enforcement, no automatic conversion. Leave "
+            "blank to hide the field."
+        )
+        header.setWordWrap(True)
         layout.addWidget(header)
 
-        self._button_group = QButtonGroup(self)
-        for opt in ("SI", "English"):
-            radio = QRadioButton(opt)
-            radio.setChecked(opt == self._selected_units)
-            radio.toggled.connect(lambda checked, o=opt: self._on_radio_toggled(o, checked))
-            self._button_group.addButton(radio)
-            layout.addWidget(radio)
+        from PySide6.QtWidgets import QLineEdit, QComboBox
+        self._line = QLineEdit(self._selected_units)
+        self._line.setPlaceholderText("e.g. mm / N / t  or  in / lbf / slug")
+        layout.addWidget(self._line)
+
+        # Quick-pick combo seeded with common conventions
+        layout.addWidget(QLabel("Quick pick:"))
+        self._suggest_combo = QComboBox()
+        self._suggest_combo.addItems(["(custom)"] + list(self.SUGGESTIONS[1:]))
+        self._suggest_combo.currentTextChanged.connect(self._on_suggestion)
+        layout.addWidget(self._suggest_combo)
 
         info = QLabel(
-            "This setting is cosmetic for now: it labels the status bar but "
-            "does not convert model values."
+            "To actually rescale node coordinates, properties, materials, "
+            "and loads, use Tools > Convert Units..."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #666; font-size: 10px;")
@@ -205,10 +219,10 @@ class UnitsDialog(QDialog):
         button_row.addWidget(ok)
         layout.addLayout(button_row)
 
-    def _on_radio_toggled(self, opt, checked):
-        if checked:
-            self._selected_units = opt
+    def _on_suggestion(self, text):
+        if text and text != "(custom)":
+            self._line.setText(text)
 
     @property
     def selected_units(self):
-        return self._selected_units
+        return self._line.text().strip()

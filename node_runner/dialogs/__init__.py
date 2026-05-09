@@ -54,3 +54,4 @@ from node_runner.dialogs.loads_extra import (
 from node_runner.dialogs.result_browser import (
     ResultBrowserDock, AnimationTimelineWidget, VectorOverlayWidget,
 )
+from node_runner.dialogs.units_conversion import UnitConversionDialog
