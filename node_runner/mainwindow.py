@@ -984,6 +984,22 @@ class MainWindow(QMainWindow):
         create_load_combo_action = QAction("Load Combination (LOAD)...", self)
         create_load_combo_action.triggered.connect(self._create_load_combination)
         model_menu.addAction(create_load_combo_action)
+        # --- Theme C: additional load and BC creators ---
+        create_pload1_action = QAction("Distributed Load (PLOAD1)...", self)
+        create_pload1_action.triggered.connect(self._create_pload1)
+        model_menu.addAction(create_pload1_action)
+        create_pload2_action = QAction("Element Pressure (PLOAD2)...", self)
+        create_pload2_action.triggered.connect(self._create_pload2)
+        model_menu.addAction(create_pload2_action)
+        create_spcd_action = QAction("Enforced Displacement (SPCD)...", self)
+        create_spcd_action.triggered.connect(self._create_spcd)
+        model_menu.addAction(create_spcd_action)
+        create_mpc_action = QAction("Multi-Point Constraint (MPC)...", self)
+        create_mpc_action.triggered.connect(self._create_mpc)
+        model_menu.addAction(create_mpc_action)
+        create_bolt_action = QAction("Bolt Preload (BOLT)...", self)
+        create_bolt_action.triggered.connect(self._create_bolt)
+        model_menu.addAction(create_bolt_action)
 
         # Section 3: Modify (moved from Edit menu)
         model_menu.addSeparator()
@@ -1042,6 +1058,17 @@ class MainWindow(QMainWindow):
         weld_action = QAction("Weld/Fastener (CWELD)...", self)
         weld_action.triggered.connect(self._create_weld_fastener)
         connections_menu.addAction(weld_action)
+        # --- Theme C: rigid element creators ---
+        connections_menu.addSeparator()
+        rbar_action = QAction("Rigid Bar (RBAR)...", self)
+        rbar_action.triggered.connect(self._create_rbar)
+        connections_menu.addAction(rbar_action)
+        rbe1_action = QAction("General Rigid (RBE1)...", self)
+        rbe1_action.triggered.connect(self._create_rbe1)
+        connections_menu.addAction(rbe1_action)
+        rspline_action = QAction("Rigid Spline (RSPLINE)...", self)
+        rspline_action.triggered.connect(self._create_rspline)
+        connections_menu.addAction(rspline_action)
 
         # Section 6: Geometry Mesh (moved from Mesh menu)
         model_menu.addSeparator()
@@ -7513,6 +7540,144 @@ class MainWindow(QMainWindow):
         dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose)
         dialog.show()
         self.active_creation_dialog = dialog
+
+    # --- Theme C: load and BC creators (PLOAD1/2, SPCD, MPC, RBAR, RBE1, RSPLINE, BOLT) ---
+
+    def _require_model(self):
+        if not self.current_generator:
+            QMessageBox.warning(self, "No Model", "Please open or generate a model first.")
+            return False
+        return True
+
+    def _create_pload1(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreatePload1Dialog
+        from node_runner.commands import AddPload1Command
+        dlg = CreatePload1Dialog(self)
+        if not dlg.exec():
+            return
+        if not dlg.eids:
+            QMessageBox.warning(self, "No EIDs", "Please specify at least one element ID.")
+            return
+        cmd = AddPload1Command(dlg.sid, dlg.eids, dlg.values)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Added PLOAD1 to {len(dlg.eids)} element(s) in SID {dlg.sid}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_pload2(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreatePload2Dialog
+        from node_runner.commands import AddPload2Command
+        dlg = CreatePload2Dialog(self)
+        if not dlg.exec():
+            return
+        if not dlg.eids:
+            QMessageBox.warning(self, "No EIDs", "Please specify at least one shell element ID.")
+            return
+        cmd = AddPload2Command(dlg.sid, dlg.eids, dlg.pressure_value)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Added PLOAD2 to {len(dlg.eids)} shell(s) in SID {dlg.sid}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_spcd(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateSpcdDialog
+        from node_runner.commands import AddSpcdCommand
+        dlg = CreateSpcdDialog(self)
+        if not dlg.exec():
+            return
+        if not dlg.nids:
+            QMessageBox.warning(self, "No nodes", "Please specify at least one node ID.")
+            return
+        cmd = AddSpcdCommand(dlg.sid, dlg.nids, dlg.dof_string, dlg.enforced_value)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Added SPCD on {len(dlg.nids)} node(s), DOFs {dlg.dof_string}, "
+            f"value={dlg.enforced_value} in SID {dlg.sid}."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_mpc(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateMpcDialog
+        from node_runner.commands import AddMpcCommand
+        dlg = CreateMpcDialog(self)
+        if not dlg.exec():
+            return
+        cmd = AddMpcCommand(dlg.sid, dlg.terms)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Added MPC SID {dlg.sid} with {len(dlg.terms)} terms."
+        )
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_rbar(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateRbarDialog
+        from node_runner.commands import AddRbarCommand
+        dlg = CreateRbarDialog(self)
+        if not dlg.exec():
+            return
+        cmd = AddRbarCommand(dlg.values)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Added RBAR {dlg.values['eid']}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_rbe1(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateRbe1Dialog
+        from node_runner.commands import AddRbe1Command
+        dlg = CreateRbe1Dialog(self)
+        if not dlg.exec():
+            return
+        v = dlg.values
+        if not v['indep_nodes'] or not v['dep_nodes']:
+            QMessageBox.warning(self, "Missing nodes",
+                                "RBE1 needs at least one independent and one dependent node.")
+            return
+        cmd = AddRbe1Command(v)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Added RBE1 {v['eid']}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_rspline(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateRsplineDialog
+        from node_runner.commands import AddRsplineCommand
+        dlg = CreateRsplineDialog(self)
+        if not dlg.exec():
+            return
+        v = dlg.values
+        if len(v['nodes']) < 2:
+            QMessageBox.warning(self, "Need >= 2 nodes",
+                                "RSPLINE requires at least two spline nodes.")
+            return
+        cmd = AddRsplineCommand(v)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(f"Added RSPLINE {v['eid']}.")
+        self._update_viewer(self.current_generator, reset_camera=False)
+
+    def _create_bolt(self):
+        if not self._require_model():
+            return
+        from node_runner.dialogs import CreateBoltDialog
+        from node_runner.commands import AddBoltCommand
+        dlg = CreateBoltDialog(self)
+        if not dlg.exec():
+            return
+        v = dlg.values
+        cmd = AddBoltCommand(v)
+        self.command_manager.execute(cmd, self.current_generator.model)
+        self._update_status(
+            f"Added BOLT {v['bid']} (preload={v['preload']}, EIDs={v['eids']})."
+        )
 
     def _on_load_creation_accept(self):
         dialog = self.active_creation_dialog

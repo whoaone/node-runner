@@ -46,3 +46,8 @@ from node_runner.dialogs.mesh_edit import (
     SmoothNodesDialog, MirrorElementsDialog, CopyElementsDialog,
     CombineTriasDialog,
 )
+from node_runner.dialogs.loads_extra import (
+    CreatePload1Dialog, CreatePload2Dialog, CreateSpcdDialog,
+    CreateMpcDialog, CreateRbarDialog, CreateRbe1Dialog,
+    CreateRsplineDialog, CreateBoltDialog,
+)
