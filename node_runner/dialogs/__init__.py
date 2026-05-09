@@ -41,3 +41,4 @@ from node_runner.dialogs.export import (
 from node_runner.dialogs.command_palette import (
     CommandPaletteDialog, install_command_palette_shortcut,
 )
+from node_runner.dialogs.cross_section import CrossSectionDialog

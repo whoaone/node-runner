@@ -676,6 +676,12 @@ class MainWindow(QMainWindow):
         self._render_timer.setInterval(16)
         self._render_timer.timeout.connect(lambda: self.plotter.render())
 
+        # Cross-section / clipping plane controller. Inactive by default;
+        # View > Cross Section opens the controls.
+        from node_runner.cross_section import CrossSectionController
+        self._cross_section = CrossSectionController(self.plotter)
+        self._cross_section_dialog = None
+
         # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
         self._selection_overlay = SelectionOverlay(self.plotter)
 
@@ -1295,6 +1301,12 @@ class MainWindow(QMainWindow):
         display_settings_action = QAction("Display Settings...", self)
         display_settings_action.triggered.connect(self._open_display_settings)
         view_menu.addAction(display_settings_action)
+        # Cross-section / clipping plane: lets you "chop" the model and
+        # see internal structure (frames, stringers, stanchions, ribs).
+        cross_section_action = QAction("Cross Section...", self)
+        cross_section_action.setShortcut("Ctrl+Shift+X")
+        cross_section_action.triggered.connect(self._open_cross_section_dialog)
+        view_menu.addAction(cross_section_action)
         capture_screenshot_action = QAction("Capture Screenshot...", self)
         capture_screenshot_action.triggered.connect(self._capture_screenshot)
         view_menu.addAction(capture_screenshot_action)
@@ -1582,6 +1594,20 @@ class MainWindow(QMainWindow):
             QSettings("NodeRunner", "NodeRunner").setValue("display/units", self._units)
             self._refresh_status_widgets()
             self._update_status(f"Units set to {self._units}.")
+
+    # --- Cross-section controls ---
+    def _open_cross_section_dialog(self):
+        """View -> Cross Section..."""
+        from node_runner.dialogs import CrossSectionDialog
+        # Reuse the existing dialog if already up so we don't stack windows.
+        if self._cross_section_dialog is not None and self._cross_section_dialog.isVisible():
+            self._cross_section_dialog.raise_()
+            self._cross_section_dialog.activateWindow()
+            return
+        self._cross_section_dialog = CrossSectionDialog(
+            self._cross_section, self, parent=self,
+        )
+        self._cross_section_dialog.show()
 
     # --- Phase 4 toggles ---
     def _toggle_ghost_mode(self, on):
@@ -8012,6 +8038,10 @@ class MainWindow(QMainWindow):
         if self.show_free_edges_check.isChecked():
             self._create_free_edges_actor()
         self._render_geometry()
+        # If cross-section is active, push the clipping plane into the
+        # mappers of the freshly-rebuilt actors so the section stays on.
+        if hasattr(self, "_cross_section") and self._cross_section.is_enabled:
+            self._cross_section.reapply()
         self.plotter.render()
 
     # --- Geometry visualization ---
