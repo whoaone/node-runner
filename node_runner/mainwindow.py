@@ -1387,20 +1387,27 @@ class MainWindow(QMainWindow):
     _LOD_DISPLAY_TARGET = 10_000       # target display size after stride
 
     def _add_node_cloud(self, node_points, name='nodes_actor'):
-        """Render a node cloud with anti-aliased points.
+        """Render a node cloud as small fixed-pixel-size markers (Femap style).
 
-        Tries PyVista's ``style='points_gaussian'`` first - it routes through
-        ``vtkPointGaussianMapper`` internally with the proper shader plumbing.
-        If that style isn't available on the active PyVista build, falls
-        back to flat ``render_points_as_spheres=False`` points which still
-        look cleaner than the legacy sphere render.
+        Each node is drawn as a flat anti-aliased screen-space point of size
+        ``self.node_size`` PIXELS - the size never grows or shrinks with the
+        camera distance. This matches how professional FEA preprocessors
+        (Femap, Patran, HyperMesh) render nodes: they stay as crisp markers
+        you can read past, instead of expanding into a fuzzy "cloud" when
+        you zoom out on a large model.
+
+        We deliberately do NOT use PyVista's ``style='points_gaussian'`` (the
+        Gaussian splat is rendered in WORLD units, so points grow into
+        blobs when zoomed out) or ``render_points_as_spheres=True`` (3D
+        billboards with the same world-space scaling problem).
 
         Above ``_LOD_DECIMATE_THRESHOLD`` points, we stride-sample down to
-        ~``_LOD_DISPLAY_TARGET`` to keep huge clouds readable and snappy.
-        The full set of nodes is still owned by ``self.current_grid`` for
-        picking; this only thins the standalone display cloud.
+        ~``_LOD_DISPLAY_TARGET`` to keep the per-point GPU bookkeeping
+        cheap on huge models. The full set of nodes is still owned by
+        ``self.current_grid`` for picking; this only thins the standalone
+        display cloud.
 
-        Returns the vtkActor (so callers can apply additional styling).
+        Returns the vtkActor.
         """
         n_total = len(node_points)
         decimated = False
@@ -1413,38 +1420,13 @@ class MainWindow(QMainWindow):
             decimated = True
 
         poly = pv.PolyData(node_points)
-
-        # Preferred path: PyVista's native Gaussian point style. PyVista
-        # configures vtkPointGaussianMapper with the right shader internally;
-        # this avoids the broken-shader pitfalls of swapping the mapper by
-        # hand (an empty SplatShaderCode compiles to a non-functional
-        # fragment program and triggers wglMakeCurrent failures on Windows).
-        actor = None
-        try:
-            actor = self.plotter.add_mesh(
-                poly,
-                style='points_gaussian',
-                color=self.node_color,
-                point_size=self.node_size,
-                emissive=False,
-                render_points_as_spheres=False,
-                name=name,
-                reset_camera=False,
-            )
-        except Exception:
-            actor = None
-
-        # Fallback: plain anti-aliased flat points. Works on every PyVista
-        # build; loses the Gaussian splat falloff but still looks clean and,
-        # critically, will not blow up the GL context.
-        if actor is None:
-            actor = self.plotter.add_points(
-                poly,
-                color=self.node_color,
-                point_size=self.node_size,
-                render_points_as_spheres=False,
-                name=name,
-            )
+        actor = self.plotter.add_points(
+            poly,
+            color=self.node_color,
+            point_size=self.node_size,
+            render_points_as_spheres=False,
+            name=name,
+        )
 
         if decimated:
             self._update_status(
