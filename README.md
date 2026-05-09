@@ -2,9 +2,22 @@
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
+## Running
+
+The simplest path on Windows is to grab `Node.Runner.exe` from the latest release and run it - no Python install needed.
+
+If you'd rather run from source, use the bundled venv to avoid Qt platform-plugin errors that come from accidentally launching with a different Python:
+
+```
+run.bat            (or)
+.\run.ps1
+```
+
+`run.py` works too, as long as you've activated the project venv first.
+
 ## Changelog for v3.0.0
 
-A four-phase upgrade across the export engine, UX layer, rendering pipeline, and performance.
+A multi-phase upgrade across the export engine, UX layer, rendering pipeline, performance, mesh editing, loads/BCs, result interaction, and the cross-section UI.
 
 ### Engine: flexible export and format detection
 - Choose Short (8-char), Long (16-char), or Free (comma-separated) field format per save via the new Export Options dialog.
@@ -28,6 +41,33 @@ A four-phase upgrade across the export engine, UX layer, rendering pipeline, and
 - Adaptive node decimation: above 50,000 points the displayed cloud strides down to ~10,000 for snappy rendering. Toggleable in Settings; full picking-resolution preserved on the underlying mesh.
 - Ghost mode (View > Ghost Hidden Groups): hidden groups render as translucent wireframe overlays so you keep spatial context.
 - Experimental parallel BDF parsing (Settings > Parallel BDF Parsing): chunks the bulk-data section across worker threads and dict-merges the results. Falls back to single-threaded on small files, INCLUDE directives, or any chunked-parse failure. Default OFF.
+
+### Mesh editing (Theme A)
+- Split CQUAD4 into 2 CTRIA3, refine quads/trias 1-into-4 with shared midside nodes, combine two trias into a quad.
+- Laplacian smoothing of node sets, mirror elements with reversed connectivity, copy elements with translate/rotate.
+- Insert node on edge with neighbor splitting; element quality metrics extended to CHEXA / CTETRA / CPENTA.
+
+### Loads and BCs (Theme C)
+- Creation dialogs for PLOAD1, PLOAD2, SPCD, MPC, RBAR, RBE1, RSPLINE, BOLT.
+- SPCD wires through to the analysis-set case-control LOAD entry.
+
+### Result interaction (Theme B)
+- Probe tool: hover for node/element values; floating tooltip with displacement and stress components.
+- Result Browser dock with sortable nodal/element tables, expression bar (sandboxed numpy eval), 3D and table cursor sync.
+- Vector overlays (displacement, principal stress, reaction force) and strain contour from OP2.
+- Animation timeline with play / pause / scrub / speed; export-GIF retained alongside.
+
+### Cross-Section dock + Define Plane methods
+- Replaced the always-on-top Cross Section dialog with a dockable widget that tabifies alongside Results / Animation / Vectors.
+- New Define Plane picker with five methods: Global Axis, Coordinate Value, 3 Points, Normal + Point, Two Nodes (line normal).
+- Translucent plane outline actor for visual feedback at the cut. Plane definitions are serializable so the dock can summarize and persist the last-used method.
+
+### Big-model robustness
+- Switched the BDF importer back to a synchronous parse with a busy cursor and lightweight status dialog. The previous QProgressDialog spinner starved the worker thread of CPU on Windows; pyNastran's bulk parse is mostly Python and the GIL serialized worker progress with the spinner, so the UI hung on 60k+ files. Sync parse is briefly unresponsive (~6 s for 60k nodes) but always finishes.
+- 1M-node b747 streaming generator (`examples/generate_b747.py`) writes BDFs without ever building a giant pyNastran object in memory.
+
+### Launcher
+- `run.bat` and `run.ps1` pin the project venv Python so PySide6's Qt platform plugins resolve correctly. Avoids the "no Qt platform plugin could be initialized" dialog you get when `python run.py` picks up the wrong interpreter.
 
 ## Changelog for v2.0.0
 
