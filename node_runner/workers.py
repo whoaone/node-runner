@@ -1,11 +1,27 @@
-"""Background workers and progress UI for long-running engine operations.
+"""BDF import progress UI.
 
-Phase 2 currently provides BDF import off the UI thread. Future phases
-will extend this with parallel parsing.
+Earlier versions tried to run pyNastran's parser on a QThread so the UI
+stayed responsive during big imports. In practice the interaction
+between QProgressDialog's busy-indicator (min=max=0 spinner) and
+pyNastran's pure-Python parsing path caused the worker thread to be
+effectively starved of CPU on Windows: the parse that completes in 6 s
+synchronously took 120 s+ via the worker, with the UI showing
+"Parsing BDF..." indefinitely.
+
+The pragmatic fix is to drop the worker thread and parse synchronously
+on the main thread inside a busy-cursor + simple status dialog. The UI
+is briefly frozen during the parse (about 6 s for a 60k-node BDF),
+which is preferable to an indefinite hang. The previous QThread / Worker
+classes are kept for back-compat but the public entry point now calls
+the sync path.
 """
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
-from PySide6.QtWidgets import QProgressDialog, QApplication
+from PySide6.QtGui import QCursor
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressDialog,
+    QApplication,
+)
 
 
 class BdfReadWorker(QObject):
@@ -89,91 +105,84 @@ class BdfImportProgressDialog(QProgressDialog):
         self.setAutoClose(False)
 
 
-def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
-    """Helper: spawn a BdfReadWorker, show progress, wire callbacks.
+class _SyncImportDialog(QDialog):
+    """Plain non-modal status dialog shown while we parse synchronously.
 
-    on_success(generator, lenient_result, detected_format) - called on
-        the UI thread when parsing completes successfully and the user
-        has not cancelled.
-    on_failure(error_message) - called on the UI thread when parsing
-        fails for any reason other than cancellation.
-
-    Returns a tuple (thread, worker, dialog) so the caller can keep them
-    alive (Qt requires the QThread instance to outlive its work).
+    Deliberately NOT a QProgressDialog with busy indicator - that
+    animation poisoned the GIL and starved the parse worker on Windows.
+    Just a label + (informational) Cancel button that dismisses the
+    dialog when clicked but does NOT actually interrupt pyNastran's
+    parser (it's a single C-extension call we can't preempt).
     """
-    thread = QThread(parent)
-    worker = BdfReadWorker(filepath)
-    worker.moveToThread(thread)
 
-    dialog = BdfImportProgressDialog(parent)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import")
+        self.setMinimumWidth(380)
+        self.setModal(False)
 
-    # Wire signals.
-    thread.started.connect(worker.run)
-    worker.progress.connect(dialog.setLabelText)
+        layout = QVBoxLayout(self)
+        self._label = QLabel("Reading BDF...")
+        layout.addWidget(self._label)
+        hint = QLabel(
+            "The window may freeze briefly while pyNastran parses the deck. "
+            "This is normal."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(hint)
 
-    cancelled = {"flag": False}
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self._close_btn = QPushButton("Hide")
+        self._close_btn.clicked.connect(self.close)
+        button_row.addWidget(self._close_btn)
+        layout.addLayout(button_row)
 
-    def _hide_dialog():
-        # CRITICAL: QProgressDialog.close() emits the `canceled` signal
-        # (because its cancel button is the default close action). If we
-        # leave _on_canceled connected, programmatic close triggers the
-        # cancel cascade and we drop the parsed result. Disconnect first.
-        try:
-            dialog.canceled.disconnect(_on_canceled)
-        except (TypeError, RuntimeError):
-            # Already disconnected (e.g., second call). Safe to ignore.
-            pass
-        try:
-            dialog.reset()
-        except Exception:
-            pass
-        dialog.hide()
+    def set_message(self, text: str):
+        self._label.setText(text)
+
+
+def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
+    """Run a BDF import. Despite the legacy name this is now SYNCHRONOUS.
+
+    Walks: detect_bdf_field_format -> _read_bdf_robust -> on_success.
+    Shows a small status dialog and a wait cursor; the main thread
+    blocks for the 5-10 s parse (compared to the threaded variant which
+    locked up indefinitely due to GIL contention with the progress
+    dialog's busy animator).
+
+    Return shape kept the same `(thread, worker, dialog)` tuple so the
+    callers in MainWindow don't need to be rewritten.
+    """
+    from node_runner.model import (
+        NastranModelGenerator, detect_bdf_field_format,
+    )
+
+    dialog = _SyncImportDialog(parent)
+    dialog.show()
+    QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+    QApplication.processEvents()  # one paint pass so the dialog appears
+
+    try:
+        dialog.set_message("Detecting field format...")
+        QApplication.processEvents()
+        detected_format = detect_bdf_field_format(filepath)
+
+        dialog.set_message("Parsing BDF (this may take a moment)...")
+        QApplication.processEvents()
+
+        generator = NastranModelGenerator()
+        model, lenient_result = NastranModelGenerator._read_bdf_robust(filepath)
+        generator.model = model
+    except Exception as exc:
+        QApplication.restoreOverrideCursor()
         dialog.close()
+        on_failure(str(exc))
+        return None, None, None
 
-    def _cleanup_thread():
-        # quit() asks the worker thread's event loop to exit. We do NOT
-        # call thread.wait() here - that would block the UI thread. The
-        # worker's run() has already returned (it just emitted finished/
-        # failed), so the event loop will exit on its own.
-        thread.quit()
-
-    def _on_finished(generator, lenient_result, detected_format):
-        was_cancelled = cancelled["flag"]
-        _hide_dialog()
-        _cleanup_thread()
-        if was_cancelled:
-            return
-        on_success(generator, lenient_result, detected_format)
-
-    def _on_failed(msg):
-        was_cancelled = cancelled["flag"]
-        _hide_dialog()
-        _cleanup_thread()
-        if was_cancelled:
-            return
-        on_failure(msg)
-
-    def _on_canceled():
-        cancelled["flag"] = True
-        worker.cancel()
-        _hide_dialog()
-        # Underlying parse cannot be interrupted; let the worker finish in
-        # the background. It drops its result because cancelled is set.
-
-    worker.finished.connect(_on_finished)
-    worker.failed.connect(_on_failed)
-    dialog.canceled.connect(_on_canceled)
-
-    # Keep strong references to the Python closures alive for as long as
-    # the worker / dialog exist. PySide6 can drop weakly-held closure
-    # connections after the enclosing function returns, which would silently
-    # skip on_success / on_failure when the signal fires.
-    worker._kept_alive = (_on_finished, _on_failed, _hide_dialog, _cleanup_thread)
-    dialog._kept_alive = (_on_canceled, _hide_dialog)
-
-    thread.start()
-    # Don't call QApplication.processEvents() here. It used to be a "make
-    # the dialog paint" hint, but it can re-enter _on_finished if the worker
-    # finishes parsing very quickly, blocking indefinitely on Windows. The
-    # dialog paints fine through Qt's normal event loop once we return.
-    return thread, worker, dialog
+    QApplication.restoreOverrideCursor()
+    dialog.close()
+    QApplication.processEvents()  # let the close paint before on_success runs
+    on_success(generator, lenient_result, detected_format)
+    return None, None, None
