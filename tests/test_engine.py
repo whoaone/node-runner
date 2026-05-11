@@ -430,3 +430,92 @@ class TestStreamingParser:
         # Root + 2 includes = 3 files.
         assert len(files) == 3
         assert total > 0
+
+
+# ---------------------------------------------------------------------------
+# Chunked-strict parser preserves cross-chunk references
+# ---------------------------------------------------------------------------
+
+class TestChunkedCrossRefs:
+    """Regression: a card in chunk N that references an ID defined in
+    chunk N-1 must still resolve correctly in the merged master model.
+
+    This works because:
+      * chunks read with xref=False, validate=False: pyNastran doesn't
+        check that referenced IDs exist at parse time. Cards store the
+        IDs as plain integers.
+      * after each chunk parses, we dict-merge its entities into the
+        master BDF. The master ends up with every card in original
+        order.
+      * referenced IDs in later chunks resolve against the merged
+        master, not against the chunk that contained the reference.
+    """
+
+    def _force_chunked_path(self, deck_text):
+        """Inject a duplicate-ID card at the top to force strict-fail."""
+        return deck_text.replace(
+            'BEGIN BULK\n',
+            'BEGIN BULK\nGRID,1,,9.9,9.9,9.9\n',
+        )
+
+    def test_element_in_later_chunk_refs_grid_in_earlier_chunk(self, tmp_path):
+        # Build a deck guaranteed to span >= 2 chunks of 20k cards each.
+        deck = ['BEGIN BULK\n']
+        n_grids = 30_000
+        for k in range(1, n_grids + 1):
+            x = (k % 100) * 0.1
+            y = ((k // 100) % 100) * 0.1
+            deck.append(f'GRID,{k},,{x:.3f},{y:.3f},0.0\n')
+        deck.append('MAT1,100,1.0E7,,0.3\n')
+        deck.append('PSHELL,1,100,0.1\n')
+        # Elements in chunk 2+ that reference GRIDs from chunk 1.
+        n_elems = 5000
+        for k in range(1, n_elems + 1):
+            deck.append(f'CQUAD4,{k},1,{k},{k+1},{k+2},{k+3}\n')
+        deck.append('ENDDATA\n')
+        text = self._force_chunked_path(''.join(deck))
+
+        path = tmp_path / 'deck.bdf'
+        path.write_text(text)
+
+        m, lenient = NastranModelGenerator._read_bdf_streaming(str(path))
+        # All grids + all elements survived the chunk boundary.
+        assert len(m.nodes) == n_grids, \
+            f'expected {n_grids:,} nodes, got {len(m.nodes):,}'
+        assert len(m.elements) == n_elems, \
+            f'expected {n_elems:,} elements, got {len(m.elements):,}'
+
+        # Pick a mid-deck element. Its node IDs lived in chunk 1, the
+        # element itself lived in chunk 2+. Both must be in the merged
+        # master.
+        eid = n_elems // 2
+        elem = m.elements[eid]
+        for nid in elem.node_ids:
+            assert nid in m.nodes, \
+                f'GRID {nid} (referenced by element {eid}) missing from master'
+
+        # The merged master must also cross-reference cleanly.
+        m.cross_reference()
+
+    def test_loads_in_later_chunk_resolve_to_earlier_grids(self, tmp_path):
+        deck = ['BEGIN BULK\n']
+        n_grids = 25_000
+        for k in range(1, n_grids + 1):
+            deck.append(f'GRID,{k},,0.0,0.0,0.0\n')
+        # FORCEs and SPCs referencing GRIDs from chunk 1.
+        for k in range(1, 200):
+            deck.append(f'FORCE,1,{k},,1.0,0.0,0.0,1.0\n')
+        for k in range(1, 50):
+            deck.append(f'SPC1,2,123456,{k}\n')
+        deck.append('ENDDATA\n')
+        text = self._force_chunked_path(''.join(deck))
+
+        path = tmp_path / 'deck.bdf'
+        path.write_text(text)
+        m, _ = NastranModelGenerator._read_bdf_streaming(str(path))
+
+        assert len(m.nodes) == n_grids
+        total_loads = sum(len(v) for v in m.loads.values())
+        assert total_loads >= 199, f'lost loads across chunk boundary: {total_loads}'
+        # And cross_reference still resolves.
+        m.cross_reference()
