@@ -1,4 +1,4 @@
-# Node Runner v3.2.6
+# Node Runner v3.2.7
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,37 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.7
+
+Patch release: Entity Selection window redesigned (take 2).
+
+### Layout
+The dialog now follows standard Qt dialog convention with OK and Cancel separated at the bottom-right. Action buttons are uniform-sized in a 3x3 grid:
+
+```
++---------------------+ +-------------------+ +----------------------+
+| Add / Remove / Exc  | |  entries list     | | [Sel All][Reset][Prev]|
+| ID / To / By        | |                   | | [Pick v][Method v][More]|
+| Group               | |                   | | [Delete][Hilite][Grow v]|
++---------------------+ +-------------------+ +----------------------+
+Count: 0 / N
+-----------------------------------------------------------------
+                                              [OK]      [Cancel]
+```
+
+Changes vs v3.2.6:
+- **Uniform button sizes** in the right column via equal column-stretch on the 3x3 grid. No `setFixedSize` anywhere. The H button (now `Hilite`) sizes itself to match the others.
+- **OK/Cancel moved out of the action grid** to their own row at the bottom of the dialog, separated by a horizontal divider. Standard Qt convention.
+- **Grow submenu** at row 2 col 2 replaces the inline `Angle | Adj | Conn | Grow | Shrink` row. Click `Grow ▾` for Adjacent / Connected / Grow / Shrink, plus `Set angle threshold...` to change the dihedral tolerance. Femap also tucks these behind menus.
+- **`Hilite` button** paints amber only when checked, blending with the other buttons in its default state.
+- **Count label kept** (it's useful) - sits between the body and the bottom OK/Cancel row.
+
+### v3.2.5 mistake addressed
+v3.2.5 created the new layout but never attached it to the body, leaving the right column blank. v3.2.7 was screenshot-tested before shipping: a standalone PySide6 sketch script (`.claude/sketch_selection.py`) builds the proposed dialog and saves a PNG. The real `EntitySelectionBar` was also rendered to PNG before the release was tagged.
+
+### Tests
+- 138 tests still pass.
 
 ## Changelog for v3.2.6
 

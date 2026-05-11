@@ -208,30 +208,40 @@ class EntitySelectionBar(QDialog):
         self._highlight_btn.setToolTip("Toggle highlighting in viewport")
         self._highlight_btn.setCheckable(True)
         self._highlight_btn.setChecked(True)
-        self._highlight_btn.setFixedSize(26, 26)
+        # v3.2.7: drop the fixed 26x26 size - the grid cell now
+        # sizes it to match the other buttons. Amber only when
+        # checked so it blends with the rest in default state.
+        self._highlight_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._highlight_btn.setText("Hilite")
+        self._highlight_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._highlight_btn.setStyleSheet(
-            "font-weight: bold; background: #f9e2af; color: #1e1e2e; "
-            "border-radius: 3px; border: 1px solid #cba651;")
-        pick_h_row.addWidget(self._highlight_btn)
-        grid.addLayout(pick_h_row, 0, 2)
+            "QToolButton:checked { font-weight: bold; background: #f9e2af; "
+            "color: #1e1e2e; border: 1px solid #cba651; border-radius: 3px; }")
+        # v3.2.7: Hilite leaves pick_h_row and gets its own cell
+        # at (2, 1) so it sits next to Delete in row 2.
+        grid.addLayout(pick_h_row, 1, 0)
+        grid.addWidget(self._highlight_btn, 2, 1)
 
         # Row 1: Previous | Delete | OK
         self._prev_btn = QPushButton("Previous")
         self._prev_btn.setToolTip("Restore previous selection")
-        grid.addWidget(self._prev_btn, 1, 0)
+        grid.addWidget(self._prev_btn, 0, 2)
 
         self._delete_btn = QPushButton("Delete")
         self._delete_btn.setToolTip("Remove highlighted entries from the list")
-        grid.addWidget(self._delete_btn, 1, 1)
+        grid.addWidget(self._delete_btn, 2, 0)
 
+        # v3.2.7: OK button moves to the dialog's bottom row. The
+        # row-1 col-2 cell is now the More button (it was already
+        # row-2 col-0; we move it here so the grid stays 3x3 with
+        # no holes in the action area).
         self._ok_btn = QPushButton("OK")
         self._ok_btn.setStyleSheet("font-weight: bold;")
-        grid.addWidget(self._ok_btn, 1, 2)
 
         # Row 2: More | Method▾ | Cancel
         self._more_btn = QPushButton("More")
         self._more_btn.setToolTip("Apply current input and clear for more entries")
-        grid.addWidget(self._more_btn, 2, 0)
+        grid.addWidget(self._more_btn, 1, 2)
 
         self._method_btn = QToolButton()
         self._method_btn.setText("Method \u25b4")
@@ -241,10 +251,34 @@ class EntitySelectionBar(QDialog):
         self._method_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._method_menu = QMenu(self)
         self._method_btn.setMenu(self._method_menu)
-        grid.addWidget(self._method_btn, 2, 1)
+        grid.addWidget(self._method_btn, 1, 1)
 
+        # v3.2.7: Cancel button moves to the dialog's bottom row
+        # (below the count label + divider) along with OK. The
+        # row-2 col-2 cell is now the Grow submenu button.
         self._cancel_btn = QPushButton("Cancel")
-        grid.addWidget(self._cancel_btn, 2, 2)
+
+        # Grow submenu (v3.2.7): replaces the inline advanced row.
+        # Same handlers as the (now-hidden) inline buttons, but
+        # tucked behind a single dropdown that fills the empty
+        # row-2 col-2 slot of the action grid.
+        self._grow_menu_btn = QToolButton()
+        self._grow_menu_btn.setText("Grow \u25be")
+        self._grow_menu_btn.setToolTip(
+            "Adjacent / Connected / Grow / Shrink ; angle threshold")
+        self._grow_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._grow_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        self._grow_menu_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._grow_menu = QMenu(self)
+        self._grow_menu.addAction("Adjacent", self._request_select_adjacent)
+        self._grow_menu.addAction("Connected", self._request_select_connected)
+        self._grow_menu.addAction("Grow by 1 layer", self._request_grow)
+        self._grow_menu.addAction("Shrink by 1 layer", self._request_shrink)
+        self._grow_menu.addSeparator()
+        self._grow_menu.addAction("Set angle threshold...",
+                                  self._prompt_angle_threshold)
+        self._grow_menu_btn.setMenu(self._grow_menu)
+        grid.addWidget(self._grow_menu_btn, 2, 2)
 
         body.addLayout(grid, 0)
 
@@ -274,8 +308,28 @@ class EntitySelectionBar(QDialog):
             btn.setMaximumWidth(52)
             adv_lay.addWidget(btn)
         adv_lay.addStretch()
+        # v3.2.7: the inline advanced row is replaced by the
+        # Grow submenu in the action grid above. We KEEP the
+        # button objects so their .clicked signal connections
+        # at lines below still resolve, but the frame itself is
+        # never shown.
         self._adv_frame.hide()
-        outer.addWidget(self._adv_frame)
+        self._adv_frame.setVisible(False)
+        # Do NOT add _adv_frame to outer (would leave dead space).
+
+        # v3.2.7: separator + bottom-right OK / Cancel row.
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.HLine)
+        _sep.setFrameShadow(QFrame.Sunken)
+        outer.addWidget(_sep)
+        _bottom = QHBoxLayout()
+        _bottom.setSpacing(3)
+        _bottom.addStretch(1)
+        self._ok_btn.setMinimumWidth(80)
+        self._cancel_btn.setMinimumWidth(80)
+        _bottom.addWidget(self._ok_btn)
+        _bottom.addWidget(self._cancel_btn)
+        outer.addLayout(_bottom)
 
         # === Connect internal signals ===
         self._pick_btn.clicked.connect(self._activate_picking)
@@ -442,7 +496,8 @@ class EntitySelectionBar(QDialog):
         self._group_combo.blockSignals(False)
 
         # Show/hide advanced selection frame (Elements only)
-        self._adv_frame.setVisible(entity_type == 'Element')
+        # v3.2.7: adv frame stays hidden; the Grow submenu is the path.
+        self._adv_frame.setVisible(False)
 
         # Clear inputs
         self._clear_inputs()
@@ -796,6 +851,22 @@ class EntitySelectionBar(QDialog):
     # ------------------------------------------------------------------
     # Advanced selection (Elements only)
     # ------------------------------------------------------------------
+
+    def _prompt_angle_threshold(self):
+        """v3.2.7: prompt for the dihedral-angle threshold used by
+        Adjacent/Grow operations. Updates the (hidden) _angle_input
+        widget so the existing handlers continue to read from it."""
+        from PySide6.QtWidgets import QInputDialog
+        try:
+            current = float(self._angle_input.text())
+        except (TypeError, ValueError):
+            current = 30.0
+        value, ok = QInputDialog.getDouble(
+            self, "Set angle threshold",
+            "Dihedral angle (degrees) for Adjacent / Grow:",
+            current, 0.0, 180.0, 1)
+        if ok:
+            self._angle_input.setText(f"{value:g}")
 
     def _request_select_adjacent(self):
         try:
