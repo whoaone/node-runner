@@ -1,4 +1,4 @@
-# Node Runner v3.2.2
+# Node Runner v3.2.3
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,19 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.3
+
+Patch release. Two small but visible fixes.
+
+### Post-parse `'Cell' object has no attribute 'normal'` fix
+- Symptom: import completes (vector geometry comes through), then a popup says `Post-parse handling failed: 'Cell' object has no attribute 'normal'`.
+- Root cause: `_create_all_load_actors` builds pressure-load arrows for every PLOAD4 by reading `cell.normal` off a `pyvista.Cell` returned from `grid.get_cell()`. PyVista 0.46 doesn't expose a `.normal` attribute on `Cell`. The user's deck has 268,000 PLOAD4 cards so this fires on every real aerospace deck with shell-pressure loads.
+- Fix: compute the shell normal manually from the cell's points (`np.cross(p1-p0, p2-p0)` then normalize). One-time cost per PLOAD4, no API dependency on PyVista internals.
+
+### Coordinate Systems group: collapsed and off by default
+- Big aerospace decks routinely have dozens of CORD2R systems (one per superelement boundary, one per skin panel). Showing all of them on first open clutters the tree and the 3D view.
+- v3.2.3: the "Coordinate Systems" tree group now defaults to **unchecked** (all coord actors hidden) and **collapsed** (children not expanded). The user can expand and check individual systems as needed.
 
 ## Changelog for v3.2.2
 

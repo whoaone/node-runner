@@ -222,7 +222,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.2.2"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.2.3"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -3473,7 +3473,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.2.2</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.2.3</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -6542,9 +6542,18 @@ class MainWindow(QMainWindow):
         
 
         if model.coords:
-            coords_item = create_item(self.tree_widget, "Coordinate Systems", data=('group', 'coords'))
+            # v3.2.2: Coordinate Systems group defaults to UNCHECKED
+            # and COLLAPSED. On big aerospace decks there are often
+            # dozens of CORD2R systems (one per superelement boundary,
+            # one per skin panel, etc.) and they clutter the tree on
+            # first open. The user can still expand and check
+            # individual systems if they want to see them.
+            coords_item = create_item(
+                self.tree_widget, "Coordinate Systems",
+                data=('group', 'coords'), checked=False)
+            coords_item.setExpanded(False)
             for cid in sorted(model.coords.keys()):
-                
+
                 if cid == 0:
                     label = "Global Rectangular"
                 elif cid == 1:
@@ -6560,12 +6569,13 @@ class MainWindow(QMainWindow):
                         label = f"{type_name} - {title}"
                     else:
                         label = type_name
-                
-                # --- FIX: Set the default visibility state based on the CID ---
-                # Default systems (0, 1, 2) start OFF. User-created systems start ON.
-                is_checked_by_default = (cid > 2)
-                
-                create_item(coords_item, f"CID {cid}: {label}", data=('coord', cid), checked=is_checked_by_default)
+
+                # Individual coord items also start UNCHECKED. The
+                # parent group is unchecked too so toggling the group
+                # back on lets the user pick which ones to show.
+                create_item(
+                    coords_item, f"CID {cid}: {label}",
+                    data=('coord', cid), checked=False)
 
         if model.materials:
             mats_item = create_item(self.tree_widget, "Materials", data=('group', 'materials'))
@@ -8568,7 +8578,26 @@ class MainWindow(QMainWindow):
                         if (cell_idx := eid_to_cell_idx_map.get(eid)) is not None:
                             cell = self.current_grid.get_cell(cell_idx)
                             pressure_points.append(cell.center)
-                            pressure_vectors.append(cell.normal * load.pressures[0])
+                            # PyVista 0.46 doesn't expose Cell.normal;
+                            # compute it manually from the cell's points
+                            # for TRIANGLE / QUAD shells. Cross-product
+                            # of two edges, then normalize.
+                            try:
+                                pts = np.asarray(cell.points)
+                                if pts.shape[0] >= 3:
+                                    v1 = pts[1] - pts[0]
+                                    v2 = pts[2] - pts[0]
+                                    n = np.cross(v1, v2)
+                                    n_norm = np.linalg.norm(n)
+                                    if n_norm > 1e-12:
+                                        n = n / n_norm
+                                    else:
+                                        n = np.array([0.0, 0.0, 1.0])
+                                else:
+                                    n = np.array([0.0, 0.0, 1.0])
+                            except Exception:
+                                n = np.array([0.0, 0.0, 1.0])
+                            pressure_vectors.append(n * load.pressures[0])
 
             if force_points:
                 actor = pv.PolyData(np.array(force_points))
