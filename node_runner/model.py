@@ -35,7 +35,15 @@ class ImportProgress:
       stage           : 'inline' | 'parse' | 'render' | 'done'
       label           : short stage label for the top of the dialog
                         (e.g. 'Stage 4/4: Chunked-strict parse')
-      source_file     : basename of the current include / source file
+      source_file     : basename of the current include / source file.
+                        STRICTLY a filename or empty - never a sentence.
+                        The dialog uses it as the persistent 'Last file
+                        read' line, so anything that isn't a real
+                        filename pollutes the UI (v3.2.1 regression).
+      detail          : human-readable detail string for the line under
+                        the progress bar. Anything that isn't a
+                        filename / card type / error / counter belongs
+                        here. Added in v3.2.2.
       card_type       : pyNastran card name (e.g. 'CBUSH')
       line_number     : 1-based line in source_file, 0 if unknown
       error           : one-line pyNastran exception text, '' if none
@@ -48,6 +56,7 @@ class ImportProgress:
     stage: str = "inline"
     label: str = ""
     source_file: str = ""
+    detail: str = ""
     card_type: str = ""
     line_number: int = 0
     error: str = ""
@@ -318,6 +327,12 @@ class NastranModelGenerator:
         field_format: 'short' (size=8), 'long' (size=16), or 'free' (comma).
         For 'free', pyNastran's BDF.write_bdf is invoked at size=8 and the
         resulting file is post-processed in place by `_convert_bdf_to_free`.
+
+        v3.2.2: if the model was imported through the streaming reader
+        and any analysis-only cards (TEMP, TLOAD, etc.) were stripped
+        out before pyNastran saw them, the raw lines are stored on
+        ``model._skipped_raw_lines``. We append them here so round-
+        tripping the deck preserves every card.
         """
         if field_format not in FIELD_FORMATS:
             field_format = 'short'
@@ -328,6 +343,62 @@ class NastranModelGenerator:
             self.model.write_bdf(output_path, size=8, is_double=False)
             if field_format == 'free':
                 _convert_bdf_to_free(output_path)
+
+        # Append the stash of analysis-only cards that the import path
+        # stripped before pyNastran saw them. The stash is raw text -
+        # syntactically valid Nastran cards copied verbatim from the
+        # source deck - so the solver accepts them as-is.
+        stash = getattr(self.model, '_skipped_raw_lines', '') or ''
+        counts = getattr(self.model, '_skipped_card_counts', {}) or {}
+        if stash:
+            # If pyNastran wrote an ENDDATA, insert the stash just
+            # before it; otherwise append at end of file.
+            import os as _os
+            try:
+                with open(output_path, 'r', encoding='utf-8',
+                          errors='replace') as fh:
+                    body = fh.read()
+                # Build a header comment that names what we re-injected.
+                if counts:
+                    top = ', '.join(
+                        f'{n}: {c:,}' for n, c in
+                        sorted(counts.items(), key=lambda kv: -kv[1])[:5])
+                    header = (
+                        f"$ -- Cards stashed by Node Runner v3.2.2 "
+                        f"(analysis-only, {sum(counts.values()):,} total): "
+                        f"{top}\n"
+                    )
+                else:
+                    header = (
+                        "$ -- Cards stashed by Node Runner v3.2.2 "
+                        "(analysis-only):\n"
+                    )
+
+                # Find ENDDATA case-insensitively, optionally preceded
+                # by whitespace.
+                import re as _re
+                m = _re.search(r'(?im)^\s*ENDDATA\b.*?$', body)
+                if m:
+                    insert_at = m.start()
+                    new_body = (
+                        body[:insert_at] + header + stash + body[insert_at:]
+                    )
+                else:
+                    new_body = body + (
+                        '' if body.endswith('\n') else '\n'
+                    ) + header + stash
+                with open(output_path, 'w', encoding='utf-8') as fh:
+                    fh.write(new_body)
+            except OSError:
+                # Best-effort: if we can't read the file back (unlikely
+                # right after pyNastran wrote it), append at end.
+                try:
+                    with open(output_path, 'a', encoding='utf-8') as fh:
+                        fh.write(
+                            "\n$ -- Cards stashed by Node Runner v3.2.2:\n")
+                        fh.write(stash)
+                except OSError:
+                    pass
     
     def _generate_nodes(self):
         radius = self.params['fuselage_radius']; num_bays = self.params['num_bays']; frame_spacing = self.params['frame_spacing']; num_stringers = self.params['num_stringers']
@@ -4113,30 +4184,27 @@ class NastranModelGenerator:
         def _emit(stage, message='', frac=None, **kwargs):
             """Forward a progress record to the dialog callback.
 
-            v3.2.0 callers may pass a structured callback that wants an
-            ``ImportProgress`` record. Legacy v3.1 callers expect the
-            3-tuple (stage, message, fraction). We try the new shape
-            first and fall back.
+            v3.2.2: ``source_file`` is now reserved for actual include
+            file basenames. If the caller passes only a hand-formatted
+            ``message``, the tail goes into the ``detail`` field (NOT
+            ``source_file``) so the dialog's persistent 'Last file
+            read' line never gets polluted with stage descriptions.
 
-            Extra keyword args (source_file, card_type, line_number,
-            error, counter_done, counter_total, rate, eta_seconds) ride
-            on the record verbatim.
+            Extra keyword args ride on the record verbatim.
             """
             if progress is None:
                 return
-            # Build the record. If the caller passed only a hand-formatted
-            # 'message' (legacy site), split it on the first ' - ' so the
-            # record at least has separate label / detail fields.
             label = kwargs.pop('label', None)
             if label is None:
                 if ' - ' in message:
                     head, _, tail = message.partition(' - ')
                     label = head.strip()
-                    if 'source_file' not in kwargs and not kwargs.get(
-                            'card_type') and not kwargs.get('error'):
-                        # No structured detail provided - park the
-                        # tail in source_file so the dialog can show it.
-                        kwargs.setdefault('source_file', tail.strip())
+                    # Tail goes to detail - NOT source_file. This is the
+                    # v3.2.2 fix for the regression where "Stage 4/4:
+                    # Chunked-strict parse - 6,079,465 cards in ~8k-card
+                    # chunks ..." ended up displayed as "Last file
+                    # read: 6,079,465 cards ...".
+                    kwargs.setdefault('detail', tail.strip())
                 else:
                     label = message.strip()
             rec = ImportProgress(stage=stage, label=label,
@@ -4198,6 +4266,49 @@ class NastranModelGenerator:
         text, missing_inline = NastranModelGenerator._inline_includes(
             filepath, progress=_inline_progress)
         missing = list(missing) + list(missing_inline)
+
+        # ---- Phase B.5: strip analysis-only cards ----
+        # Real aerospace decks are often dominated by cards Node Runner
+        # never displays - nodal temperatures, dynamic load functions,
+        # response spectra, optimization variables, output sets. On
+        # one user's deck 4.6M of 6.08M cards (76%) were TEMP cards
+        # that pyNastran would chew through for ~60-90 s before falling
+        # to lenient for many minutes. We never look at those cards
+        # in any UI.
+        #
+        # The strip is a single pass over the inlined buffer (cheap)
+        # and is information-preserving: skipped lines are stashed
+        # verbatim and appended to the export so save/save-as round-
+        # trips intact.
+        from node_runner.skip_cards import strip_analysis_only_cards
+        _emit('parse',
+              label='Stage 2b/4: Stripping analysis-only cards',
+              detail='Looking for thermal loads, function tables, '
+                     'optimization cards...',
+              frac=0.24)
+        text, _skipped_raw, _skip_counts = strip_analysis_only_cards(text)
+
+        def _attach_stash(model_obj):
+            """Stash the analysis-only raw lines + counts onto the
+            BDF model. The export path appends _skipped_raw_lines
+            before ENDDATA so the round-trip preserves these cards.
+            """
+            if model_obj is None:
+                return
+            try:
+                model_obj._skipped_raw_lines = _skipped_raw
+                model_obj._skipped_card_counts = dict(_skip_counts)
+            except Exception:
+                pass
+        if _skip_counts:
+            total_skipped = sum(_skip_counts.values())
+            top3 = ', '.join(
+                f'{n}: {c:,}' for n, c in _skip_counts.most_common(3))
+            _emit('parse',
+                  label='Stage 2b/4: Analysis-only cards stashed',
+                  detail=(f"Skipped {total_skipped:,} analysis-only cards "
+                          f"({top3}). Will be written back on export."),
+                  frac=0.25)
 
         # ---- Phase C: parse the flat buffer ----
         # Count card-starts up front so we can:
@@ -4308,6 +4419,7 @@ class NastranModelGenerator:
                           f'{len(m.elements):,} elements',
                           1.0)
                     NastranModelGenerator._finalize_for_viewer(m)
+                    _attach_stash(m)
                     return (m, None)
                 except Exception as exc:
                     raw = str(exc).split('\n')[0].strip()
@@ -4389,6 +4501,7 @@ class NastranModelGenerator:
                       + (f' ({len(skipped)} skipped)' if skipped else ''),
                       1.0)
                 NastranModelGenerator._finalize_for_viewer(chunked_model)
+                _attach_stash(chunked_model)
                 if used_lenient:
                     counts = {}
                     for fname in ('nodes', 'elements', 'properties',
@@ -4433,6 +4546,7 @@ class NastranModelGenerator:
                           f'({len(result.skipped)} skipped)',
                           1.0)
                     NastranModelGenerator._finalize_for_viewer(result.model)
+                    _attach_stash(result.model)
                     return (result.model, result)
                 except Exception as e:
                     raise RuntimeError(

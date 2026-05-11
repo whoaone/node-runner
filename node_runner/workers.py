@@ -230,18 +230,24 @@ class _SyncImportDialog(QDialog):
 
         # Update the persistent "Last file read" line whenever a record
         # carries a non-empty source_file. We DO NOT clear it on records
-        # that lack source_file - this is the v3.2.1 fix for the v3.2.0
-        # symptom where the file name disappeared on stage transitions.
+        # that lack source_file - this is the v3.2.1 behaviour. v3.2.2
+        # additionally guarantees that source_file is STRICTLY a
+        # filename (not a sentence) because the model layer's _emit no
+        # longer stuffs message tails into source_file.
         if record.source_file:
             self._last_file_seen = record.source_file
             self._last_file_label.setText(
                 f"Last file read: <b>{record.source_file}</b>")
 
-        # Build the detail line. The source file already lives in the
-        # persistent "Last file read" line above, so we don't repeat it
-        # here. The detail line carries only the in-flight info: card
-        # type, line number, error reason, counter, rate, ETA.
+        # v3.2.2: structured ``detail`` field on the record carries any
+        # human-readable detail the model layer wants displayed under
+        # the bar (e.g. "Skipped 4,638,690 analysis-only cards (TEMP:
+        # 4,638,690). Will be written back on export."). If the record
+        # also has card_type / error / counter / rate, those get
+        # appended in the format below.
         parts = []
+        if record.detail:
+            parts.append(record.detail)
         if record.error:
             prefix = []
             if record.line_number:

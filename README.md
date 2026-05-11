@@ -1,4 +1,4 @@
-# Node Runner v3.2.1
+# Node Runner v3.2.2
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,38 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.2
+
+Patch release. Two fixes; the headline is that **decks dominated by analysis-only cards (TEMP, TLOAD, tables, etc.) now import in seconds instead of "Not Responding forever"**.
+
+### Strip analysis-only cards on import
+
+The user's `Fuse_BFEM_Light.bdf` was 76% TEMP cards (4.6 million of 6.08 million total) — nodal temperature loads for downstream thermal analysis. Node Runner has no UI to render, edit, or otherwise use TEMP cards (or TLOAD, RLOAD, TABLED*, DCONSTR, DRESP, etc.). But v3.2.1 still fed all 4.6M to pyNastran's parser, which is what made the dialog say "Not Responding".
+
+v3.2.2 strips a hardcoded set of analysis-only cards from the inlined buffer **before** pyNastran sees them. The raw lines are stashed verbatim and appended back on export, so the round-trip preserves every card. The skip list is intentionally not user-toggleable — a toggle would just be a footgun (flip it off, get a hang, no idea why).
+
+The skip set covers:
+- Thermal loads: `TEMP`, `TEMPD`, `TEMPF`, `TEMPB`, `TEMPRB`, `TEMPAX`, `TEMPP1..4`
+- Dynamic loads: `TLOAD1/2`, `RLOAD1/2`, `DAREA`, `DPHASE`, `DELAY`
+- Function tables: `TABLED1..4`, `TABLEM1..4`, `TABLES1`, `TABRND1`, `TABRNDG`, `TABDMP1`
+- Optimization: `DCONSTR`, `DESVAR`, `DLINK`, `DRESP1..3`, `DVPREL1/2`, `DVCREL1/2`, `DVMREL1/2`, `DOPTPRM`
+- Output sets / eigenvalue control: `SET1/2/3`, `BOUTPUT`, `EIGR`, `EIGRL`, `EIGB`, `EIGC`, `EIGP`
+
+The post-import status line reports the count:
+```
+Opened Fuse_BFEM_Light.bdf - includes 4,419 rigid elements (RBE/RBAR),
+  4,638,690 analysis-only cards stashed (TEMP: 4,638,690) - written back on export
+```
+
+When a future version of Node Runner adds UI for any of these card types, that type comes off the skip list and starts going through the full parser.
+
+### "Last file read" regression fixed
+- v3.2.1's dialog line "Last file read: 6,079,465 cards in ~8k-card chunks. Bad chunks fall back to lenient ..." was a regression: my `_emit` adapter was putting the message tail into the `source_file` field for legacy emits. v3.2.2 keeps `source_file` strictly for actual include-file basenames; a new `detail` field on `ImportProgress` carries the descriptive text. The detail line under the bar uses `record.detail` directly.
+
+### Tests
+- 12 new pytest cases in `tests/test_skip_cards.py` covering the skip set composition, card-name detection for all three formats (fixed, comma, 16-char), strip semantics, continuation handling, and an end-to-end round-trip that verifies TEMP cards survive `import → save → re-read`.
+- **138 tests pass** (was 126).
 
 ## Changelog for v3.2.1
 
