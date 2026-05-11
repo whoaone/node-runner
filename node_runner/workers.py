@@ -211,27 +211,27 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
         generator = NastranModelGenerator()
 
         if has_includes:
-            dialog.set_message(
-                "Stage 1/4: Scanning INCLUDE chain (counting files + sizes)...")
+            dialog.set_message("Stage 1/4: Scanning INCLUDE chain")
+            dialog.set_detail("Counting files + sizes...")
             QApplication.processEvents()
 
             def _progress(stage, message, frac):
-                # Show the rich message verbatim - the model layer's
-                # stage labels and per-stage details are designed to
-                # be read by the end user. We used to overwrite this
-                # with a generic 'Parsing flattened deck...' which
-                # hid all the useful per-file/per-card detail.
-                short_msg = message
-                # If the message is too long for the main label, put
-                # the first sentence in the title and the rest in the
-                # detail line. Otherwise keep both in sync.
-                if '. ' in message and len(message) > 80:
-                    head, _, tail = message.partition('. ')
-                    short_msg = head + '.'
-                    detail_msg = tail.strip() or message
+                # The model layer emits messages of the form
+                #   "Stage X/Y: <stage label> - <details>"
+                # We split on the FIRST ' - ' so the top of the dialog
+                # gets the high-level stage label and the line under
+                # the progress bar gets the concrete details (file,
+                # card, error, etc.). If there's no separator, the
+                # whole message is treated as stage and details are
+                # blanked.
+                if ' - ' in message:
+                    stage_label, _, detail_msg = message.partition(' - ')
+                    stage_label = stage_label.strip()
+                    detail_msg = detail_msg.strip()
                 else:
-                    detail_msg = message
-                dialog.set_message(short_msg)
+                    stage_label = message.strip()
+                    detail_msg = ''
+                dialog.set_message(stage_label)
                 dialog.set_detail(detail_msg)
                 dialog.set_fraction(frac)
                 QApplication.processEvents()
@@ -248,6 +248,21 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
             dialog.set_fraction(1.0)
 
         generator.model = model
+
+        # Resolve cp_ref / cd_ref on every node so get_position() works.
+        # Without this, scene-building crashes with
+        #   'NoneType' object has no attribute 'transform_node_to_global'
+        # because we read with xref=False for speed and pyNastran's
+        # node.get_position() requires cp_ref to be set.
+        dialog.set_message("Stage 5/5: Resolving coordinate references")
+        dialog.set_detail("Wiring up grid coord systems for the viewer...")
+        QApplication.processEvents()
+        try:
+            NastranModelGenerator._finalize_for_viewer(model)
+        except Exception:
+            # Best effort; visualization may fail later but we don't
+            # want to lose the whole import over an unexpected hiccup.
+            pass
     except Exception as exc:
         QApplication.restoreOverrideCursor()
         dialog.close()

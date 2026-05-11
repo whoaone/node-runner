@@ -520,6 +520,35 @@ class TestChunkedCrossRefs:
         # And cross_reference still resolves.
         m.cross_reference()
 
+    def test_finalize_for_viewer_resolves_cp_ref(self, tmp_path):
+        """v3.1.5 regression: a deck whose GRIDs reference a non-basic
+        coord system must be usable for get_position() even without
+        a full pyNastran cross_reference pass.
+
+        Before v3.1.5: get_position() crashed with
+            'NoneType' object has no attribute 'transform_node_to_global'
+        because we read with xref=False for speed and never resolved
+        node.cp_ref. The post-parse _finalize_for_viewer fixup wires
+        every node's cp_ref so the viewer's scene build works.
+        """
+        deck = (
+            "SOL 101\nCEND\nBEGIN BULK\n"
+            "CORD2R,10,0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0\n"
+            "GRID,1,10,1.0,0.0,0.0\n"
+            "GRID,2,0,5.0,0.0,0.0\n"
+            "GRID,3,99,0.0,1.0,0.0\n"   # cp=99 doesn't exist; falls back to basic
+            "ENDDATA\n"
+        )
+        path = tmp_path / 'deck.bdf'
+        path.write_text(deck)
+        m, _ = NastranModelGenerator._read_bdf_robust(str(path))
+        NastranModelGenerator._finalize_for_viewer(m)
+        # Every node now has cp_ref set; get_position works.
+        for nid in (1, 2, 3):
+            pos = m.nodes[nid].get_position()
+            assert pos is not None
+            assert len(pos) == 3
+
     def test_dmig_matrix_survives_chunked_path(self, tmp_path):
         """A DMIG matrix with many entries (more than chunk_card_count)
         must keep all its entries when the chunked path is taken.

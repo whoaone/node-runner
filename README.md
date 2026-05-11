@@ -1,4 +1,4 @@
-# Node Runner v3.1.4
+# Node Runner v3.1.5
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,25 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.1.5
+
+Patch release: fixes the post-parse crash on decks that use non-basic coord systems, and cleans up the import dialog so the top label and detail line aren't showing the same text.
+
+### Post-parse `'NoneType' object has no attribute 'transform_node_to_global'`
+- Symptom: a deck imports successfully (progress bar reaches 100%, no errors during parse), then the application throws a `'NoneType'.transform_node_to_global` error in a popup. Nothing displays.
+- Root cause: Node Runner reads with `xref=False` for speed (full pyNastran cross_reference takes minutes on big decks). But `pyNastran.node.get_position()` requires `node.cp_ref` to be set, and `xref=False` leaves it as `None`. The scene-build path calls `get_position()` and crashes.
+- Fix: new `_finalize_for_viewer(model)` helper does the minimum cross-reference work needed for visualization: walks every CORD2x's RID chain, then wires every GRID's `cp_ref` and `cd_ref` to the matching COORD object. Unknown coord IDs fall back to basic (CID 0) so we never crash, just degrade gracefully.
+- The finalize step shows as **Stage 5/5: Resolving coordinate references** in the import dialog.
+
+### Cleaner import dialog
+- Before: the top label and the line under the progress bar showed the same text ("Parsing flattened deck..." in both places).
+- After: the top label is the high-level stage ("Stage 2/4: Reading include files"), the line under the bar is the concrete detail ("foo.bdf (5 / 7 files, 237.1 / 246.6 MB)"). The split happens on the first `" - "` in the model-layer status string, so the model layer controls both fields explicitly.
+- All Stage 1-5 messages now follow the `"Stage X/Y: <stage> - <detail>"` convention.
+
+### Tests
+- New `test_finalize_for_viewer_resolves_cp_ref` builds a deck with both basic-coord and non-basic-coord GRIDs, plus a GRID referencing a non-existent CID, and confirms `get_position()` works on all of them after the finalize step.
+- 123 tests pass.
 
 ## Changelog for v3.1.4
 

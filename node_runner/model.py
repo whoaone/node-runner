@@ -3189,6 +3189,86 @@ class NastranModelGenerator:
                              counts=counts)
 
     @staticmethod
+    def _finalize_for_viewer(model):
+        """Post-parse fixup so node.get_position() and similar work.
+
+        Node Runner reads with ``xref=False`` for speed (the deck may
+        have hundreds of MB of bulk data and full pyNastran cross-
+        reference would take minutes). But ``node.get_position()``
+        requires ``node.cp_ref`` to be set - otherwise it crashes with
+        ``'NoneType' object has no attribute 'transform_node_to_global'``.
+
+        This function does the minimum xref needed for visualization:
+          * Resolve every GRID's ``cp`` integer ID into a ``cp_ref``
+            COORD object reference.
+          * Resolve every COORD2x's ``rid`` reference (chain of
+            coordinate systems).
+        We DON'T resolve elements, properties, loads, etc. - those
+        aren't needed to render the model and would trip up on the
+        permissive merges chunked-strict does.
+
+        Safe to call on any pyNastran BDF object; silently skips
+        anything it can't resolve.
+        """
+        if model is None:
+            return
+        # First pass: resolve coord systems' own RID chain. Walk in a
+        # loop because CORD2R can reference another CORD2R.
+        coords = getattr(model, 'coords', None) or {}
+        for _ in range(8):  # max chain depth; CORD chains are usually 1-2
+            still_unresolved = False
+            for cid, cs in coords.items():
+                if getattr(cs, 'rid_ref', None) is not None:
+                    continue
+                rid = getattr(cs, 'rid', None)
+                if rid is None or rid == 0:
+                    # Basic - has no parent
+                    continue
+                try:
+                    cs.rid_ref = coords.get(int(rid))
+                    if cs.rid_ref is None:
+                        still_unresolved = True
+                except Exception:
+                    still_unresolved = True
+            if not still_unresolved:
+                break
+        # Second pass: wire each grid's cp_ref to the coord object.
+        nodes = getattr(model, 'nodes', None) or {}
+        basic = coords.get(0)
+        for nid, node in nodes.items():
+            if getattr(node, 'cp_ref', None) is not None:
+                continue
+            cp = getattr(node, 'cp', 0)
+            try:
+                cp_int = int(cp) if cp is not None else 0
+            except (TypeError, ValueError):
+                cp_int = 0
+            ref = coords.get(cp_int)
+            if ref is None:
+                # Unknown cp - fall back to basic so get_position
+                # doesn't crash. xyz is treated as already-global.
+                ref = basic
+            try:
+                node.cp_ref = ref
+            except Exception:
+                pass
+        # Third pass: same for any GRID's cd (output coord). Less
+        # critical but some pyNastran code paths read it.
+        for nid, node in nodes.items():
+            if getattr(node, 'cd_ref', None) is not None:
+                continue
+            cd = getattr(node, 'cd', 0)
+            try:
+                cd_int = int(cd) if cd is not None else 0
+            except (TypeError, ValueError):
+                cd_int = 0
+            ref = coords.get(cd_int) or basic
+            try:
+                node.cd_ref = ref
+            except Exception:
+                pass
+
+    @staticmethod
     def _try_read_bdf(filepath, punch, silent_log, devnull, include_dir=None):
         """Attempt to read a BDF file, suppressing all output.
 
@@ -4028,19 +4108,25 @@ class NastranModelGenerator:
             if inline_state['last_file'] else ""
         )
 
+        last_file_detail = (
+            f"Last file read: {inline_state['last_file']}. "
+            if inline_state['last_file'] else ""
+        )
         if skip_whole_strict:
             _emit('parse',
-                  f"Stage 3/4: Big deck detected "
-                  f"({approx_card_count:,} cards, {flat_mb:.1f} MB). "
-                  f"Skipping whole-deck strict parse (it would freeze the "
-                  f"window for minutes and usually fails on big decks); "
-                  f"going straight to chunked-strict.{last_file_msg}",
+                  f"Stage 3/4: Big deck detected, skipping whole-deck strict "
+                  f"- {approx_card_count:,} cards, {flat_mb:.1f} MB. "
+                  f"{last_file_detail}"
+                  f"Going straight to chunked-strict (whole-deck would "
+                  f"freeze the window for minutes and usually fails on "
+                  f"big decks).",
                   0.26)
         else:
             _emit('parse',
                   f"Stage 3/4: Parsing flat deck strictly "
-                  f"({approx_card_count:,} cards, {flat_mb:.1f} MB). "
-                  f"Window will appear frozen for this step.{last_file_msg}",
+                  f"- {approx_card_count:,} cards, {flat_mb:.1f} MB. "
+                  f"{last_file_detail}"
+                  f"Window will appear frozen for this step.",
                   0.26)
 
         tmp = tempfile.NamedTemporaryFile(
@@ -4063,6 +4149,7 @@ class NastranModelGenerator:
                           f'Imported {len(m.nodes):,} nodes, '
                           f'{len(m.elements):,} elements',
                           1.0)
+                    NastranModelGenerator._finalize_for_viewer(m)
                     return (m, None)
                 except Exception as exc:
                     raw = str(exc).split('\n')[0].strip()
@@ -4073,14 +4160,15 @@ class NastranModelGenerator:
             # ---- Chunked-strict (always reached for big decks) ----
             if strict_fail_reason:
                 _emit('parse',
-                      f"Stage 4/4: Whole-deck strict failed "
-                      f"({strict_fail_reason}). Switching to chunked-strict "
-                      f"({approx_card_count:,} cards, ~8k cards per chunk).",
+                      f"Stage 4/4: Chunked-strict parse "
+                      f"- whole-deck strict failed: {strict_fail_reason}. "
+                      f"Splitting into ~8k-card chunks. Bad chunks fall "
+                      f"back to lenient automatically.",
                       0.26)
             else:
                 _emit('parse',
-                      f"Stage 4/4: Running chunked-strict parse "
-                      f"({approx_card_count:,} cards, ~8k cards per chunk). "
+                      f"Stage 4/4: Chunked-strict parse "
+                      f"- {approx_card_count:,} cards in ~8k-card chunks. "
                       f"Bad chunks fall back to lenient automatically.",
                       0.26)
 
@@ -4144,6 +4232,7 @@ class NastranModelGenerator:
                       f'{n_elements:,} elements'
                       + (f' ({len(skipped)} skipped)' if skipped else ''),
                       1.0)
+                NastranModelGenerator._finalize_for_viewer(chunked_model)
                 if used_lenient:
                     counts = {}
                     for fname in ('nodes', 'elements', 'properties',
@@ -4181,6 +4270,7 @@ class NastranModelGenerator:
                           f'Imported {len(result.model.nodes):,} nodes '
                           f'({len(result.skipped)} skipped)',
                           1.0)
+                    NastranModelGenerator._finalize_for_viewer(result.model)
                     return (result.model, result)
                 except Exception as e:
                     raise RuntimeError(
