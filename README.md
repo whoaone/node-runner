@@ -1,4 +1,4 @@
-# Node Runner v3.2.4
+# Node Runner v3.2.5
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,30 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.5
+
+Patch release: Entity Selection window redesign.
+
+### Uniform-size buttons, OK/Cancel separated at bottom-right
+- Every action button (`Select All`, `Reset`, `Previous`, `Pick`, `Method`, `More`, `Delete`, `Hilite`) is now the same size, driven by equal column-stretch on a 3-column grid. No more H button at 26x26 px next to wide buttons.
+- OK and Cancel sit together on their own row at the bottom-right of the right column, separated from the action grid by a vertical stretch.
+- Layout:
+  ```
+  [Select All]  [Reset]     [Previous]
+  [Pick ▾]      [Method ▾]  [More]
+  [Delete]      [Hilite]
+  ---------- (spacer) ---------------
+                              [OK]  [Cancel]
+  ```
+- The Hilite button (renamed from "H") only paints amber when checked, so it visually matches the other buttons in its default state instead of standing out.
+
+### Result
+- The dialog's default height matches the manually-resized version from v3.2.4 — no more excess vertical whitespace.
+- Buttons are logically grouped: bulk-actions on top, input-methods in the middle, list-ops on the bottom; decision (OK/Cancel) clearly separated.
+
+### Tests
+- 138 tests still pass (no semantic changes; layout-only).
 
 ## Changelog for v3.2.4
 
