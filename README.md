@@ -1,4 +1,4 @@
-# Node Runner v3.1.3
+# Node Runner v3.1.4
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,38 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.1.4
+
+Patch release: external-superelement support. Real aerospace decks with `.pch` punch files containing DMIG stiffness/mass matrices now import without silently losing entries.
+
+### What was broken
+A single DMIG matrix in a `.pch` file can have thousands of column-entry cards. With the chunked-strict path, those entries could span multiple chunks and the chunk-merge logic (first-write-wins by matrix name) would drop entries from chunks 2..N. Even worse, if the chunk fell into lenient fallback, pyNastran's `add_card` would queue the DMIG entries into `_dmig_temp` but `fill_dmigs()` was never called to materialize them - so the matrix ended up with zero entries.
+
+### Fixes
+
+#### DMIG-family card pre-extract
+- Before chunking, the importer now scans the inlined buffer for every DMIG / DMI / DMIJ / DMIJI / DMIK card (plus their continuation lines) and pulls them out into a dedicated punch sub-deck.
+- The DMIG sub-deck is parsed in one shot with `pyNastran.read_bdf(punch=True, validate=False)` - which DOES call `fill_dmigs()` automatically. Every DMIG entry survives.
+- The non-DMIG bulk data goes through chunked-strict as before.
+
+#### DMIG detection in both formats
+- The DMIG-family detector handles both fixed-format (`DMIG    K25 ...`) and comma-delimited free-field (`DMIG,K25,...`) cards, as well as the 16-char `DMIG*` form used in real `.pch` files.
+
+#### fill_dmigs in lenient path
+- `_read_bdf_lenient` now calls `fill_dmigs()` at the end so any DMIG entries that arrived through the lenient path are materialized into actual matrix entries.
+
+#### List-extending merge for SID-keyed dicts
+- `loads`, `spcs`, `mpcs`, `tables_sdamping`, `random_tables` are now merged by extending the list when the same key (SID) appears across chunks, instead of dropping subsequent chunks' contributions.
+
+#### Defensive DMIG matrix merge
+- Same-name DMIG matrices across chunks (should be rare with pre-extract, but kept as a safety net) now combine their GCi/GCj/Real/Complex/GCs arrays instead of first-write-wins.
+
+#### Import summary now reports DMIG / RBE / MPC / SE counts
+- The status bar message after a successful import now reads e.g.: "Opened deck.dat - includes 4 DMIG matrix(es), 1,247 rigid elements (RBE/RBAR), 89 MPC equation(s), 3 superelement card(s)". So you can verify the SE data actually came through.
+
+### Tests
+- New `test_dmig_matrix_survives_chunked_path` in `TestChunkedCrossRefs` builds a 12,000-entry DMIG matrix (well over the 8k chunk size), injects a duplicate GRID to force the chunked path, and asserts all 12,000 entries are present in the final master. 122 tests pass.
 
 ## Changelog for v3.1.3
 

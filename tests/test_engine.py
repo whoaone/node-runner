@@ -519,3 +519,39 @@ class TestChunkedCrossRefs:
         assert total_loads >= 199, f'lost loads across chunk boundary: {total_loads}'
         # And cross_reference still resolves.
         m.cross_reference()
+
+    def test_dmig_matrix_survives_chunked_path(self, tmp_path):
+        """A DMIG matrix with many entries (more than chunk_card_count)
+        must keep all its entries when the chunked path is taken.
+
+        v3.1.4 pre-extracts DMIG-family cards into a dedicated punch
+        sub-parse so chunking can't split a matrix and the chunk's
+        lenient fallback can't drop entries during add_card. Before
+        v3.1.4 this test showed KAAX with 0 entries.
+        """
+        # Build a deck with > 8000 DMIG entries so chunking would
+        # normally split it. Also include a duplicate GRID to force
+        # the strict path to fail and trigger the chunked fallback.
+        n_dmig = 12_000  # > default chunk size of 8000
+        deck = ['BEGIN BULK\n']
+        deck.append('GRID,1,,9.9,9.9,9.9\n')  # duplicate forces chunked
+        for k in range(1, 101):
+            deck.append(f'GRID,{k},,0.0,0.0,0.0\n')
+        deck.append('DMIG,KAAX,0,6,1,0\n')  # matrix header
+        for k in range(1, n_dmig + 1):
+            gj = (k % 100) + 1
+            cj = (k % 6) + 1
+            deck.append(f'DMIG,KAAX,{gj},{cj},,{gj},{cj},{1.0 + k:.4f}\n')
+        deck.append('ENDDATA\n')
+
+        path = tmp_path / 'deck.bdf'
+        path.write_text(''.join(deck))
+        m, _ = NastranModelGenerator._read_bdf_streaming(str(path))
+
+        assert 'KAAX' in m.dmig, 'KAAX matrix missing from chunked import'
+        kaax = m.dmig['KAAX']
+        # GCi / GCj / Real must each have all n_dmig entries.
+        assert len(kaax.GCi) == n_dmig, \
+            f'lost DMIG entries: {len(kaax.GCi)} != {n_dmig}'
+        assert len(kaax.GCj) == n_dmig
+        assert len(kaax.Real) == n_dmig

@@ -3151,6 +3151,25 @@ class NastranModelGenerator:
             except Exception:
                 pass
 
+        # ---- Step 4.5: Materialize DMIG matrix entries ----
+        # pyNastran's add_card() queues DMIG/DMI/etc entry cards into
+        # model._dmig_temp; the matrices aren't actually populated until
+        # fill_dmigs() is called. read_bdf() does this automatically at
+        # the end of a strict parse, but add_card-driven lenient parsing
+        # never triggers it. Without this call, model.dmig['KAAX'] is an
+        # empty matrix even though every entry card was added cleanly.
+        try:
+            from pyNastran.bdf.bdf_interface.utils import fill_dmigs
+            old_stdout_fd = sys.stdout
+            try:
+                sys.stdout = devnull
+                fill_dmigs(model)
+            finally:
+                sys.stdout = old_stdout_fd
+        except Exception:
+            # Best-effort; skip silently if pyNastran's internals change.
+            pass
+
         # ---- Step 5: Validate ----
         total = sum(counts.values())
 
@@ -3507,6 +3526,107 @@ class NastranModelGenerator:
 
         bulk_lines = all_lines[bulk_start:bulk_end]
 
+        # ---- Pre-extract DMIG-family cards as their own punch deck ----
+        # DMIG entry cards have an internal queue (_dmig_temp) that's
+        # processed via fill_dmigs() only at the end of read_bdf. If
+        # any chunk fails strict and we add DMIG cards via add_card in
+        # the lenient path, add_card may reject entries with duplicate
+        # (GJ, CJ, GI, CI) tuples, dropping data silently.
+        #
+        # Trick: rip ALL DMIG-family cards out of the bulk lines into
+        # a dedicated punch file. pyNastran's strict punch reader
+        # handles DMIGs perfectly (it queues + fill_dmigs in one shot).
+        # The remaining non-DMIG bulk goes through chunked-strict as
+        # normal. After both parses, we merge the DMIG-only model's
+        # matrices into the master.
+        def _card_name(line):
+            """Extract the card name regardless of fixed vs comma format."""
+            # Free-field comma-delimited: head is everything before the
+            # first comma. Fixed 8-char: head is the first 8 chars.
+            stripped = line.lstrip()
+            if ',' in stripped[:16]:
+                head = stripped.split(',', 1)[0]
+            else:
+                # The card name lives in the leading 8 chars regardless
+                # of whether the line is indented.
+                head = line[:8]
+            return head.strip().upper().rstrip('*')
+
+        def _line_is_dmig_family(line):
+            return _card_name(line) in (
+                'DMIG', 'DMIJ', 'DMIJI', 'DMIK', 'DMI')
+
+        dmig_lines = []        # DMIG card lines (incl. continuations)
+        non_dmig_lines = []    # everything else (regular bulk data)
+        in_dmig_block = False
+        for ln in bulk_lines:
+            stripped_ln = ln.lstrip()
+            if not stripped_ln:
+                # blank line - goes wherever we are
+                if in_dmig_block:
+                    dmig_lines.append(ln)
+                else:
+                    non_dmig_lines.append(ln)
+                continue
+            if stripped_ln.startswith('$'):
+                # comment line - stays in non_dmig_lines so source-file
+                # tracking still works for non-DMIG progress
+                non_dmig_lines.append(ln)
+                continue
+            # Continuation marker - belongs to whatever the previous
+            # card was.
+            if ln[:1] in ('+', '*') or (
+                    ln[:1] == ' ' and stripped_ln
+                    and stripped_ln[0].isdigit()):
+                if in_dmig_block:
+                    dmig_lines.append(ln)
+                else:
+                    non_dmig_lines.append(ln)
+                continue
+            # New card start.
+            if _line_is_dmig_family(ln):
+                in_dmig_block = True
+                dmig_lines.append(ln)
+            else:
+                in_dmig_block = False
+                non_dmig_lines.append(ln)
+
+        dmig_master_partial = None
+        if dmig_lines:
+            try:
+                silent = SimpleLogger(level='critical')
+                with tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.pch', delete=False,
+                        encoding='utf-8') as tmp_dmig:
+                    tmp_dmig.write('$ pyNastran : punch=True\n')
+                    tmp_dmig.writelines(dmig_lines)
+                    dmig_path = tmp_dmig.name
+                try:
+                    db = BDF(log=silent)
+                    db.read_bdf(dmig_path, punch=True, xref=False,
+                                validate=False)
+                    dmig_master_partial = db
+                except Exception:
+                    # If even the dedicated DMIG punch parse fails,
+                    # fall through; the chunked path below will see the
+                    # DMIG lines in non_dmig_lines... actually wait, we
+                    # need to RESTORE them to bulk_lines so the chunked
+                    # path still attempts them. Cheaper: just continue
+                    # with the original bulk_lines list.
+                    pass
+                finally:
+                    try:
+                        os.remove(dmig_path)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        # If DMIG pre-extract succeeded, the chunked path only chunks
+        # the non-DMIG bulk data. Otherwise it sees everything.
+        if dmig_master_partial is not None:
+            bulk_lines = non_dmig_lines
+
         # Count card-starts (non-continuation, non-comment, non-blank).
         def _is_new_card(line):
             stripped = line.strip()
@@ -3541,8 +3661,43 @@ class NastranModelGenerator:
         if total_cards == 0:
             return BDF(log=SimpleLogger(level='critical')), False, []
 
-        # Chunk boundaries aligned to card-start positions.
-        chunk_starts = card_start_idxs[::chunk_card_count]
+        # DMIG-aware chunking. A single DMIG matrix definition spans
+        # one header card + many "DMIG NAME ..." column-entry cards
+        # (or "DMIG* NAME ..." in 16-char format). Each entry counts as
+        # a new card by _is_new_card. If we naively split every
+        # chunk_card_count cards, we will slice a DMIG matrix between
+        # chunks; subsequent chunks lose the connection to the header
+        # and the chunk merge (which keys by matrix name) drops them.
+        # So we nudge chunk boundaries forward past any DMIG-family
+        # card so a single matrix is always contained in one chunk.
+        def _is_dmig_card(line):
+            # Handle both fixed-format (DMIG in cols 1-8) and free-field
+            # comma-delimited (DMIG,NAME,...).
+            stripped = line.lstrip()
+            if ',' in stripped[:16]:
+                head = stripped.split(',', 1)[0]
+            else:
+                head = line[:8]
+            return head.strip().upper().rstrip('*') in (
+                'DMIG', 'DMIJ', 'DMIJI', 'DMIK', 'DMI')
+
+        # Compute chunk boundaries as indices into card_start_idxs,
+        # skipping forward through DMIG runs at each split point.
+        chunk_boundary_card_idxs = [0]
+        i = chunk_card_count
+        while i < len(card_start_idxs):
+            # If the next chunk would start inside a DMIG run, push
+            # forward to the first non-DMIG card. Worst case the chunk
+            # grows past the nominal size; best case the DMIG matrix
+            # stays whole.
+            while (i < len(card_start_idxs)
+                   and _is_dmig_card(bulk_lines[card_start_idxs[i]])):
+                i += 1
+            if i < len(card_start_idxs):
+                chunk_boundary_card_idxs.append(i)
+            i += chunk_card_count
+        chunk_starts = [card_start_idxs[i] for i in chunk_boundary_card_idxs]
+
         chunk_bounds = []
         for k, cs in enumerate(chunk_starts):
             if k + 1 < len(chunk_starts):
@@ -3573,6 +3728,39 @@ class NastranModelGenerator:
             'dmig', 'dmij', 'dmiji', 'dmik', 'dmi',
             'params',
         )
+        # Dicts whose values are LISTS of cards keyed by SID (loads
+        # with same SID are accumulated across chunks - extend the
+        # list, don't replace it).
+        LIST_VALUED = {
+            'loads', 'spcs', 'mpcs', 'tables_sdamping', 'random_tables',
+        }
+        # Dicts whose values are DMIG-family matrix objects; same-name
+        # matrices across chunks must have their entry arrays combined.
+        DMIG_DICTS = {'dmig', 'dmij', 'dmiji', 'dmik', 'dmi'}
+
+        def _merge_dmig_into(master_mat, chunk_mat):
+            """Extend the GCi/GCj/Real/Complex/GCs arrays of master_mat
+            with the corresponding arrays from chunk_mat, in place."""
+            for attr in ('GCi', 'GCj', 'GCs', 'Real', 'Complex'):
+                mv = getattr(master_mat, attr, None)
+                cv = getattr(chunk_mat, attr, None)
+                if mv is None or cv is None:
+                    continue
+                # Both list and numpy array support iteration; use the
+                # appropriate extend.
+                if hasattr(mv, 'extend'):
+                    try:
+                        mv.extend(cv)
+                    except Exception:
+                        pass
+                else:
+                    # numpy array - concatenate by re-setting attribute
+                    try:
+                        import numpy as _np
+                        combined = _np.concatenate([mv, cv])
+                        setattr(master_mat, attr, combined)
+                    except Exception:
+                        pass
 
         def _merge(master_bdf, chunk_bdf):
             for fname in merge_fields:
@@ -3583,6 +3771,19 @@ class NastranModelGenerator:
                 for k, v in c_dict.items():
                     if k not in m_dict:
                         m_dict[k] = v
+                        continue
+                    # Key already present in master. Merge intelligently
+                    # based on the kind of value:
+                    if fname in LIST_VALUED:
+                        if isinstance(m_dict[k], list) and isinstance(v, list):
+                            m_dict[k].extend(v)
+                    elif fname in DMIG_DICTS:
+                        # Defensive: DMIG-aware chunking should normally
+                        # prevent this, but if a matrix DID end up
+                        # spanning chunks, combine the entries.
+                        _merge_dmig_into(m_dict[k], v)
+                    # else: first-write-wins (default for GRIDs, ELEs,
+                    # PROPs, MATs, COORDs etc.).
 
         def _emit(done, src=''):
             if progress is None:
@@ -3679,6 +3880,12 @@ class NastranModelGenerator:
 
             cards_done += chunk_card_n
             _emit(cards_done, chunk_src)
+
+        # Merge the pre-extracted DMIG matrices into the master. We
+        # ran a dedicated strict punch parse on the DMIG-only buffer
+        # earlier so the matrices are fully populated.
+        if dmig_master_partial is not None:
+            _merge(master, dmig_master_partial)
 
         # Inject one synthetic SkippedCard per source file that had a
         # chunk fail strict, with the actual exception reason. The

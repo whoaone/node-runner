@@ -222,7 +222,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.1.3"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.1.4"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -3392,7 +3392,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.1.3</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.1.4</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -7178,16 +7178,50 @@ class MainWindow(QMainWindow):
                 self._on_model_loaded(filepath, detected_format)
 
                 fname = os.path.basename(filepath)
+                # Build a short summary of advanced-entity counts so
+                # the user can see at a glance whether superelement
+                # matrices and rigid/multi-point connections came
+                # through cleanly.
+                m = generator.model
+                advanced = []
+                dmig_total = sum(len(getattr(m, d, {}) or {})
+                                 for d in ('dmig', 'dmij', 'dmiji', 'dmik', 'dmi'))
+                if dmig_total:
+                    advanced.append(f"{dmig_total} DMIG matrix(es)")
+                rigid_n = len(getattr(m, 'rigid_elements', {}) or {})
+                if rigid_n:
+                    advanced.append(f"{rigid_n} rigid elements (RBE/RBAR)")
+                mpc_n = sum(len(v) for v in (getattr(m, 'mpcs', {}) or {}).values())
+                if mpc_n:
+                    advanced.append(f"{mpc_n} MPC equation(s)")
+                # Superelement bulk: count SEBULK/SECONCT entries if
+                # pyNastran has them on the model.
+                se_n = 0
+                for attr in ('superelement_models', 'seloc', 'sebulk',
+                             'seconct', 'setrans'):
+                    v = getattr(m, attr, None)
+                    if isinstance(v, dict):
+                        se_n += len(v)
+                if se_n:
+                    advanced.append(f"{se_n} superelement card(s)")
+                advanced_suffix = ""
+                if advanced:
+                    advanced_suffix = " - includes " + ", ".join(advanced)
+
                 if lenient_result and lenient_result.skipped:
                     n = len(lenient_result.skipped)
                     self._update_status(
-                        f"Opened {fname} ({n} card{'s' if n != 1 else ''} skipped)")
+                        f"Opened {fname} "
+                        f"({n} card{'s' if n != 1 else ''} skipped)"
+                        f"{advanced_suffix}")
                     LenientImportReportDialog(fname, lenient_result, self).exec()
                 elif lenient_result:
                     self._update_status(
-                        f"Opened {fname} (lenient mode, all cards OK)")
+                        f"Opened {fname} "
+                        f"(lenient mode, all cards OK){advanced_suffix}")
                 else:
-                    self._update_status(f"Displayed {fname}")
+                    self._update_status(
+                        f"Displayed {fname}{advanced_suffix}")
             except Exception as e:
                 self._update_status("File open failed.", is_error=True)
                 QMessageBox.critical(self, "Error", f"Post-parse handling failed: {e}")
