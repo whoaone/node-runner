@@ -1,4 +1,4 @@
-# Node Runner v3.0.2
+# Node Runner v3.1.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -15,26 +15,9 @@ run.bat            (or)
 
 `run.py` works too, as long as you've activated the project venv first.
 
-## Changelog for v3.0.2
+## Changelog for v3.1.0
 
-Follow-up to v3.0.1 focused on big multi-INCLUDE decks where the user has no idea whether the import is making progress or hung.
-
-### Streaming parser with per-file progress
-- New `_read_bdf_streaming` walks the INCLUDE chain first to enumerate every reachable file, then inlines them one at a time, then hands the flat buffer to pyNastran. The import dialog now shows a determinate progress bar (0..100%) that advances file-by-file during the inline pass.
-- Per-file status: "Reading BULK\\foo.bdf (3 of 12)". The previous import dialog showed only "Parsing BDF..." with no indication of progress on multi-file decks; that flag has been replaced with concrete file-counter text plus a percentage bar.
-- The progress bar is deliberately determinate (a static rectangle that fills), not the marching-ants spinner that caused the GIL-starvation bug in v3.0.0. The window may still freeze briefly during pyNastran's parse phase, but you can see how far the inline pass got before that.
-
-### Hardened multi-line INCLUDE statement parsing
-- The `_inline_includes` parser was rewritten to handle all three Nastran continuation forms: single-line, unclosed-quote (most common multi-line form), and continuation lines with leading `+` or `*` Nastran markers.
-- Previously a 2-line INCLUDE with the close quote on the second line was silently rejected and that file's cards were dropped.
-- New `_gather_include_chain` walks every reachable INCLUDE without inlining, so the streaming parser can enumerate files (and total bytes) up front without paying to read them twice.
-
-### Tests
-- Seven new pytest cases in `TestMultiLineInclude` and `TestStreamingParser` cover indented continuation, unclosed-quote continuation, `+` continuation markers, end-to-end streaming, progress-callback emission, and the include-chain enumerator.
-
-## Changelog for v3.0.1
-
-Patch release focused on real-world Nastran decks that use INCLUDE statements (typical of multi-file aerospace assemblies).
+Minor feature release: full support for real-world multi-file aerospace Nastran decks. v3.1.0 supersedes the briefly-tagged v3.0.1 and v3.0.2 (their work is consolidated here under proper semver - features land in a minor bump, not a patch).
 
 ### INCLUDE-aware import
 - Decks with INCLUDE statements (in executive, case, or bulk sections) now import reliably. Relative paths like `..\BULK\foo.bdf` resolve against the original deck's directory even when the importer falls back to temp-file strategies.
@@ -42,8 +25,21 @@ Patch release focused on real-world Nastran decks that use INCLUDE statements (t
 - Lenient parsing now sees cards from included files too (previously the lenient path scanned only the top-level file and silently dropped everything that lived behind an INCLUDE).
 - File-open / import dialogs now accept `.bdf`, `.dat`, `.nas`, `.pch`, and `.asm` (the latter two are common as INCLUDE targets in real decks).
 
+### Multi-line INCLUDE statements
+- New `_parse_include_statement` handles every continuation form seen in real decks: single-line, unclosed-quote spanning lines (the most common multi-line form, used to keep paths under MSC Nastran's 72-column field limit), continuation lines with leading `+` or `*` Nastran markers, and indented continuation.
+- The previous regex required the close quote on the same line, silently dropping files referenced by 2-line INCLUDEs. The new character-by-character parser accumulates the path across lines until the matching close quote is found.
+
+### Streaming parser with per-file progress
+- New `_read_bdf_streaming` walks the INCLUDE chain first to enumerate every reachable file, then inlines them one at a time, then hands the flat buffer to pyNastran. The import dialog now shows a determinate progress bar (0..100%) that advances file-by-file during the inline pass.
+- Per-file status: "Reading BULK\\foo.bdf (3 of 12)". The previous import dialog showed only "Parsing BDF..." with no indication of progress on multi-file decks.
+- The progress bar is deliberately determinate (a static rectangle that fills), not the marching-ants spinner that caused the GIL-starvation bug in v3.0.0. The window may still freeze briefly during pyNastran's parse phase, but you can see how far the inline pass got before that.
+- New `_gather_include_chain` walks every reachable INCLUDE without inlining, so the streaming parser can enumerate files (and total bytes) up front.
+
 ### Performance: no cross-reference on import
-- `BDF.read_bdf` is now called with `xref=False` by default. Node Runner is a pre-processor and doesn't need pyNastran's cross-reference web at open time, where it can easily double or triple parse time on large decks. The model still cross-references on demand for analysis-time operations.
+- `BDF.read_bdf` is now called with `xref=False` by default. Node Runner is a pre-processor and doesn't need pyNastran's cross-reference web at open time, where it can easily double or triple parse time on large decks. Callers that need it can run `model.cross_reference()` on demand.
+
+### Tests
+- 12 new pytest cases across `TestIncludeStatements`, `TestMultiLineInclude`, and `TestStreamingParser` cover INCLUDE resolution, every multi-line continuation form, end-to-end streaming, progress-callback emission, and the include-chain enumerator. 118 tests pass.
 
 ## Changelog for v3.0.0
 
