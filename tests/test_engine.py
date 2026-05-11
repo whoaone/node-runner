@@ -520,6 +520,76 @@ class TestChunkedCrossRefs:
         # And cross_reference still resolves.
         m.cross_reference()
 
+    def test_vectorized_node_coords_match_get_position(self, tmp_path):
+        """v3.2.0 regression: build_node_coords_vectorized must produce
+        the same xyz array as the per-node get_position() loop, both
+        for basic-coord nodes and for non-basic-coord nodes."""
+        from node_runner.scene_build import build_node_coords_vectorized
+        deck = (
+            "SOL 101\nCEND\nBEGIN BULK\n"
+            "CORD2R,10,0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0\n"
+            "GRID,1,0,1.0,0.0,0.0\n"
+            "GRID,2,0,0.0,2.0,0.0\n"
+            "GRID,3,10,1.0,0.0,0.0\n"
+            "GRID,4,10,0.0,1.0,0.0\n"
+            "ENDDATA\n"
+        )
+        path = tmp_path / 'deck.bdf'
+        path.write_text(deck)
+        m, _ = NastranModelGenerator._read_bdf_robust(str(path))
+        NastranModelGenerator._finalize_for_viewer(m)
+
+        sorted_ids = sorted(m.nodes.keys())
+        # Per-node reference
+        ref = np.array([m.nodes[n].get_position() for n in sorted_ids])
+        vec = build_node_coords_vectorized(m, sorted_ids)
+        assert vec.shape == ref.shape
+        assert np.allclose(vec, ref, atol=1e-9), \
+            f'vectorized != per-node:\n{vec}\nvs\n{ref}'
+
+    def test_vectorized_element_arrays(self, tmp_path):
+        """build_element_arrays_vectorized must produce the right cell
+        counts + matching EID arrays."""
+        from node_runner.scene_build import build_element_arrays_vectorized
+        deck = (
+            "BEGIN BULK\n"
+            "GRID,1,,0.0,0.0,0.0\n"
+            "GRID,2,,1.0,0.0,0.0\n"
+            "GRID,3,,0.0,1.0,0.0\n"
+            "GRID,4,,1.0,1.0,0.0\n"
+            "PSHELL,1,1,0.1\n"
+            "MAT1,1,1.0E7,,0.3\n"
+            "CQUAD4,1,1,1,2,4,3\n"
+            "CTRIA3,2,1,1,2,3\n"
+            "CBAR,3,1,1,2,1.0,0.0,0.0\n"
+            "ENDDATA\n"
+        )
+        path = tmp_path / 'deck.bdf'
+        path.write_text(deck)
+        m, _ = NastranModelGenerator._read_bdf_robust(str(path))
+        NastranModelGenerator._finalize_for_viewer(m)
+        sorted_ids = sorted(m.nodes.keys())
+        node_map = {n: i for i, n in enumerate(sorted_ids)}
+        out = build_element_arrays_vectorized(m, sorted_ids, node_map)
+        assert out['eid'].size == 3
+        assert set(out['eid'].tolist()) == {1, 2, 3}
+        # Cells array shape: CQUAD4 has 5 ints (4+1), CTRIA3 has 4,
+        # CBAR has 3. Total = 12.
+        assert out['cells'].size == 5 + 4 + 3
+
+    def test_apply_display_lod_passes_through_small_grids(self, tmp_path):
+        """Under-threshold grids must be returned untouched."""
+        from node_runner.scene_build import apply_display_lod
+        import pyvista as pv
+        grid = pv.UnstructuredGrid(
+            np.array([4, 0, 1, 2, 3], dtype=np.int64),
+            np.array([pv.CellType.QUAD], dtype=np.uint8),
+            np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=float),
+        )
+        display, info = apply_display_lod(grid, threshold=10)
+        assert not info['lod_active']
+        assert display is grid
+
     def test_finalize_for_viewer_resolves_cp_ref(self, tmp_path):
         """v3.1.5 regression: a deck whose GRIDs reference a non-basic
         coord system must be usable for get_position() even without

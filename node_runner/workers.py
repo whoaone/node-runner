@@ -16,6 +16,7 @@ classes are kept for back-compat but the public entry point now calls
 the sync path.
 """
 
+import os
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
@@ -106,67 +107,167 @@ class BdfImportProgressDialog(QProgressDialog):
 
 
 class _SyncImportDialog(QDialog):
-    """Plain non-modal status dialog shown while we parse synchronously.
+    """Status dialog shown while a BDF imports.
 
-    Deliberately NOT a QProgressDialog with busy indicator - that
-    animation poisoned the GIL and starved the parse worker on Windows
-    (see v3.0.0 history). The progress bar here is DETERMINATE - a
-    static rectangle that fills as the parser walks INCLUDEs, not a
-    marching-ants spinner. That avoids the GIL-starvation issue while
-    still giving the user feedback that work is happening.
+    v3.2.0 layout, top to bottom:
+      1. **Header**  - "Importing: <filename>" - persistent, set once.
+      2. **Stage**   - "Stage X/Y: <short label>" - what we're doing now.
+      3. **Bar**     - determinate, 0..100%, filled by the parser.
+      4. **Detail**  - the helpful line: source include file, current
+                       card type, line# (if known), most recent error,
+                       cards/sec rate, ETA.
+      5. **Cancel**  - sets a flag the parser checks between chunks;
+                       parser exits cleanly, viewer keeps previous state.
 
-    The Hide button dismisses the dialog without interrupting the
-    parse (pyNastran's bulk-data read is a single blocking call we
-    can't preempt).
+    A QTimer watches the time since the last progress event and flips
+    the detail line to "Waiting for parser... N s since last update"
+    if it goes more than 30 s without activity. This keeps the dialog
+    informative even if a single pyNastran call genuinely takes minutes.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, filepath: str = '', parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import")
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(520)
         self.setModal(False)
+        # Track cancel state; the parser polls via was_cancelled().
+        self._cancel_requested = False
+        self._closed_by_user = False
 
         layout = QVBoxLayout(self)
-        self._label = QLabel("Reading BDF...")
-        layout.addWidget(self._label)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(6)
 
-        # Determinate progress bar. The streaming reader updates the
-        # value as it walks INCLUDE files; legacy callers that don't
-        # emit progress just leave it at zero.
+        # 1. Persistent header - the file the user actually selected.
+        self._header = QLabel("")
+        self._header.setStyleSheet(
+            "font-weight: 600; font-size: 12px; color: #cdd6f4;")
+        self._header.setWordWrap(True)
+        layout.addWidget(self._header)
+
+        # 2. Stage label.
+        self._stage = QLabel("Preparing...")
+        self._stage.setWordWrap(True)
+        layout.addWidget(self._stage)
+
+        # 3. Determinate bar.
         self._bar = QProgressBar(self)
         self._bar.setRange(0, 100)
         self._bar.setValue(0)
         self._bar.setTextVisible(True)
         layout.addWidget(self._bar)
 
+        # 4. Detail line - the actually-helpful info.
         self._detail = QLabel("")
         self._detail.setWordWrap(True)
-        self._detail.setStyleSheet("color: #888; font-size: 10px;")
+        self._detail.setStyleSheet("color: #b4befe; font-size: 11px;")
+        # Reserve two lines of vertical space so the dialog doesn't
+        # jump around when text wraps.
+        self._detail.setMinimumHeight(32)
         layout.addWidget(self._detail)
 
         hint = QLabel(
-            "The window may freeze briefly while pyNastran parses the "
-            "bulk-data section. Multi-file decks update file-by-file."
+            "The window may freeze briefly during pyNastran's bulk-data "
+            "scan. Multi-file decks update file-by-file."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setStyleSheet("color: #6c7086; font-size: 10px;")
         layout.addWidget(hint)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
-        self._close_btn = QPushButton("Hide")
-        self._close_btn.clicked.connect(self.close)
-        button_row.addWidget(self._close_btn)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        button_row.addWidget(self._cancel_btn)
         layout.addLayout(button_row)
 
+        if filepath:
+            self.set_filepath(filepath)
+
+        # Watchdog: if we don't see a progress event for 30 s, the
+        # detail line gets an emergency stamp so the user knows we're
+        # waiting on pyNastran (and that Cancel is available).
+        import time as _time
+        self._last_progress_time = _time.time()
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(2000)  # check every 2 s
+        self._watchdog.timeout.connect(self._tick_watchdog)
+        self._watchdog.start()
+
+    # ----- public API used by run_bdf_import_threaded -----
+
+    def set_filepath(self, filepath: str) -> None:
+        import os as _os
+        self._header.setText(
+            f"Importing: <b>{_os.path.basename(filepath)}</b>")
+
+    def apply_progress(self, record) -> None:
+        """Render an ImportProgress record. ``record`` is a dataclass
+        instance from node_runner.model.ImportProgress."""
+        import time as _time
+        self._last_progress_time = _time.time()
+
+        if record.label:
+            self._stage.setText(record.label)
+        if record.fraction is not None:
+            try:
+                v = max(0, min(100, int(float(record.fraction) * 100)))
+                self._bar.setValue(v)
+            except (TypeError, ValueError):
+                pass
+
+        # Build the detail line. Compose only the fields that are set
+        # so we don't leave " | " separators dangling.
+        parts = []
+        if record.error:
+            # Errors get center stage with file/card prefix when available.
+            prefix = []
+            if record.source_file:
+                prefix.append(record.source_file)
+            if record.line_number:
+                prefix.append(f"line {record.line_number}")
+            if record.card_type:
+                prefix.append(record.card_type)
+            prefix_str = " : ".join(prefix)
+            if prefix_str:
+                parts.append(
+                    f"<span style='color:#f38ba8'>{prefix_str}  -  "
+                    f"{record.error}</span>")
+            else:
+                parts.append(
+                    f"<span style='color:#f38ba8'>{record.error}</span>")
+        else:
+            if record.source_file:
+                parts.append(f"from <b>{record.source_file}</b>")
+            if record.card_type:
+                parts.append(record.card_type)
+            if record.line_number:
+                parts.append(f"line {record.line_number}")
+            if record.counter_total:
+                parts.append(
+                    f"{record.counter_done:,} / {record.counter_total:,} cards")
+            if record.rate:
+                parts.append(f"{int(record.rate):,} cards/s")
+            if record.eta_seconds:
+                eta = record.eta_seconds
+                if eta > 90:
+                    parts.append(f"ETA {eta / 60:.1f} min")
+                else:
+                    parts.append(f"ETA {int(eta)} s")
+        self._detail.setText("  |  ".join(parts) if parts else "")
+
+    def was_cancelled(self) -> bool:
+        return self._cancel_requested
+
+    # ----- backwards-compat shim (legacy callers) -----
+
     def set_message(self, text: str):
-        self._label.setText(text)
+        self._stage.setText(text)
 
     def set_detail(self, text: str):
         self._detail.setText(text)
 
     def set_fraction(self, frac):
-        """Update the bar; ``frac`` is 0.0..1.0 or None for no change."""
         if frac is None:
             return
         try:
@@ -174,6 +275,36 @@ class _SyncImportDialog(QDialog):
             self._bar.setValue(v)
         except (TypeError, ValueError):
             pass
+
+    # ----- internals -----
+
+    def _on_cancel(self):
+        self._cancel_requested = True
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setText("Cancelling...")
+        self._stage.setText("Cancellation requested - waiting for safe stop point...")
+
+    def _tick_watchdog(self):
+        import time as _time
+        idle = _time.time() - self._last_progress_time
+        if idle > 30 and not self._cancel_requested:
+            # Don't overwrite the detail line; append a hint.
+            current = self._detail.text()
+            stamp = (f"<span style='color:#fab387'>"
+                     f"(no parser activity for {int(idle)}s - "
+                     f"pyNastran may be in a single big call)"
+                     f"</span>")
+            if "no parser activity" not in current:
+                self._detail.setText(
+                    current + ("<br/>" if current else "") + stamp)
+            else:
+                # Update the existing stamp's elapsed counter
+                import re
+                self._detail.setText(re.sub(
+                    r'\(no parser activity for \d+s',
+                    f'(no parser activity for {int(idle)}s',
+                    current,
+                ))
 
 
 def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
@@ -189,16 +320,32 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
     callers in MainWindow don't need to be rewritten.
     """
     from node_runner.model import (
-        NastranModelGenerator, detect_bdf_field_format,
+        NastranModelGenerator, detect_bdf_field_format, ImportProgress,
     )
 
-    dialog = _SyncImportDialog(parent)
+    dialog = _SyncImportDialog(filepath, parent)
     dialog.show()
     QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
     QApplication.processEvents()  # one paint pass so the dialog appears
 
+    class _Cancelled(Exception):
+        pass
+
+    def _progress(record):
+        """Receives ImportProgress dataclass instances from the model
+        layer. Pushes them into the dialog and checks for cancel."""
+        if dialog.was_cancelled():
+            raise _Cancelled()
+        dialog.apply_progress(record)
+        QApplication.processEvents()
+
     try:
-        dialog.set_message("Detecting field format...")
+        dialog.apply_progress(ImportProgress(
+            stage='inline',
+            label='Stage 1/5: Detecting field format',
+            source_file=os.path.basename(filepath) if filepath else '',
+            fraction=0.0,
+        ))
         QApplication.processEvents()
         detected_format = detect_bdf_field_format(filepath)
 
@@ -211,41 +358,28 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
         generator = NastranModelGenerator()
 
         if has_includes:
-            dialog.set_message("Stage 1/4: Scanning INCLUDE chain")
-            dialog.set_detail("Counting files + sizes...")
+            dialog.apply_progress(ImportProgress(
+                stage='inline',
+                label='Stage 2/5: Scanning INCLUDE chain',
+                source_file='Counting files + sizes...',
+                fraction=0.0,
+            ))
             QApplication.processEvents()
-
-            def _progress(stage, message, frac):
-                # The model layer emits messages of the form
-                #   "Stage X/Y: <stage label> - <details>"
-                # We split on the FIRST ' - ' so the top of the dialog
-                # gets the high-level stage label and the line under
-                # the progress bar gets the concrete details (file,
-                # card, error, etc.). If there's no separator, the
-                # whole message is treated as stage and details are
-                # blanked.
-                if ' - ' in message:
-                    stage_label, _, detail_msg = message.partition(' - ')
-                    stage_label = stage_label.strip()
-                    detail_msg = detail_msg.strip()
-                else:
-                    stage_label = message.strip()
-                    detail_msg = ''
-                dialog.set_message(stage_label)
-                dialog.set_detail(detail_msg)
-                dialog.set_fraction(frac)
-                QApplication.processEvents()
-
             model, lenient_result = (
                 NastranModelGenerator._read_bdf_streaming(
                     filepath, progress=_progress))
         else:
-            dialog.set_message("Parsing BDF (this may take a moment)...")
-            dialog.set_fraction(0.1)
+            dialog.apply_progress(ImportProgress(
+                stage='parse',
+                label='Stage 2/5: Parsing BDF',
+                source_file='No INCLUDE statements - reading directly',
+                fraction=0.1,
+            ))
             QApplication.processEvents()
             model, lenient_result = (
                 NastranModelGenerator._read_bdf_robust(filepath))
-            dialog.set_fraction(1.0)
+            dialog.apply_progress(ImportProgress(
+                stage='done', label='Parse complete', fraction=1.0))
 
         generator.model = model
 
@@ -254,8 +388,14 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
         #   'NoneType' object has no attribute 'transform_node_to_global'
         # because we read with xref=False for speed and pyNastran's
         # node.get_position() requires cp_ref to be set.
-        dialog.set_message("Stage 5/5: Resolving coordinate references")
-        dialog.set_detail("Wiring up grid coord systems for the viewer...")
+        if dialog.was_cancelled():
+            raise _Cancelled()
+        dialog.apply_progress(ImportProgress(
+            stage='render',
+            label='Stage 5/5: Resolving coordinate references',
+            source_file='Wiring up grid coord systems for the viewer...',
+            fraction=1.0,
+        ))
         QApplication.processEvents()
         try:
             NastranModelGenerator._finalize_for_viewer(model)
@@ -263,6 +403,11 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
             # Best effort; visualization may fail later but we don't
             # want to lose the whole import over an unexpected hiccup.
             pass
+    except _Cancelled:
+        QApplication.restoreOverrideCursor()
+        dialog.close()
+        on_failure("Import cancelled by user.")
+        return None, None, None
     except Exception as exc:
         QApplication.restoreOverrideCursor()
         dialog.close()

@@ -222,7 +222,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.1.5"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.2.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -275,6 +275,15 @@ class MainWindow(QMainWindow):
         self._ghost_mode_enabled = _settings.value(
             "render/ghost_mode", False, type=bool,
         )
+        # v3.2.0: element-level LOD threshold. Above this cell count,
+        # the displayed mesh stride-samples shells and extracts surface
+        # for solids; current_grid still has every cell for picking.
+        self._elem_lod_threshold = _settings.value(
+            "render/elem_lod_threshold", 500_000, type=int,
+        )
+        # The display-decimated grid. Equal to current_grid when LOD is
+        # inactive; a smaller pv.UnstructuredGrid when active.
+        self.current_display_grid = None
         # NOTE: Parallel parsing was an experimental opt-in. It turned out
         # to be slower than single-threaded due to GIL contention on
         # pyNastran's pure-Python card parsing, and a stale "True" left
@@ -1441,6 +1450,10 @@ class MainWindow(QMainWindow):
         self.adaptive_lod_action.setChecked(self._adaptive_lod_enabled)
         self.adaptive_lod_action.toggled.connect(self._toggle_adaptive_lod)
         settings_menu.addAction(self.adaptive_lod_action)
+        # v3.2.0: element-level LOD threshold (Femap-style).
+        elem_lod_action = QAction("Element LOD Threshold...", self)
+        elem_lod_action.triggered.connect(self._open_elem_lod_dialog)
+        settings_menu.addAction(elem_lod_action)
         # Parallel BDF parsing toggle has been retired (was slower than
         # single-threaded due to GIL contention; left stale-True values
         # in some users' QSettings causing huge import hangs). The
@@ -2239,6 +2252,74 @@ class MainWindow(QMainWindow):
         self._update_status(
             f"Parallel parsing {'enabled' if on else 'disabled'}.",
         )
+
+    def _open_elem_lod_dialog(self):
+        """Settings -> Element LOD Threshold...
+
+        Above this many cells the displayed mesh stride-samples shells
+        and extracts the outer surface of solids. Picking and queries
+        still see every cell (current_grid is unchanged).
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
+            QDialogButtonBox,
+        )
+        from PySide6.QtCore import QSettings
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Element LOD Threshold")
+        dlg.setMinimumWidth(420)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel(
+            "Above this cell count the displayed mesh is decimated for "
+            "speed. Picking and queries still see every cell.\n\n"
+            "Default: 500,000. Range: 50,000 - 5,000,000."
+        ))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Threshold:"))
+        spin = QSpinBox()
+        spin.setRange(50_000, 5_000_000)
+        spin.setSingleStep(50_000)
+        spin.setValue(int(self._elem_lod_threshold))
+        spin.setSuffix(" cells")
+        row.addWidget(spin)
+        row.addStretch(1)
+        v.addLayout(row)
+        if getattr(self, '_lod_info', None) and self._lod_info.get('lod_active'):
+            info = QLabel(
+                f"Currently active: showing "
+                f"{self._lod_info['displayed_cells']:,} of "
+                f"{self._lod_info['total_cells']:,} cells."
+            )
+            info.setStyleSheet("color: #888;")
+            v.addWidget(info)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_threshold = int(spin.value())
+        if new_threshold == self._elem_lod_threshold:
+            return
+        self._elem_lod_threshold = new_threshold
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "render/elem_lod_threshold", new_threshold,
+        )
+        self._update_status(
+            f"Element LOD threshold set to {new_threshold:,} cells. "
+            f"Re-open or reload the model to apply.",
+        )
+        # If there's a current model, rebuild the display grid in place.
+        if self.current_grid is not None and self.current_grid.n_cells > 0:
+            try:
+                from node_runner.scene_build import apply_display_lod
+                self.current_display_grid, self._lod_info = apply_display_lod(
+                    self.current_grid, threshold=new_threshold,
+                )
+                self._update_plot_visibility()
+            except Exception:
+                pass
 
     # --- NEW: Handler for the "License..." menu action ---
     def _show_license_dialog(self):
@@ -3392,7 +3473,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.1.5</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.2.0</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -6209,116 +6290,59 @@ class MainWindow(QMainWindow):
 
         self.current_node_ids_sorted = sorted(model.nodes.keys())
         node_map = {nid: i for i, nid in enumerate(self.current_node_ids_sorted)}
-        # Build node coordinates with periodic UI yield. On a 1M-node model
-        # the naive list comprehension stalls the main thread for 5-15s
-        # and Windows marks the app "Not Responding"; batching with
-        # processEvents keeps it alive.
+        # v3.2.0: bulk-build node coords via the vectorized helper. The
+        # old code called node.get_position() per node which is ~50x
+        # slower because of pyNastran's per-call matmul. The vectorized
+        # path groups nodes by cp and does one batched matmul per
+        # unique coord system.
         from PySide6.QtWidgets import QApplication
+        from node_runner.scene_build import (
+            build_node_coords_vectorized,
+            build_element_arrays_vectorized,
+        )
         n_nodes = len(self.current_node_ids_sorted)
         if n_nodes > 50_000:
-            self._update_status(f"Loading {n_nodes:,} nodes...")
+            self._update_status(f"Loading {n_nodes:,} nodes (vectorized)...")
             QApplication.processEvents()
-            _coords_list = []
-            _model_nodes = model.nodes
-            BATCH = 100_000
-            for i, nid in enumerate(self.current_node_ids_sorted):
-                _coords_list.append(_model_nodes[nid].get_position())
-                if i and i % BATCH == 0:
-                    self._update_status(f"Loading nodes: {i:,} / {n_nodes:,}")
-                    QApplication.processEvents()
-            node_coords = np.array(_coords_list)
-            del _coords_list
-        else:
-            node_coords = np.array([model.nodes[nid].get_position() for nid in self.current_node_ids_sorted])
+        node_coords = build_node_coords_vectorized(
+            model, self.current_node_ids_sorted)
+        if n_nodes > 50_000:
+            QApplication.processEvents()
 
-        nodes_used_by_elements = set()
-        shells_conn, trias_conn, beams_conn, rods_conn, bush_conn = [], [], [], [], []
-        hexas_conn, tetras_conn, pentas_conn, shear_conn, gap_conn = [], [], [], [], []
-        # --- FIX: Track cell data per group to keep in sync with cell ordering ---
-        shells_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        trias_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        hexas_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        tetras_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        pentas_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        shear_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        beams_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        rods_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        bush_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        gap_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-
-        all_elements = {**model.elements, **model.rigid_elements}
-
-        # Heavy Python loop below: iterating > 1M elements would lock the
-        # UI thread for tens of seconds and Windows would mark the app as
-        # "Not Responding". Yield to Qt's event loop every YIELD_EVERY
-        # iterations so the window keeps painting and the user can see
-        # progress.
-        from PySide6.QtWidgets import QApplication
-        n_elems = len(all_elements)
-        YIELD_EVERY = 50_000
-        _heavy = n_elems > YIELD_EVERY
-        if _heavy:
-            self._update_status(f"Building scene from {n_elems:,} elements...")
-            QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-
-        for _idx, (eid, elem) in enumerate(all_elements.items()):
-            if _heavy and _idx and _idx % YIELD_EVERY == 0:
-                self._update_status(
-                    f"Building scene: {_idx:,} / {n_elems:,} elements...",
-                )
-                QApplication.processEvents()
-            try:
-                # RBE2/RBE3 don't have .nodes - get node IDs via independent/dependent
-                if elem.type in ['RBE2', 'RBE3']:
-                    try:
-                        nodes_used_by_elements.update(elem.independent_nodes + elem.dependent_nodes)
-                    except (AttributeError, TypeError):
-                        pass
-                    continue  # RBEs are rendered separately via _create_rbe_actors()
-                nodes_used_by_elements.update(elem.nodes)
-
-                if elem.type in ['CQUAD4', 'CMEMBRAN']:
-                    shells_conn.append([4] + [node_map[nid] for nid in elem.nodes])
-                    shells_data['PID'].append(elem.pid); shells_data['EID'].append(eid); shells_data['type'].append(elem.type); shells_data['is_shell'].append(1)
-                elif elem.type == 'CTRIA3':
-                    trias_conn.append([3] + [node_map[nid] for nid in elem.nodes])
-                    trias_data['PID'].append(elem.pid); trias_data['EID'].append(eid); trias_data['type'].append(elem.type); trias_data['is_shell'].append(1)
-                elif elem.type in ['CHEXA', 'CHEXA8', 'CHEXA20']:
-                    nids = [n for n in elem.nodes[:8] if n]
-                    hexas_conn.append([len(nids)] + [node_map[nid] for nid in nids])
-                    hexas_data['PID'].append(elem.pid); hexas_data['EID'].append(eid); hexas_data['type'].append('CHEXA'); hexas_data['is_shell'].append(0)
-                elif elem.type in ['CTETRA', 'CTETRA4', 'CTETRA10']:
-                    nids = [n for n in elem.nodes[:4] if n]
-                    tetras_conn.append([len(nids)] + [node_map[nid] for nid in nids])
-                    tetras_data['PID'].append(elem.pid); tetras_data['EID'].append(eid); tetras_data['type'].append('CTETRA'); tetras_data['is_shell'].append(0)
-                elif elem.type in ['CPENTA', 'CPENTA6', 'CPENTA15']:
-                    nids = [n for n in elem.nodes[:6] if n]
-                    pentas_conn.append([len(nids)] + [node_map[nid] for nid in nids])
-                    pentas_data['PID'].append(elem.pid); pentas_data['EID'].append(eid); pentas_data['type'].append('CPENTA'); pentas_data['is_shell'].append(0)
-                elif elem.type == 'CSHEAR':
-                    shear_conn.append([4] + [node_map[nid] for nid in elem.nodes])
-                    shear_data['PID'].append(elem.pid); shear_data['EID'].append(eid); shear_data['type'].append(elem.type); shear_data['is_shell'].append(1)
-                elif elem.type in ['CBEAM', 'CBAR']:
-                    beams_conn.append([2] + [node_map[nid] for nid in elem.nodes])
-                    beams_data['PID'].append(elem.pid); beams_data['EID'].append(eid); beams_data['type'].append(elem.type); beams_data['is_shell'].append(0)
-                elif elem.type == 'CROD':
-                    rods_conn.append([2] + [node_map[nid] for nid in elem.nodes])
-                    rods_data['PID'].append(elem.pid); rods_data['EID'].append(eid); rods_data['type'].append(elem.type); rods_data['is_shell'].append(0)
-                elif elem.type == 'CBUSH':
-                    bush_conn.append([2] + [node_map[nid] for nid in elem.nodes])
-                    bush_data['PID'].append(elem.pid); bush_data['EID'].append(eid); bush_data['type'].append(elem.type); bush_data['is_shell'].append(0)
-                elif elem.type == 'CGAP':
-                    gap_conn.append([2] + [node_map[nid] for nid in elem.nodes[:2]])
-                    gap_data['PID'].append(elem.pid); gap_data['EID'].append(eid); gap_data['type'].append(elem.type); gap_data['is_shell'].append(0)
-            except KeyError as e:
-                print(f"Warning: Skipping element {eid} due to missing node {e}.")
-
-        if _heavy:
-            QApplication.restoreOverrideCursor()
+        # v3.2.0: bulk-build per-element-kind connectivity arrays via
+        # the vectorized helper. The old per-element Python loop here
+        # was the dominant time sink on big decks (~30 s on 600k
+        # elements). The new helper sorts elements by kind, builds
+        # uniform (n_elem, n_nodes) numpy arrays, and does the node-ID
+        # -> grid-index lookup via np.searchsorted in a single
+        # vectorized op.
+        n_elems = len(model.elements) + len(model.rigid_elements)
+        if n_elems > 50_000:
             self._update_status(
-                f"Scene built: {n_elems:,} elements. Rendering...",
-            )
+                f"Building scene from {n_elems:,} elements (vectorized)...")
+            QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             QApplication.processEvents()
+
+        def _scene_build_progress(done, total, kind):
+            self._update_status(
+                f"Building scene: {done:,} / {total:,} elements ({kind})...")
+            QApplication.processEvents()
+
+        try:
+            elem_arrays = build_element_arrays_vectorized(
+                model,
+                self.current_node_ids_sorted,
+                node_map,
+                progress=(_scene_build_progress if n_elems > 50_000 else None),
+            )
+        finally:
+            if n_elems > 50_000:
+                QApplication.restoreOverrideCursor()
+                self._update_status(
+                    f"Scene built: {n_elems:,} elements. Rendering...")
+                QApplication.processEvents()
+
+        nodes_used_by_elements = elem_arrays['nodes_used']
 
         # PLOTELs are rendered separately but their nodes should not appear as free nodes
         for eid, elem in model.plotels.items():
@@ -6328,52 +6352,92 @@ class MainWindow(QMainWindow):
         all_node_ids = set(model.nodes.keys())
         free_node_ids = all_node_ids - nodes_used_by_elements
 
-        vertex_conn = []
-        vertex_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        for nid in free_node_ids:
-            if nid in node_map:
-                vertex_conn.append([1, node_map[nid]])
+        # Free-node VERTEX cells. Build via numpy directly.
+        free_node_idx = np.array(
+            [node_map[nid] for nid in free_node_ids if nid in node_map],
+            dtype=np.int64,
+        )
+        n_free = free_node_idx.size
 
-        for _ in free_node_ids:
-            vertex_data['PID'].append(-1)
-            vertex_data['EID'].append(-1)
-            vertex_data['type'].append('VTK_VERTEX')
-            vertex_data['is_shell'].append(0)
+        # Compose the master cells / cell_types arrays.
+        main_cells = elem_arrays['cells']
+        main_cell_types = elem_arrays['cell_types']
+        if n_free:
+            vertex_cells = np.empty(n_free * 2, dtype=np.int64)
+            vertex_cells[0::2] = 1  # one node per VERTEX cell
+            vertex_cells[1::2] = free_node_idx
+            vertex_types = np.full(n_free, pv.CellType.VERTEX, dtype=np.uint8)
+            cells = np.concatenate([main_cells, vertex_cells])
+            cell_types = np.concatenate([main_cell_types, vertex_types])
+        else:
+            cells = main_cells
+            cell_types = main_cell_types
 
-        all_conns = shells_conn + trias_conn + hexas_conn + tetras_conn + pentas_conn + shear_conn + beams_conn + rods_conn + bush_conn + gap_conn + vertex_conn
-        # --- FIX: Concatenate cell data in the same order as cells ---
-        elem_data = {'PID': [], 'EID': [], 'type': [], 'is_shell': []}
-        for group_data in [shells_data, trias_data, hexas_data, tetras_data, pentas_data, shear_data, beams_data, rods_data, bush_data, gap_data, vertex_data]:
-            for key in elem_data:
-                elem_data[key].extend(group_data[key])
-        
-        if not all_conns and node_coords.any():
+        if cells.size == 0 and node_coords.size > 0:
+            # No elements, no free-node vertices yet - render all nodes
+            # as vertex cells so something appears.
             num_nodes = node_coords.shape[0]
-            cells = np.hstack([np.full((num_nodes, 1), 1), np.arange(num_nodes).reshape(-1, 1)]).ravel()
-            cell_types = np.full(num_nodes, pv.CellType.VERTEX)
+            cells = np.empty(num_nodes * 2, dtype=np.int64)
+            cells[0::2] = 1
+            cells[1::2] = np.arange(num_nodes, dtype=np.int64)
+            cell_types = np.full(num_nodes, pv.CellType.VERTEX, dtype=np.uint8)
             self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
-        elif all_conns:
-            flat_cells_list = [value for conn_list in all_conns for value in conn_list]
-            cells = np.array(flat_cells_list)
-            # --- Cell types must match all_conns order ---
-            cell_types = np.concatenate([
-                np.full(len(shells_conn), pv.CellType.QUAD),
-                np.full(len(trias_conn), pv.CellType.TRIANGLE),
-                np.full(len(hexas_conn), pv.CellType.HEXAHEDRON),
-                np.full(len(tetras_conn), pv.CellType.TETRA),
-                np.full(len(pentas_conn), pv.CellType.WEDGE),
-                np.full(len(shear_conn), pv.CellType.QUAD),
-                np.full(len(beams_conn) + len(rods_conn) + len(bush_conn) + len(gap_conn), pv.CellType.LINE),
-                np.full(len(vertex_conn), pv.CellType.VERTEX)
-            ])
+        elif cells.size > 0:
             self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
         else:
             self.current_grid = pv.UnstructuredGrid()
 
         self.current_grid.point_data['vtkOriginalPointIds'] = np.arange(self.current_grid.n_points)
-        
-        if elem_data['EID']:
-            for key, value in elem_data.items(): self.current_grid.cell_data[key] = np.array(value)
+
+        # Attach per-cell metadata. We had main element cells + free-node
+        # vertex cells; pad vertex cells with -1 EID / -1 PID / VTK_VERTEX.
+        if main_cells.size > 0 or n_free > 0:
+            n_main = elem_arrays['eid'].size
+            if n_free:
+                eid_full = np.concatenate([
+                    elem_arrays['eid'],
+                    np.full(n_free, -1, dtype=np.int64)])
+                pid_full = np.concatenate([
+                    elem_arrays['pid'],
+                    np.full(n_free, -1, dtype=np.int64)])
+                etype_full = np.concatenate([
+                    elem_arrays['etype'],
+                    np.array(['VTK_VERTEX'] * n_free, dtype=object)])
+                is_shell_full = np.concatenate([
+                    elem_arrays['is_shell'],
+                    np.zeros(n_free, dtype=np.int8)])
+            else:
+                eid_full = elem_arrays['eid']
+                pid_full = elem_arrays['pid']
+                etype_full = elem_arrays['etype']
+                is_shell_full = elem_arrays['is_shell']
+            self.current_grid.cell_data['EID'] = eid_full
+            self.current_grid.cell_data['PID'] = pid_full
+            self.current_grid.cell_data['type'] = etype_full
+            self.current_grid.cell_data['is_shell'] = is_shell_full
+
+        # v3.2.0: build the display-LOD'd grid. This is what
+        # _rebuild_plot passes to plotter.add_mesh; current_grid keeps
+        # every cell for picking and queries.
+        try:
+            from node_runner.scene_build import apply_display_lod
+            display_grid, lod_info = apply_display_lod(
+                self.current_grid,
+                threshold=self._elem_lod_threshold,
+                target_shells=200_000,
+            )
+            self.current_display_grid = display_grid
+            self._lod_info = lod_info
+            if lod_info.get('lod_active'):
+                self._update_status(
+                    f"LOD active: showing {lod_info['displayed_cells']:,} "
+                    f"of {lod_info['total_cells']:,} cells (full mesh kept "
+                    f"for picking)."
+                )
+        except Exception as _lod_exc:
+            # Fail-safe: render the full grid.
+            self.current_display_grid = self.current_grid
+            self._lod_info = {'lod_active': False}
 
         for pid in model.properties.keys():
             if pid not in self.pid_color_map:
@@ -7777,7 +7841,11 @@ class MainWindow(QMainWindow):
             if node_points is not None and len(node_points) > 0:
                 self._add_node_cloud(node_points, name='nodes_actor')
 
-        grid_to_render = self.current_grid
+        # v3.2.0: prefer the display-LOD'd grid when no visibility mask
+        # is active. With a visibility mask we have to extract from the
+        # full grid because cell indices are full-grid indices. Cell
+        # picking always targets self.current_grid so EID resolution
+        # is unaffected by display LOD.
         if visibility_mask is not None:
             visible_indices = np.where(visibility_mask)[0]
             if visible_indices.size > 0:
@@ -7786,6 +7854,12 @@ class MainWindow(QMainWindow):
                 self.plotter.remove_actor(['shells', 'beams'])
                 self.plotter.render()
                 return
+        else:
+            grid_to_render = (
+                self.current_display_grid
+                if self.current_display_grid is not None
+                else self.current_grid
+            )
 
         # --- FIX: Check if cell data (like 'is_shell') exists before trying to use it ---
         if grid_to_render and grid_to_render.n_cells > 0 and 'is_shell' in grid_to_render.cell_data:

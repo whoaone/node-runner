@@ -6,6 +6,8 @@ import datetime
 import numpy as np
 from io import StringIO
 from collections import namedtuple
+from dataclasses import dataclass, field
+from typing import Optional
 from pyNastran.bdf.bdf import BDF
 from scipy.spatial import cKDTree
 from pyNastran.bdf.cards.elements.shell import CQUAD4, CTRIA3
@@ -17,6 +19,73 @@ LenientResult = namedtuple('LenientResult', ['model', 'skipped', 'counts'])
 # Result wrapper carrying field-format detection alongside the parsed model.
 # A `None` LenientResult means strict parse succeeded; format is still set.
 ImportResult = namedtuple('ImportResult', ['model', 'lenient_result', 'detected_format'])
+
+
+@dataclass
+class ImportProgress:
+    """Structured progress record published by every reader stage.
+
+    Replaces the v3.1.x ``progress(stage, message, fraction)`` callback
+    signature where the dialog had to split a single 'message' string on
+    ' - ' to recover the detail. Every emit site now fills the fields it
+    has and leaves the rest empty; the dialog composes the display lines
+    however it wants.
+
+    Fields:
+      stage           : 'inline' | 'parse' | 'render' | 'done'
+      label           : short stage label for the top of the dialog
+                        (e.g. 'Stage 4/4: Chunked-strict parse')
+      source_file     : basename of the current include / source file
+      card_type       : pyNastran card name (e.g. 'CBUSH')
+      line_number     : 1-based line in source_file, 0 if unknown
+      error           : one-line pyNastran exception text, '' if none
+      fraction        : 0.0-1.0 overall progress, None to leave bar alone
+      counter_done    : N out of counter_total cards (or files) processed
+      counter_total   : denominator for the counter
+      rate            : current parse rate in cards/sec, 0 if unknown
+      eta_seconds     : seconds remaining at the current rate, 0 if unknown
+    """
+    stage: str = "inline"
+    label: str = ""
+    source_file: str = ""
+    card_type: str = ""
+    line_number: int = 0
+    error: str = ""
+    fraction: Optional[float] = None
+    counter_done: int = 0
+    counter_total: int = 0
+    rate: float = 0.0
+    eta_seconds: float = 0.0
+
+
+def _emit_legacy(progress, stage: str, message: str, fraction):
+    """Adapter so old emit sites that still call ``progress(stage, msg, f)``
+    keep working. Splits ``message`` on the first ' - ' to recover
+    label/detail and constructs an ``ImportProgress`` record.
+
+    If ``progress`` itself accepts the legacy 3-arg signature it's called
+    that way; if it accepts a single ImportProgress (the new shape), we
+    pass the record. Detection is by parameter count.
+    """
+    if progress is None:
+        return
+    if ' - ' in message:
+        label, _, detail = message.partition(' - ')
+    else:
+        label, detail = message, ''
+    rec = ImportProgress(
+        stage=stage, label=label.strip(), source_file=detail.strip(),
+        fraction=fraction,
+    )
+    try:
+        # New shape: progress(record)
+        progress(rec)
+    except TypeError:
+        # Legacy shape: progress(stage, message, fraction)
+        try:
+            progress(stage, message, fraction)
+        except Exception:
+            pass
 
 # Valid Nastran field formats. Used by both the writer (size selection) and
 # the reader (format detection result).
@@ -3097,6 +3166,10 @@ class NastranModelGenerator:
         progress_every = max(500, n_cards // 100)
         old_stdout = sys.stdout
         sys.stdout = devnull
+        # Track latest card info so progress callbacks can show it.
+        last_card_name = ''
+        last_error = ''
+        last_line = 0
         try:
             for idx, card_info in enumerate(cards):
                 if progress is not None and idx % progress_every == 0:
@@ -3105,7 +3178,13 @@ class NastranModelGenerator:
                     # processEvents() repaint.
                     sys.stdout = old_stdout
                     try:
-                        progress(idx, n_cards)
+                        # Try the new structured-record signature
+                        # first; fall back to the legacy 2-arg form.
+                        try:
+                            progress(idx, n_cards, last_card_name,
+                                     last_line, last_error)
+                        except TypeError:
+                            progress(idx, n_cards)
                     except Exception:
                         pass
                     sys.stdout = devnull
@@ -3119,14 +3198,19 @@ class NastranModelGenerator:
                 except Exception:
                     orig_ln = (orig_card_starts[cidx][0]
                                if cidx < len(orig_card_starts) else -1)
+                    last_card_name = 'UNKNOWN'
+                    last_line = orig_ln
+                    last_error = 'Could not parse card fields'
                     skipped.append(SkippedCard(
                         line=orig_ln, card='UNKNOWN',
                         raw=card_lines[0].rstrip()[:80],
-                        error='Could not parse card fields'))
+                        error=last_error))
                     continue
 
                 orig_ln = (orig_card_starts[cidx][0]
                            if cidx < len(orig_card_starts) else -1)
+                last_card_name = card_name
+                last_line = orig_ln
 
                 try:
                     if is_list:
@@ -3137,6 +3221,7 @@ class NastranModelGenerator:
                     counts[card_name] = counts.get(card_name, 0) + 1
                 except Exception as e:
                     err_msg = _humanize_bdf_error(card_name, str(e))
+                    last_error = err_msg
                     skipped.append(SkippedCard(
                         line=orig_ln, card=card_name,
                         raw=card_lines[0].rstrip()[:80],
@@ -3865,11 +3950,24 @@ class NastranModelGenerator:
                     # else: first-write-wins (default for GRIDs, ELEs,
                     # PROPs, MATs, COORDs etc.).
 
-        def _emit(done, src=''):
+        def _emit(done, src='', card_name='', line_number=0, error=''):
+            """Forward chunked progress. We try multiple callback shapes
+            for back-compat: the v3.2 5-arg form first, then the v3.1
+            3-arg (done, total, src), then 2-arg (done, total)."""
             if progress is None:
                 return
             try:
+                progress(done, total_cards, src, card_name, line_number, error)
+                return
+            except TypeError:
+                pass
+            try:
                 progress(done, total_cards, src)
+            except TypeError:
+                try:
+                    progress(done, total_cards)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -3930,13 +4028,18 @@ class NastranModelGenerator:
                         wrapped.write('ENDDATA\n')
                         wrapped.close()
 
-                        def _chunk_lenient_progress(idx, total):
+                        def _chunk_lenient_progress(
+                                idx, total, card_name='',
+                                line_number=0, error=''):
                             if total <= 0:
                                 return
                             # Interpolate within this chunk.
                             interp = cards_done + chunk_card_n * (
                                 idx / float(total))
-                            _emit(int(interp), chunk_src)
+                            _emit(int(interp), chunk_src,
+                                  card_name=card_name,
+                                  line_number=line_number,
+                                  error=error)
 
                         try:
                             result = (
@@ -4007,12 +4110,47 @@ class NastranModelGenerator:
         import os, io, tempfile
         from cpylog import SimpleLogger
 
-        def _emit(stage, message, frac=None):
-            if progress is not None:
-                try:
-                    progress(stage, message, frac)
-                except Exception:
-                    pass
+        def _emit(stage, message='', frac=None, **kwargs):
+            """Forward a progress record to the dialog callback.
+
+            v3.2.0 callers may pass a structured callback that wants an
+            ``ImportProgress`` record. Legacy v3.1 callers expect the
+            3-tuple (stage, message, fraction). We try the new shape
+            first and fall back.
+
+            Extra keyword args (source_file, card_type, line_number,
+            error, counter_done, counter_total, rate, eta_seconds) ride
+            on the record verbatim.
+            """
+            if progress is None:
+                return
+            # Build the record. If the caller passed only a hand-formatted
+            # 'message' (legacy site), split it on the first ' - ' so the
+            # record at least has separate label / detail fields.
+            label = kwargs.pop('label', None)
+            if label is None:
+                if ' - ' in message:
+                    head, _, tail = message.partition(' - ')
+                    label = head.strip()
+                    if 'source_file' not in kwargs and not kwargs.get(
+                            'card_type') and not kwargs.get('error'):
+                        # No structured detail provided - park the
+                        # tail in source_file so the dialog can show it.
+                        kwargs.setdefault('source_file', tail.strip())
+                else:
+                    label = message.strip()
+            rec = ImportProgress(stage=stage, label=label,
+                                 fraction=frac, **kwargs)
+            try:
+                progress(rec)
+                return
+            except TypeError:
+                pass
+            # Legacy fallback.
+            try:
+                progress(stage, message or label, frac)
+            except Exception:
+                pass
 
         # ---- Phase A: enumerate files ----
         _emit('inline', 'Scanning for INCLUDE files...', 0.0)
@@ -4181,7 +4319,8 @@ class NastranModelGenerator:
                 'rate': 0.0,
             }
 
-            def _chunked_progress(done, total, src=''):
+            def _chunked_progress(done, total, src='',
+                                  card_name='', line_number=0, error=''):
                 if total <= 0:
                     return
                 now = _time.time()
@@ -4200,24 +4339,21 @@ class NastranModelGenerator:
                 frac = base + span * (done / float(total))
 
                 rate = rate_state['rate']
+                eta_s = 0.0
                 if rate > 0:
-                    remaining = (total - done) / rate
-                    if remaining > 90:
-                        eta = f"{remaining / 60:.1f} min"
-                    else:
-                        eta = f"{int(remaining)} s"
-                else:
-                    eta = "calculating..."
+                    eta_s = (total - done) / rate
 
-                msg_parts = [f"Card {done:,} / {total:,}"]
-                if src:
-                    msg_parts.append(f"from {src}")
-                if rate > 0:
-                    msg_parts.append(f"{int(rate):,} cards/s")
-                msg_parts.append(f"ETA {eta}")
                 _emit('parse',
-                      "Parsing bulk data - " + " | ".join(msg_parts),
-                      min(0.98, frac))
+                      label='Stage 4/4: Chunked-strict parse',
+                      frac=min(0.98, frac),
+                      source_file=src,
+                      card_type=card_name,
+                      line_number=line_number,
+                      error=error,
+                      counter_done=done,
+                      counter_total=total,
+                      rate=rate,
+                      eta_seconds=eta_s)
 
             try:
                 (chunked_model, used_lenient, skipped) = (
@@ -4253,15 +4389,21 @@ class NastranModelGenerator:
                       'lenient (slow, but the most forgiving path)...',
                       0.26)
 
-                def _lenient_progress(idx, total):
+                def _lenient_progress(idx, total, card_name='',
+                                      line_number=0, error=''):
                     if total <= 0:
                         return
                     base = 0.26
                     span = 0.72
                     frac = base + span * (idx / float(total))
                     _emit('parse',
-                          f"Lenient parsing card {idx:,} of {total:,}...",
-                          min(0.98, frac))
+                          label='Stage 4/4: Lenient card-by-card',
+                          frac=min(0.98, frac),
+                          card_type=card_name,
+                          line_number=line_number,
+                          error=error,
+                          counter_done=idx,
+                          counter_total=total)
 
                 try:
                     result = NastranModelGenerator._read_bdf_lenient(

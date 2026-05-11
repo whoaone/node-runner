@@ -1,4 +1,4 @@
-# Node Runner v3.1.5
+# Node Runner v3.2.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,50 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.0
+
+Minor feature release: the import dialog now actually tells you what's going on, and the viewer handles 600k+ node/element decks without going "Not Responding".
+
+### Import dialog rebuilt
+- **Header**: persistent "Importing: <filename>" so you always see which file the operation is working on.
+- **Stage label**: high-level step (Stage 1/5 ... 5/5).
+- **Progress bar**: determinate, 0..100%.
+- **Detail line**: a real status — current source include file, card type, line number (when known from lenient), most recent pyNastran error, cards/sec rate, ETA. No more "Parsing flattened deck..." in both labels.
+- **Cancel button**: actually cancels (sets a flag the parser checks between chunks). The parser exits cleanly, the viewer keeps its previous state.
+- **Watchdog**: if no progress events arrive for 30 s, the detail line stamps "(no parser activity for N s)" so you know the parser is in a single big pyNastran call. The stamp updates live.
+
+### Structured progress pipeline
+New `ImportProgress` dataclass replaces the v3.1.x `(stage, message, fraction)` callback signature. Every emit site - inline, chunked, lenient - now publishes `source_file`, `card_type`, `line_number`, `error`, `counter_done`, `counter_total`, `rate`, `eta_seconds` as separate fields. The dialog composes the display lines from those fields, instead of trying to split a hand-formatted string on `" - "`.
+
+When a chunk falls into lenient fallback, the lenient parser now forwards the latest skipped card's name and error message up to the dialog detail line in real time. So you see e.g. `from AllLoads.bdf | CBUSH | line 12345 | field 5 must be integer` while the slow fallback runs, instead of a frozen-looking bar.
+
+### Vectorized scene build (the "Not Responding" fix)
+The viewer's `_update_viewer` was doing two giant Python loops on every import:
+1. `node.get_position()` per node (with internal matmul for each non-basic-coord node)
+2. Per-element type dispatch with `[node_map[nid] for nid in elem.nodes]` per element
+
+On a 600k-element deck this was ~30+ seconds of pure-Python work, with Qt only getting CPU between yield points. Windows would declare the app "Not Responding" before scene-build finished, and the user had to kill it from Task Manager.
+
+New `node_runner/scene_build.py` does both in bulk numpy:
+- **Node coords**: pulls every `node.xyz` into one flat array, then groups by `cp` and does one batched matmul per unique coord system. For decks where all nodes use the basic coord (almost all decks), it's just `np.array([...])`. Measured at 0.05 s on a 60k-node deck.
+- **Element arrays**: sorts elements by kind once, builds per-kind `(n_elem, n_nodes)` arrays, then uses `np.searchsorted` to convert raw node IDs into grid indices in one vectorized op. Measured at 0.25 s on a 100k-element deck.
+
+Combined: ~50-100x faster than the old loops. A 600k-element deck now builds in ~1-3 s instead of "never".
+
+### Femap-style element LOD
+New `apply_display_lod` in `scene_build.py`. Above a threshold (default 500k cells), the displayed mesh:
+- Stride-samples shells (CQUAD4 / CTRIA3 / CSHEAR) so the rendered count stays around 200k.
+- Extracts the outer surface of solids (CHEXA / CTETRA / CPENTA) so a 600k-cell solid mesh becomes ~150-250k surface triangles.
+- Keeps beams / rods / bushes as-is (typically small counts).
+
+The underlying `current_grid` still has every cell, so cell-pick, queries, mass props, and export work unchanged. Only the displayed grid (`current_display_grid`) is decimated.
+
+Threshold is configurable via **Settings > Element LOD Threshold...**; persists in QSettings. Status bar shows "LOD active: showing 200k of 600k cells (full mesh kept for picking)" when active.
+
+### Tests
+- Three new pytest cases: `test_vectorized_node_coords_match_get_position` (vectorized coords match per-node `get_position` to 1e-9), `test_vectorized_element_arrays` (right cell counts + EID order), `test_apply_display_lod_passes_through_small_grids` (LOD is no-op below threshold).
+- 126 tests pass.
 
 ## Changelog for v3.1.5
 
