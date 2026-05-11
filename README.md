@@ -1,4 +1,4 @@
-# Node Runner v3.2.0
+# Node Runner v3.2.1
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,23 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.1
+
+Patch release that fixes three v3.2.0 papercuts.
+
+### Threaded BDF import (the real "Not Responding" fix)
+- v3.2.0 vectorized the *scene build* but the *parse* was still synchronous - pyNastran held the GIL through long calls and Windows declared the app "Not Responding" on big multi-INCLUDE decks.
+- v3.2.1 actually runs the import in a `QThread`. The dialog stays responsive throughout because the determinate progress bar updates only on signal emission (no marching-ants spinner; that was what drove us sync back in v3.0.0).
+- Cancel button now wires to `thread.cancel()`. The worker's progress emit checks the flag and raises a `_Cancelled` exception that the thread catches cleanly. The viewer keeps its previous state.
+
+### Persistent "Last file read" line
+- The dialog now has a dedicated `Last file read: <filename>` line under the header. It's only ever updated, never cleared, so the user can always see which include the parser got furthest with - across stage transitions, errors, and silent stretches.
+- Detail line under the bar no longer repeats the source file (it was duplicating the persistent line). Detail line now carries only the in-flight info: card type, line number, error reason, counter, rate, ETA.
+
+### Honest card count when there's no BEGIN BULK
+- v3.2.0's `_count_card_starts_in_text` returned 0 if the inlined buffer had no `BEGIN BULK` marker (which happens when a user opens a partial deck like `Fuse_BFEM_Light.bdf` whose entire content is INCLUDE statements). The dialog then read "from 0 cards in ~8k-card chunks", which is wrong and confusing.
+- v3.2.1 falls back to counting all bulk-data card-start lines when no `BEGIN BULK` is present, so the dialog shows the real card count instead of zero.
 
 ## Changelog for v3.2.0
 

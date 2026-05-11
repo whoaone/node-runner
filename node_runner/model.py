@@ -4212,17 +4212,37 @@ class NastranModelGenerator:
         # to chunked-strict, which has per-chunk progress.
 
         def _count_card_starts_in_text(t):
+            """Count bulk-data card starts in the flat buffer.
+
+            If a BEGIN BULK marker is present, count cards after it.
+            If not (the flat buffer is a punch fragment or a deck that
+            only contains INCLUDEs and bulk-data cards with no
+            executive/case-control sections), count every card-start
+            line in the entire buffer. Returning 0 just because
+            BEGIN BULK isn't there is misleading - we end up showing
+            'from 0 cards' in the dialog and the user wonders what's
+            actually being parsed.
+            """
+            lines = t.splitlines()
+            # First pass: scan for BEGIN BULK.
+            has_begin_bulk = False
+            begin_idx = 0
+            for i, ln in enumerate(lines):
+                stripped = ln.strip()
+                if stripped and not stripped.startswith('$'):
+                    upper = stripped.upper()
+                    if upper.startswith('BEGIN BULK'):
+                        has_begin_bulk = True
+                        begin_idx = i + 1
+                        break
+            # Pick the slice we'll count over.
+            scan_from = begin_idx if has_begin_bulk else 0
             n = 0
-            in_bulk = False
-            for ln in t.splitlines():
+            for ln in lines[scan_from:]:
                 stripped = ln.strip()
                 if not stripped or stripped.startswith('$'):
                     continue
                 upper = stripped.upper()
-                if not in_bulk:
-                    if upper.startswith('BEGIN BULK'):
-                        in_bulk = True
-                    continue
                 if upper.startswith('ENDDATA'):
                     break
                 # Continuation line?
