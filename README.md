@@ -1,4 +1,4 @@
-# Node Runner v3.1.1
+# Node Runner v3.1.2
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,25 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.1.2
+
+Patch release that fixes the v3.1.1 "stuck at 97%" symptom: when a chunk falls into lenient fallback, the bar now advances within the chunk instead of waiting for the whole chunk to finish.
+
+### Real status during slow imports
+- The import dialog now shows the current source file alongside the card counter, taken from the `$ -- begin INCLUDE` markers we already write into the inlined buffer. So instead of "Parsing flattened deck..." you see "Parsing - 6,360,000 / 6,375,641 cards | file: Wing_SE_Complete.pch | 22,500 cards/s | ETA 0.6 s".
+- Cards-per-second rate is computed from a running EMA. ETA is derived from that rate and the cards remaining.
+- Progress updates are time-rate-limited to ~4/sec so the dialog doesn't spend its budget in Qt repaints.
+
+### Lenient fallback inside chunked emits per-card progress
+- The v3.1.1 chunked parser only emitted progress between chunks. If chunk K ran into lenient (e.g. a slow card type), the bar sat at the chunk-(K-1) value for the entire lenient pass over those ~20k cards. That's why your screenshot froze at 97% for 20 minutes - one chunk near the end was grinding through lenient silently.
+- v3.1.2 passes the progress callback INTO the chunk's lenient fallback so the bar interpolates within that chunk. You now see motion every ~500 cards even during slow phases.
+
+### Smaller default chunk size
+- Default chunk size dropped 20,000 -> 8,000. Worst-case stall on a single bad chunk shrinks from ~60 s lenient to ~25 s, and the bar advances roughly 2.5x more often during a healthy run.
+
+### Inline-phase status shows file size + tree depth
+- During the inline phase (the first 25% of the bar), status now reads "Reading   Fuse_Base_0.3.3.bdf (12 / 47 files, 92.3 / 184.0 MB)" with two-space indentation per INCLUDE depth so you can see the nesting.
 
 ## Changelog for v3.1.1
 
