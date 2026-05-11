@@ -1,4 +1,4 @@
-# Node Runner v3.1.0
+# Node Runner v3.1.1
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,20 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.1.1
+
+Patch release for big multi-INCLUDE decks where pyNastran's strict parse fails and the importer used to grind through the slow lenient card-by-card path with a frozen progress bar.
+
+### Chunked-strict parser
+- New `_read_bdf_chunked` splits the bulk-data section into ~20k-card chunks and runs pyNastran's `read_bdf(punch=True, validate=False)` on each chunk independently. Each chunk is one fast `read_bdf` call instead of N slow per-card `add_card` calls - typically 10-50x faster than whole-deck lenient on a real aerospace deck. Chunks that fail (e.g. one bad card type) fall back to lenient on just their ~20k lines so the rest of the deck still gets the fast path.
+- When pyNastran's strict whole-deck parse fails, the importer now tries chunked-strict next, before falling through to whole-deck lenient as a last resort.
+- Imported chunk BDFs are merged into a single master model by dict-level update of nodes, elements, properties, materials, coords, loads, SPCs, MPCs, DMIGs, sets, params, and ~20 other entity dicts. First definition wins on duplicate IDs (permissive).
+
+### Faster + visible lenient path
+- The per-card `sys.stdout` redirect in `_read_bdf_lenient` is gone - that swap was happening on every card and added meaningful overhead on million-card decks. Now stdout is redirected once at the top of the loop and restored once at the bottom.
+- The lenient and chunked paths both emit per-card progress callbacks every ~500 cards. The import dialog's progress bar now advances smoothly from 26% through 98% during the fallback parse phases. Previously the bar sat at a static 50% the entire time lenient ran, looking hung.
+- Status text shows current position: "Chunked parsing: 240,000 / 1,250,000 cards" or "Lenient parsing card 240,000 of 1,250,000".
 
 ## Changelog for v3.1.0
 
