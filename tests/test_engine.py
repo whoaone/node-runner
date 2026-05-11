@@ -196,3 +196,87 @@ class TestQualityMetrics:
         q = hex_gen.calculate_element_quality()
         # Right-angle unit tet has volume 1/6
         assert abs(q[2]['volume'] - 1.0 / 6.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# INCLUDE handling - real-world multi-file aerospace decks
+# ---------------------------------------------------------------------------
+
+class TestIncludeStatements:
+    """Covers .dat decks with INCLUDE statements (.dat -> .bdf relative).
+
+    Regression net for v3.0.1: relative paths like ``..\\BULK\\foo.bdf``
+    must resolve correctly even when _read_bdf_robust falls back to
+    temp-file strategies, and lenient parsing must see cards inside
+    included files (previously it scanned only the top-level file).
+    """
+
+    def _build_deck(self, root):
+        (root / 'exec').mkdir()
+        (root / 'bulk').mkdir()
+        (root / 'bulk' / 'grids.bdf').write_text(
+            'GRID,1,,0.0,0.0,0.0\n'
+            'GRID,2,,1.0,0.0,0.0\n'
+            'GRID,3,,0.0,1.0,0.0\n'
+            'GRID,4,,1.0,1.0,0.0\n'
+        )
+        (root / 'bulk' / 'elems.bdf').write_text(
+            'CQUAD4,1,1,1,2,4,3\n'
+            'PSHELL,1,1,0.1\n'
+            'MAT1,1,1.0E7,,0.3\n'
+        )
+        (root / 'exec' / 'main.dat').write_text(
+            "SOL 101\nCEND\nTITLE = Test\nBEGIN BULK\n"
+            "INCLUDE '..\\bulk\\grids.bdf'\n"
+            "INCLUDE '..\\bulk\\elems.bdf'\n"
+            "ENDDATA\n"
+        )
+        return root / 'exec' / 'main.dat'
+
+    def test_strict_include_resolution(self, tmp_path):
+        main = self._build_deck(tmp_path)
+        m, lenient = NastranModelGenerator._read_bdf_robust(str(main))
+        assert len(m.nodes) == 4
+        assert len(m.elements) == 1
+        assert lenient is None  # clean strict parse
+
+    def test_lenient_path_sees_includes(self, tmp_path):
+        # Inject a duplicate-ID GRID into the included file to force
+        # fallback into the lenient card-by-card path. The included
+        # cards must still arrive in the final model.
+        main = self._build_deck(tmp_path)
+        grids = tmp_path / 'bulk' / 'grids.bdf'
+        grids.write_text(grids.read_text() + 'GRID,3,,9.0,9.0,9.0\n')
+        m, lenient = NastranModelGenerator._read_bdf_robust(str(main))
+        assert len(m.nodes) == 4
+        assert len(m.elements) == 1
+        assert lenient is not None
+        assert len(lenient.skipped) >= 1
+
+    def test_file_has_includes_detection(self, tmp_path):
+        main = self._build_deck(tmp_path)
+        assert NastranModelGenerator._file_has_includes(str(main))
+        plain = tmp_path / 'plain.bdf'
+        plain.write_text('GRID,1,,0.0,0.0,0.0\n')
+        assert not NastranModelGenerator._file_has_includes(str(plain))
+
+    def test_inline_includes_flattens(self, tmp_path):
+        main = self._build_deck(tmp_path)
+        text, missing = NastranModelGenerator._inline_includes(str(main))
+        assert missing == []
+        # The flattened deck must contain GRIDs and the CQUAD4 inline.
+        assert 'GRID,1' in text
+        assert 'CQUAD4,1' in text
+        # And must NOT still contain raw INCLUDE statements.
+        for line in text.splitlines():
+            assert not line.lstrip().upper().startswith('INCLUDE ')
+
+    def test_inline_includes_reports_missing(self, tmp_path):
+        (tmp_path / 'exec').mkdir()
+        (tmp_path / 'exec' / 'main.dat').write_text(
+            "BEGIN BULK\nINCLUDE 'nope.bdf'\nENDDATA\n"
+        )
+        text, missing = NastranModelGenerator._inline_includes(
+            str(tmp_path / 'exec' / 'main.dat'))
+        assert len(missing) == 1
+        assert 'nope.bdf' in missing[0].replace('\\', '/')

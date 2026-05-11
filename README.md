@@ -1,4 +1,4 @@
-# Node Runner v3.0.0
+# Node Runner v3.0.1
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,19 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.0.1
+
+Patch release focused on real-world Nastran decks that use INCLUDE statements (typical of multi-file aerospace assemblies).
+
+### INCLUDE-aware import
+- Decks with INCLUDE statements (in executive, case, or bulk sections) now import reliably. Relative paths like `..\BULK\foo.bdf` resolve against the original deck's directory even when the importer falls back to temp-file strategies.
+- New `_inline_includes` pre-expands every INCLUDE into a single flat buffer as a fallback path. If pyNastran's strict parse fails on the original, the importer tries again on the flattened deck before resorting to lenient card-by-card parsing.
+- Lenient parsing now sees cards from included files too (previously the lenient path scanned only the top-level file and silently dropped everything that lived behind an INCLUDE).
+- File-open / import dialogs now accept `.bdf`, `.dat`, `.nas`, `.pch`, and `.asm` (the latter two are common as INCLUDE targets in real decks).
+
+### Performance: no cross-reference on import
+- `BDF.read_bdf` is now called with `xref=False` by default. Node Runner is a pre-processor and doesn't need pyNastran's cross-reference web at open time, where it can easily double or triple parse time on large decks. The model still cross-references on demand for analysis-time operations.
 
 ## Changelog for v3.0.0
 

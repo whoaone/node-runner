@@ -2969,10 +2969,34 @@ class NastranModelGenerator:
         Raises:
             RuntimeError: If zero cards could be imported.
         """
-        import os, io, sys
+        import os, io, sys, tempfile
         from cpylog import SimpleLogger
 
-        # ---- Step 1: Build line-number map from original file ----
+        # ---- Step 0: pre-expand INCLUDE statements ----
+        # The card-by-card scan below operates on a single file. If the
+        # deck has INCLUDE statements we'd otherwise see them as opaque
+        # one-line "cards" and skip everything in the referenced files.
+        # Inline them up front so every card lands in the scan.
+        _inlined_path = None
+        if NastranModelGenerator._file_has_includes(filepath):
+            try:
+                flat_text, _missing = (
+                    NastranModelGenerator._inline_includes(filepath))
+                if flat_text:
+                    tmp = tempfile.NamedTemporaryFile(
+                        mode='w', suffix='.bdf', delete=False,
+                        encoding='utf-8',
+                    )
+                    tmp.write(flat_text)
+                    tmp.close()
+                    _inlined_path = tmp.name
+                    filepath = _inlined_path
+            except Exception:
+                # Fall through using the original path; the rest of
+                # _read_bdf_lenient just won't see the included cards.
+                pass
+
+        # ---- Step 1: Build line-number map from (possibly inlined) file ----
         with open(filepath, 'r') as f:
             orig_lines = f.readlines()
 
@@ -3101,6 +3125,14 @@ class NastranModelGenerator:
 
         # ---- Step 5: Validate ----
         total = sum(counts.values())
+
+        # Clean up the inlined temp file if we created one in Step 0.
+        if _inlined_path and os.path.exists(_inlined_path):
+            try:
+                os.remove(_inlined_path)
+            except OSError:
+                pass
+
         if total == 0:
             raise RuntimeError(
                 f"Lenient parsing failed: 0 cards imported, "
@@ -3110,21 +3142,130 @@ class NastranModelGenerator:
                              counts=counts)
 
     @staticmethod
-    def _try_read_bdf(filepath, punch, silent_log, devnull):
+    def _try_read_bdf(filepath, punch, silent_log, devnull, include_dir=None):
         """Attempt to read a BDF file, suppressing all output.
 
         Redirects stdout to suppress pyNastran's raw print()
         statements that bypass the logger (bdf.py line 4371).
+
+        `xref=False` is forced: Node Runner is a pre-processor and never
+        needs the cross-reference web at open time. xref doubles or
+        triples parse time on real-world decks (especially anything with
+        INCLUDE files) for zero benefit until the user runs an analysis.
+        Callers that need xref can call `model.cross_reference()` later.
+
+        `include_dir` overrides pyNastran's auto-computed include search
+        directory. This is critical when reading from a temp file copy of
+        a deck whose INCLUDE statements use paths relative to the
+        original location.
         """
-        import sys
+        import sys, os
         m = BDF(log=silent_log)
+        if include_dir:
+            m.include_dir = include_dir
         old_stdout = sys.stdout
         try:
             sys.stdout = devnull
-            m.read_bdf(filepath, punch=punch)
+            m.read_bdf(filepath, punch=punch, xref=False)
         finally:
             sys.stdout = old_stdout
         return m
+
+    @staticmethod
+    def _file_has_includes(filepath):
+        """Return True if any INCLUDE statement exists in the file.
+
+        Cheap scan - reads only until the first INCLUDE or EOF, ignoring
+        comments. Used by `_read_bdf_robust` to skip fallback strategies
+        that would break relative INCLUDE paths.
+        """
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as fh:
+                for raw in fh:
+                    stripped = raw.lstrip()
+                    if not stripped or stripped.startswith('$'):
+                        continue
+                    if stripped[:7].upper() == 'INCLUDE':
+                        return True
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _inline_includes(filepath, max_depth=8):
+        """Expand every INCLUDE statement into a single flat text blob.
+
+        Walks the deck top-down. INCLUDE lines are replaced inline with
+        the body of the referenced file (recursively, up to ``max_depth``
+        levels). Quoted paths in any of `'..foo'`, `"..foo"`, or bare
+        `..foo` form are accepted; backslash + forward slash separators
+        both work. Continuation across two lines (Nastran spec - INCLUDE
+        with a comma-trailer followed by a continuation line) is also
+        handled.
+
+        Returns ``(text, missing)`` where ``missing`` is a list of include
+        paths that couldn't be resolved (so the caller can surface them
+        rather than silently dropping data).
+        """
+        import os
+        import re
+
+        # Match: INCLUDE '...' / INCLUDE "..." / INCLUDE bare/path
+        # Stops at the first whitespace, '$' (comment), or EOL when bare.
+        include_re = re.compile(
+            r"^\s*INCLUDE\s+(['\"]?)([^'\"\$\r\n]+)\1\s*(?:\$.*)?$",
+            re.IGNORECASE,
+        )
+        missing = []
+
+        def expand(path, depth):
+            if depth > max_depth:
+                missing.append(path)
+                return f"$ INCLUDE depth exceeded for {path}\n"
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    raw_lines = fh.readlines()
+            except OSError:
+                missing.append(path)
+                return f"$ INCLUDE not found: {path}\n"
+
+            include_dir = os.path.dirname(os.path.abspath(path))
+            out_chunks = []
+            i = 0
+            while i < len(raw_lines):
+                line = raw_lines[i]
+                m = include_re.match(line)
+                if m:
+                    inc_path = m.group(2).strip()
+                    # Handle Nastran continuation form: trailing comma
+                    # means the path continues on the next line.
+                    while inc_path.endswith(',') and i + 1 < len(raw_lines):
+                        i += 1
+                        cont = raw_lines[i].strip()
+                        # Strip continuation-leading + or *
+                        if cont.startswith(('+', '*')):
+                            cont = cont[1:].strip()
+                        inc_path = inc_path[:-1] + cont
+                    # Normalize separators - Windows decks usually use \
+                    # but pyNastran also accepts /.
+                    norm = inc_path.replace('\\', os.sep).replace('/', os.sep)
+                    if os.path.isabs(norm):
+                        resolved = norm
+                    else:
+                        resolved = os.path.normpath(
+                            os.path.join(include_dir, norm))
+                    out_chunks.append(
+                        f"$ -- begin INCLUDE {inc_path}\n")
+                    out_chunks.append(expand(resolved, depth + 1))
+                    out_chunks.append(
+                        f"$ -- end   INCLUDE {inc_path}\n")
+                else:
+                    out_chunks.append(line)
+                i += 1
+            return ''.join(out_chunks)
+
+        text = expand(os.path.abspath(filepath), 0)
+        return text, missing
 
     @staticmethod
     def _read_bdf_parallel(filepath, n_workers=4):
@@ -3290,6 +3431,15 @@ class NastranModelGenerator:
         devnull = io.StringIO()
         _try = NastranModelGenerator._try_read_bdf
 
+        # Decks with INCLUDE statements need the original directory so
+        # `..\\BULK\\foo.bdf` style relative paths resolve. The temp-file
+        # fallback strategies below (bulk-extract, preprocess, free-field)
+        # would write copies into the OS temp dir and the relative paths
+        # would point at nothing. So for INCLUDE-bearing decks we keep
+        # the original `include_dir` pinned through every fallback.
+        has_includes = NastranModelGenerator._file_has_includes(filepath)
+        orig_include_dir = os.path.dirname(os.path.abspath(filepath))
+
         # Attempt 1: full deck
         try:
             return (_try(filepath, punch=False,
@@ -3304,7 +3454,59 @@ class NastranModelGenerator:
         except Exception:
             pass
 
+        # Attempt 2.5: for INCLUDE decks, try inlining everything first.
+        # The bulk-extract / preprocess / free-field strategies below
+        # would silently drop INCLUDE bodies because they write to a
+        # different directory. Inline-then-parse keeps every card.
+        if has_includes:
+            try:
+                flat_text, missing = NastranModelGenerator._inline_includes(
+                    filepath)
+                if flat_text and not missing:
+                    tmp_inlined = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode='w', suffix='.bdf', delete=False,
+                            encoding='utf-8',
+                        ) as tmp:
+                            tmp.write(flat_text)
+                            tmp_inlined = tmp.name
+                        # No INCLUDE statements left in the flat file,
+                        # so include_dir is irrelevant. Try full deck
+                        # then punch.
+                        try:
+                            return (_try(tmp_inlined, punch=False,
+                                         silent_log=silent_log,
+                                         devnull=devnull), None)
+                        except Exception:
+                            pass
+                        try:
+                            return (_try(tmp_inlined, punch=True,
+                                         silent_log=silent_log,
+                                         devnull=devnull), None)
+                        except Exception:
+                            pass
+                        # Lenient on the inlined deck.
+                        try:
+                            result = (
+                                NastranModelGenerator._read_bdf_lenient(
+                                    tmp_inlined))
+                            return (result.model, result)
+                        except Exception:
+                            pass
+                    finally:
+                        if tmp_inlined and os.path.exists(tmp_inlined):
+                            os.remove(tmp_inlined)
+            except Exception:
+                # Fall through to remaining strategies; inlining is
+                # best-effort.
+                pass
+
         # Attempt 3: extract bulk data manually
+        # Skip for INCLUDE-bearing decks - the include statements still
+        # live in the extracted bulk and would point into the OS temp
+        # dir, not the original deck's directory. The orig_include_dir
+        # override below restores the right search path.
         bulk_data = NastranModelGenerator._extract_bulk_data(filepath)
         if bulk_data is not None:
             tmp_path = None
@@ -3315,7 +3517,8 @@ class NastranModelGenerator:
                     tmp.write(bulk_data)
                     tmp_path = tmp.name
                 return (_try(tmp_path, punch=True,
-                             silent_log=silent_log, devnull=devnull), None)
+                             silent_log=silent_log, devnull=devnull,
+                             include_dir=orig_include_dir), None)
             except Exception:
                 pass
             finally:
@@ -3329,14 +3532,16 @@ class NastranModelGenerator:
                 # Try full deck on preprocessed file
                 try:
                     return (_try(pp_path, punch=False,
-                                 silent_log=silent_log, devnull=devnull), None)
+                                 silent_log=silent_log, devnull=devnull,
+                                 include_dir=orig_include_dir), None)
                 except Exception:
                     pass
 
                 # Try punch on preprocessed file
                 try:
                     return (_try(pp_path, punch=True,
-                                 silent_log=silent_log, devnull=devnull), None)
+                                 silent_log=silent_log, devnull=devnull,
+                                 include_dir=orig_include_dir), None)
                 except Exception:
                     pass
 
@@ -3351,7 +3556,9 @@ class NastranModelGenerator:
                             tmp.write(bulk_data)
                             tmp_path2 = tmp.name
                         return (_try(tmp_path2, punch=True,
-                                     silent_log=silent_log, devnull=devnull), None)
+                                     silent_log=silent_log,
+                                     devnull=devnull,
+                                     include_dir=orig_include_dir), None)
                     except Exception:
                         pass
                     finally:
@@ -3367,12 +3574,14 @@ class NastranModelGenerator:
             try:
                 try:
                     return (_try(ff_path, punch=False,
-                                 silent_log=silent_log, devnull=devnull), None)
+                                 silent_log=silent_log, devnull=devnull,
+                                 include_dir=orig_include_dir), None)
                 except Exception:
                     pass
                 try:
                     return (_try(ff_path, punch=True,
-                                 silent_log=silent_log, devnull=devnull), None)
+                                 silent_log=silent_log, devnull=devnull,
+                                 include_dir=orig_include_dir), None)
                 except Exception:
                     pass
                 # 5c: extract bulk data from reformatted file
@@ -3387,7 +3596,8 @@ class NastranModelGenerator:
                             tmp_ff = tmp.name
                         return (_try(tmp_ff, punch=True,
                                      silent_log=silent_log,
-                                     devnull=devnull), None)
+                                     devnull=devnull,
+                                     include_dir=orig_include_dir), None)
                     except Exception:
                         pass
                     finally:

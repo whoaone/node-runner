@@ -222,7 +222,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.0.0"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.0.1"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -3392,7 +3392,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.0.0</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.0.1</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -7145,7 +7145,14 @@ class MainWindow(QMainWindow):
 
 
     def _open_file_dialog(self):
-        filepath, _ = QFileDialog.getOpenFileName(self, "Open Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")
+        # Accept the full Nastran family: bulk data (.bdf), executive
+        # data (.dat), free-form decks (.nas), punch (.pch), and
+        # assembly (.asm). The latter two show up via INCLUDE statements
+        # in real aerospace decks; users sometimes want to open them
+        # standalone too.
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Open Nastran File", "",
+            "Nastran Files (*.bdf *.dat *.nas *.pch *.asm);;All Files (*)")
         if not filepath:
             return
 
@@ -7254,7 +7261,9 @@ class MainWindow(QMainWindow):
 
     def _import_file_dialog(self):
         """Handles the 'Import' file action, showing an options dialog."""
-        filepath, _ = QFileDialog.getOpenFileName(self, "Import Nastran File", "", "Nastran Files (*.bdf *.dat *.nas);;All Files (*)")
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Import Nastran File", "",
+            "Nastran Files (*.bdf *.dat *.nas *.pch *.asm);;All Files (*)")
         if not filepath:
             self._update_status("Import cancelled.")
             return
