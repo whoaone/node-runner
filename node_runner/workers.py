@@ -463,10 +463,27 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
 
     def _on_done(generator, lenient_result, detected_format):
         QApplication.restoreOverrideCursor()
-        dialog.close()
+        # v3.2.4: keep the import dialog open through on_success
+        # (which builds the 3D scene + actors). Hand the dialog to
+        # the parent so MainWindow can push progress emits during
+        # the slow per-element actor build. Close once on_success
+        # returns.
+        from node_runner.model import ImportProgress
+        dialog.apply_progress(ImportProgress(
+            stage='render',
+            label='Stage 6/6: Building 3D scene',
+            detail='Constructing geometry + load/BC actors...',
+            fraction=1.0,
+        ))
+        QApplication.processEvents()
+        if parent is not None:
+            parent._active_import_dialog = dialog
         try:
             on_success(generator, lenient_result, detected_format)
         finally:
+            if parent is not None:
+                parent._active_import_dialog = None
+            dialog.close()
             thread.deleteLater()
 
     def _on_failed(msg):

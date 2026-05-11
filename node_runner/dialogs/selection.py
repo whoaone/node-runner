@@ -59,12 +59,16 @@ class EntitySelectionBar(QDialog):
         )
         self.setModal(False)
 
+        # v3.2.4: tightened vertical padding so the dialog isn't taller
+        # than it needs to be. Previously buttons had min-height 24 +
+        # padding 3 + container spacing 4 = ~31px per row × ~6 rows of
+        # buttons / inputs adds up to a dialog that's mostly whitespace.
         self.setStyleSheet("""
             QLabel { font-size: 11px; }
-            QLineEdit { padding: 2px 4px; min-height: 20px; font-size: 11px; }
-            QPushButton, QToolButton { font-size: 11px; padding: 3px 6px;
-                                       min-height: 24px; }
-            QComboBox { font-size: 11px; padding: 2px 4px; min-height: 20px; }
+            QLineEdit { padding: 1px 4px; min-height: 18px; font-size: 11px; }
+            QPushButton, QToolButton { font-size: 11px; padding: 2px 6px;
+                                       min-height: 20px; }
+            QComboBox { font-size: 11px; padding: 1px 4px; min-height: 18px; }
             QRadioButton { font-size: 11px; spacing: 3px; }
             QListWidget { font-family: Consolas, monospace; font-size: 12px;
                           border: 1px solid #aaaaaa; border-radius: 2px;
@@ -75,8 +79,8 @@ class EntitySelectionBar(QDialog):
         # Main 3-column horizontal layout
         # ============================================================
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        outer.setContentsMargins(5, 5, 5, 5)
+        outer.setSpacing(2)
 
         # Title label
         self._title_label = QLabel("Select Node")
@@ -84,11 +88,11 @@ class EntitySelectionBar(QDialog):
         outer.addWidget(self._title_label)
 
         body = QHBoxLayout()
-        body.setSpacing(6)
+        body.setSpacing(4)
 
         # ── LEFT COLUMN ──────────────────────────────────────────
         left = QVBoxLayout()
-        left.setSpacing(4)
+        left.setSpacing(2)
 
         # Row 1: Action mode radios
         radio_row = QHBoxLayout()
@@ -492,12 +496,35 @@ class EntitySelectionBar(QDialog):
             self._method_btn.setText(f"Method \u25b4")
 
     def _update_value_combo(self, method_text):
-        """Populate the value combo from select_by_data."""
+        """Populate the value combo from select_by_data.
+
+        v3.2.4: 'By Quality' is a deferred-compute placeholder (the
+        sentinel '__deferred_quality__'). When the user picks it,
+        MainWindow's _compute_quality_select_data() runs the slow
+        calc on demand and returns the real category dict.
+        """
         self._value_combo.clear()
-        if method_text in self.select_by_data:
-            for key in sorted(self.select_by_data[method_text].keys(),
+        data = self.select_by_data.get(method_text)
+        if data == '__deferred_quality__':
+            # Resolve the deferred compute via a callback on the parent
+            # MainWindow. We do this so the bar itself stays free of
+            # quality knowledge.
+            parent = self.parent()
+            resolver = getattr(parent, '_compute_quality_select_data', None)
+            if callable(resolver):
+                try:
+                    data = resolver()
+                    # Cache the resolved dict so we don't recompute
+                    # next time the user picks the method.
+                    self.select_by_data[method_text] = data
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+        if isinstance(data, dict):
+            for key in sorted(data.keys(),
                               key=lambda k: (isinstance(k, str), k)):
-                count = len(self.select_by_data[method_text][key])
+                count = len(data[key])
                 self._value_combo.addItem(f"{key} ({count} elems)", key)
 
     # ------------------------------------------------------------------
@@ -735,12 +762,26 @@ class EntitySelectionBar(QDialog):
                 self.entity_type, self.get_selected_ids())
 
     def _on_highlight_toggled(self, checked):
-        """Toggle highlighting of selected entities in the viewport."""
+        """Toggle highlighting of selected entities in the viewport.
+
+        v3.2.4: also update the count label so the user sees feedback
+        when nothing's selected yet. Before, clicking H with no
+        entries added produced no visible change anywhere; users
+        thought the button was broken.
+        """
         if checked:
-            self.request_show_selection.emit(
-                self.entity_type, self.get_selected_ids())
+            ids = self.get_selected_ids()
+            self.request_show_selection.emit(self.entity_type, ids)
+            if not ids:
+                # No entries yet - tell the user nothing to highlight.
+                self._count_label.setText(
+                    f"Count: 0 / {len(self.all_entity_ids):,}  "
+                    f"(nothing selected to highlight yet)")
         else:
             self.request_show_selection.emit(self.entity_type, [])
+            self._count_label.setText(
+                f"Count: {len(self.get_selected_ids()):,} / "
+                f"{len(self.all_entity_ids):,}  (highlighting OFF)")
 
     # ------------------------------------------------------------------
     # Picking / Previous

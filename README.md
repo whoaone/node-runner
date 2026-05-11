@@ -1,4 +1,4 @@
-# Node Runner v3.2.3
+# Node Runner v3.2.4
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,37 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.2.4
+
+Patch release covering six user-reported issues from the v3.2.3 review.
+
+### `List > Element Information` hang (~5 min)
+- Root cause: `_build_select_by_data` eagerly computed element-quality metrics (aspect, skew, warp, Jacobian, taper) for *every* element on every selection-bar open. On a 700k-element deck that's many minutes of pure-Python work for a "By Quality" category most users never click.
+- Fix: defer the quality compute. The Method menu now lists `By Quality` as a placeholder; the slow calc runs only when the user actually picks that method, with a wait cursor + status message. Result is cached for the session.
+- The selection bar's `Highlight` path also got a performance guard: when the user's selection covers more than 50% of the grid, we overlay the *full* `current_grid` wireframe instead of doing an `extract_cells` deep-copy. Visually equivalent, ~100x faster on whole-mesh selections.
+
+### Highlight (H) button in the Entity Selection window
+- The button was wired correctly but produced no visible feedback when nothing was selected yet, which read as "broken". Now the count label updates with a hint: `Count: 0 / 700,000  (nothing selected to highlight yet)` when H is toggled on with no entries, and `(highlighting OFF)` when toggled off.
+
+### Entity Selection window vertical spacing
+- Tightened the per-row padding (button `min-height` 24 → 20, `QLineEdit` 20 → 18, layout spacing 4 → 2) so the dialog isn't dominated by whitespace between rows.
+
+### Coordinate Systems tree group: actually collapsed
+- v3.2.3 marked the coords group `setExpanded(False)` but `_populate_tree` calls `tree.expandAll()` afterward, so the group re-expanded. v3.2.4 explicitly collapses the coords group *after* the tree-wide expand so it stays closed.
+
+### Model-tree search bar
+- New `QLineEdit` above the Model tree with **Filter** / **Find** radio buttons:
+  - **Filter mode** (default): hides tree items whose text doesn't match the query (case-insensitive substring; matches GRIDs / CIDs / element types / property labels). Parents of matching children stay visible and auto-expand.
+  - **Find mode**: Enter scrolls the next matching item into view + selects it. Wraps to top after the last match.
+- Use it to find `CID 10`, `CQUAD4`, `Property 42`, or `Material steel` instantly without scrolling.
+
+### "Still rendering" feedback after import completes
+- The import dialog used to close at `Imported N nodes` and the user then saw the window freeze for a few seconds while `_update_viewer` built per-element actors (loads, constraints, RBEs, masses, PLOTELs). On a 268k-PLOAD4 deck that gap was 5-15 s of silent waiting.
+- v3.2.4 keeps the import dialog open through the post-parse scene-build phase. New `Stage 6/6: Building 3D scene` with detail lines for each actor-creation step (loads, constraints, rigid elements, masses, PLOTELs, final render). Dialog closes only after the scene is on-screen.
+
+### Tests
+- 138 tests still pass (changes are wiring/UX; no semantic-level test changes).
 
 ## Changelog for v3.2.3
 

@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QGridLayout, QTreeWidget, QTreeWidgetItem, QSplitter,
     QDialogButtonBox, QTreeWidgetItemIterator, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QRadioButton,
-    QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox, QDockWidget,
+    QButtonGroup, QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox,
+    QDockWidget,
 )
 from PySide6.QtGui import (QPalette, QColor, QAction, QActionGroup, QDoubleValidator,
                            QPainter, QPen, QBrush, QPolygonF, QPixmap, QIcon)
@@ -222,7 +223,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.2.3"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.2.4"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -438,8 +439,50 @@ class MainWindow(QMainWindow):
         grp_row4.addWidget(auto_grp_btn)
         groups_layout.addLayout(grp_row4)
 
+        # v3.2.4: search bar above the model tree. Search supports two
+        # modes via the radio toggles:
+        #   Filter: hide tree items that don't match (default)
+        #   Find:   scroll-and-highlight the next matching item
+        # Match logic: case-insensitive substring match against item
+        # display text, which includes IDs and labels (e.g. "GRID 12345",
+        # "CID 10: Rectangular - my_csys").
+        model_tab_container = QWidget()
+        model_tab_layout = QVBoxLayout(model_tab_container)
+        model_tab_layout.setContentsMargins(4, 4, 4, 4)
+        model_tab_layout.setSpacing(3)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(4)
+        self._tree_search = QLineEdit()
+        self._tree_search.setPlaceholderText(
+            "Search tree (ID, type, label)...")
+        self._tree_search.setClearButtonEnabled(True)
+        search_row.addWidget(self._tree_search, 1)
+        self._tree_search_filter_radio = QRadioButton("Filter")
+        self._tree_search_filter_radio.setChecked(True)
+        self._tree_search_filter_radio.setToolTip(
+            "Hide tree items that don't match")
+        self._tree_search_find_radio = QRadioButton("Find")
+        self._tree_search_find_radio.setToolTip(
+            "Scroll the next matching item into view")
+        _tree_search_grp = QButtonGroup(self)
+        _tree_search_grp.addButton(self._tree_search_filter_radio)
+        _tree_search_grp.addButton(self._tree_search_find_radio)
+        search_row.addWidget(self._tree_search_filter_radio)
+        search_row.addWidget(self._tree_search_find_radio)
+        model_tab_layout.addLayout(search_row)
+        model_tab_layout.addWidget(self.tree_widget, 1)
+        self._tree_search.textChanged.connect(self._on_tree_search_changed)
+        self._tree_search.returnPressed.connect(self._on_tree_search_next)
+        self._tree_search_filter_radio.toggled.connect(
+            lambda on: on and self._on_tree_search_changed(
+                self._tree_search.text()))
+        self._tree_search_find_radio.toggled.connect(
+            lambda on: on and self._tree_search_clear_filter())
+        # Tracks where 'Find' mode is in the cycle.
+        self._tree_search_find_cursor = 0
+
         self.sidebar_tabs = QTabWidget()
-        self.sidebar_tabs.addTab(self.tree_widget, "Model")
+        self.sidebar_tabs.addTab(model_tab_container, "Model")
 
         # --- Loads Tab (unified tree, mirrors Model tab layout) ---
         loads_tab = QWidget()
@@ -3473,7 +3516,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.2.3</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.2.4</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -6187,16 +6230,35 @@ class MainWindow(QMainWindow):
                 )
 
         elif entity_type == 'Element':
-            indices = np.isin(self.current_grid.cell_data['EID'], entity_ids)
-            if np.any(indices):
-                highlight_grid = self.current_grid.extract_cells(indices)
-                # Phase 3.5: theme-coherent selection accent
-                from node_runner.theme import SELECTION_ACCENT
+            # v3.2.4: extract_cells deep-copies the selected cells +
+            # their points. On a 700k-element 'select all' it's many
+            # seconds and looks like a hang. Performance guard:
+            #   * If the selection size approaches the full element
+            #     count, skip the deep copy and overlay the WHOLE
+            #     current_grid as a wireframe with the accent color.
+            #     Visually equivalent for the user.
+            #   * Otherwise extract the subset as before.
+            from node_runner.theme import SELECTION_ACCENT
+            n_cells = self.current_grid.n_cells
+            n_sel = len(entity_ids)
+            if n_cells > 0 and n_sel >= n_cells * 0.5:
+                # Big selection - just overlay the full grid.
                 self.plotter.add_mesh(
-                    highlight_grid, style='wireframe', color=SELECTION_ACCENT,
-                    line_width=5, name='selection_highlight', pickable=False,
-                    reset_camera=False
+                    self.current_grid, style='wireframe',
+                    color=SELECTION_ACCENT, line_width=3,
+                    name='selection_highlight', pickable=False,
+                    reset_camera=False,
                 )
+            else:
+                indices = np.isin(self.current_grid.cell_data['EID'], entity_ids)
+                if np.any(indices):
+                    highlight_grid = self.current_grid.extract_cells(indices)
+                    self.plotter.add_mesh(
+                        highlight_grid, style='wireframe',
+                        color=SELECTION_ACCENT, line_width=5,
+                        name='selection_highlight', pickable=False,
+                        reset_camera=False,
+                    )
 
         self.plotter.camera = camera_before
         self.plotter.render()
@@ -6443,16 +6505,25 @@ class MainWindow(QMainWindow):
             if pid not in self.pid_color_map:
                 self.pid_color_map[pid] = QColor(random.randint(50, 220), random.randint(50, 220), random.randint(50, 220)).name()
 
+        self._emit_render_progress("Populating model tree...")
         self.tree_widget.blockSignals(True)
         self._populate_tree()
         self.tree_widget.blockSignals(False)
 
         # Coord actors are created centrally via _refresh_coord_actors (called by _update_plot_visibility)
+        # Each of these can iterate the full bulk (e.g. 268k PLOAD4s);
+        # show a status hint between each so the user sees motion.
+        self._emit_render_progress("Building load actors (FORCE/MOMENT/PLOAD4)...")
         self._create_all_load_actors()
+        self._emit_render_progress("Building constraint actors (SPC/SPC1)...")
         self._create_all_constraint_actors()
+        self._emit_render_progress("Building rigid-element actors (RBE/RBAR)...")
         self._create_rbe_actors()
+        self._emit_render_progress("Building mass actors (CONM2)...")
         self._create_mass_actors()
+        self._emit_render_progress("Building plot-element actors (PLOTEL)...")
         self._create_plotel_actors()
+        self._emit_render_progress("Final render...")
         self._update_plot_visibility()
 
         if reset_camera and self.current_grid and self.current_grid.n_points > 0:
@@ -6467,7 +6538,17 @@ class MainWindow(QMainWindow):
         return [it.value() for it in QTreeWidgetItemIterator(self.tree_widget) if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
 
     def _build_select_by_data(self):
-        """Build property/material/type/quality lookup dicts for element selection."""
+        """Build property/material/type lookup dicts for element selection.
+
+        v3.2.4: 'By Quality' is computed lazily on demand instead of
+        up front. Element-quality metrics (aspect, skew, warp,
+        Jacobian, taper) for a 700k-element deck are many minutes of
+        pure-Python work; computing them every time the user opens
+        any selection dialog made `List > Element Information` hang
+        for 5+ minutes. The Method menu now shows 'By Quality
+        (compute...)' which triggers the calc only if the user
+        actually picks it.
+        """
         model = self.current_generator.model
         all_elements = {**model.elements, **model.rigid_elements}
         by_property, by_material, by_type = {}, {}, {}
@@ -6481,35 +6562,53 @@ class MainWindow(QMainWindow):
                     mid = getattr(prop, 'mid', None) or getattr(prop, 'mid1', None)
                     if mid: by_material.setdefault(mid, []).append(eid)
 
-        # Quality-based selection categories
-        by_quality = {}
-        try:
-            quality = self.current_generator.calculate_element_quality()
-            thresholds = {'Aspect > 5': ('aspect', 5.0, 'gt'),
-                          'Skew > 45°': ('skew', 45.0, 'gt'),
-                          'Skew > 60°': ('skew', 60.0, 'gt'),
-                          'Warp > 5°': ('warp', 5.0, 'gt'),
-                          'Warp > 10°': ('warp', 10.0, 'gt'),
-                          'Jacobian < 0.6': ('jacobian', 0.6, 'lt'),
-                          'Taper > 0.5': ('taper', 0.5, 'gt')}
-            for label, (metric, thresh, op) in thresholds.items():
-                eids = []
-                for eid, metrics in quality.items():
-                    val = metrics.get(metric)
-                    if val is None:
-                        continue
-                    if (op == 'gt' and val > thresh) or (op == 'lt' and val < thresh):
-                        eids.append(eid)
-                if eids:
-                    by_quality[label] = eids
-        except Exception:
-            pass
-
         result = {'By Property': by_property, 'By Material': by_material,
                   'By Type': by_type}
-        if by_quality:
-            result['By Quality'] = by_quality
+        # 'By Quality' is a deferred-compute placeholder. The selection
+        # bar shows it as a method but only triggers the actual quality
+        # calc when the user picks it. See _compute_quality_select_data.
+        result['By Quality'] = '__deferred_quality__'
         return result
+
+    def _compute_quality_select_data(self):
+        """Lazy producer of the 'By Quality' selection categories.
+
+        Called from EntitySelectionBar when the user picks 'By Quality'
+        method. Wraps the slow calculate_element_quality() call in a
+        wait cursor + status message so the user can see something is
+        happening. Returns a dict {label: [eid, ...]}.
+        """
+        from PySide6.QtWidgets import QApplication
+        try:
+            self._update_status(
+                "Computing element-quality metrics... (one-time, may "
+                "take 30-60s on big decks)")
+            QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            QApplication.processEvents()
+            quality = self.current_generator.calculate_element_quality()
+        finally:
+            QApplication.restoreOverrideCursor()
+        thresholds = {'Aspect > 5': ('aspect', 5.0, 'gt'),
+                      'Skew > 45 deg': ('skew', 45.0, 'gt'),
+                      'Skew > 60 deg': ('skew', 60.0, 'gt'),
+                      'Warp > 5 deg': ('warp', 5.0, 'gt'),
+                      'Warp > 10 deg': ('warp', 10.0, 'gt'),
+                      'Jacobian < 0.6': ('jacobian', 0.6, 'lt'),
+                      'Taper > 0.5': ('taper', 0.5, 'gt')}
+        out = {}
+        for label, (metric, thresh, op) in thresholds.items():
+            eids = []
+            for eid, metrics in quality.items():
+                val = metrics.get(metric)
+                if val is None:
+                    continue
+                if (op == 'gt' and val > thresh) or (op == 'lt' and val < thresh):
+                    eids.append(eid)
+            if eids:
+                out[label] = eids
+        self._update_status(
+            f"Quality computed for {len(quality):,} elements.")
+        return out
 
     def _open_property_editor(self):
         if not self.current_generator or not self.current_generator.model.properties: QMessageBox.warning(self, "No Properties", "No properties to edit."); return
@@ -6658,10 +6757,149 @@ class MainWindow(QMainWindow):
                     create_item(surfs_item, label, data=('geom_surface', sid))
 
         self.tree_widget.expandAll()
+        # v3.2.4: collapse the Coordinate Systems group after the
+        # tree-wide expandAll above. Big aerospace decks routinely
+        # have dozens of CORD2R systems (one per SE boundary, one per
+        # panel) and they clutter the tree on first open. The user
+        # can still click the disclosure triangle to expand.
+        for coords_item in self._find_tree_items(('group', 'coords')):
+            coords_item.setExpanded(False)
         self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
         self._populate_loads_tab()
         self._populate_analysis_tab()
 
+
+    def _emit_render_progress(self, message: str) -> None:
+        """v3.2.4: push a status update into the import dialog (if one
+        is still open) during the post-parse scene-build steps.
+
+        The import dialog stays visible through ``on_success`` so the
+        user sees progress while we build PyVista actors, populate
+        the tree, and rebuild the plot. Without this, the dialog
+        would have closed at 'Imported N nodes' and the user would
+        see a several-second freeze while the scene assembled.
+        """
+        dialog = getattr(self, '_active_import_dialog', None)
+        if dialog is None:
+            self._update_status(message)
+            return
+        try:
+            from node_runner.model import ImportProgress
+            dialog.apply_progress(ImportProgress(
+                stage='render',
+                label='Stage 6/6: Building 3D scene',
+                detail=message,
+                fraction=1.0,
+            ))
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    # ----- v3.2.4 tree search bar -----
+
+    def _on_tree_search_changed(self, text: str):
+        """Search box content changed.
+
+        Filter mode: walk the tree, hide every item whose display
+        text doesn't contain the query (case-insensitive), and unhide
+        any item on the path from a matching child up to root.
+
+        Find mode: just resets the find cursor; actual scroll happens
+        on Enter via _on_tree_search_next.
+        """
+        if self._tree_search_filter_radio.isChecked():
+            self._apply_tree_filter(text.strip().lower())
+        else:
+            # Find mode - reset the cursor so the next Enter starts
+            # from the top.
+            self._tree_search_find_cursor = 0
+
+    def _on_tree_search_next(self):
+        """Enter pressed in the search box.
+
+        Filter mode: re-applies the filter (no-op if text unchanged).
+        Find mode: scroll the next matching item into view + select.
+        Wraps to the top after the last match.
+        """
+        text = self._tree_search.text().strip().lower()
+        if not text:
+            return
+        if self._tree_search_filter_radio.isChecked():
+            self._apply_tree_filter(text)
+            return
+        # Find mode: walk the tree, find the next match after the cursor.
+        matches = []
+        it = QTreeWidgetItemIterator(self.tree_widget)
+        while it.value():
+            item = it.value()
+            label = item.text(0).lower()
+            if text in label:
+                matches.append(item)
+            it += 1
+        if not matches:
+            self._update_status(f"Tree search: no match for '{text}'.")
+            return
+        idx = self._tree_search_find_cursor % len(matches)
+        target = matches[idx]
+        # Expand ancestors so the item is actually visible.
+        parent = target.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.tree_widget.setCurrentItem(target)
+        self.tree_widget.scrollToItem(target)
+        self._tree_search_find_cursor = idx + 1
+        self._update_status(
+            f"Tree search: match {idx + 1} / {len(matches)} for '{text}'.")
+
+    def _tree_search_clear_filter(self):
+        """Switching back to Find mode - unhide everything."""
+        it = QTreeWidgetItemIterator(self.tree_widget)
+        while it.value():
+            it.value().setHidden(False)
+            it += 1
+
+    def _apply_tree_filter(self, query: str):
+        """Hide tree items that don't contain ``query`` (lowercase).
+
+        Two-pass:
+          1) Walk every item; mark "matches" if its own text contains
+             query OR any descendant's text does.
+          2) Hide items that are NOT marked.
+        Empty query unhides everything.
+        """
+        if not query:
+            self._tree_search_clear_filter()
+            return
+
+        # Collect all items so we can do a child-then-parent pass.
+        all_items = []
+        it = QTreeWidgetItemIterator(self.tree_widget)
+        while it.value():
+            all_items.append(it.value())
+            it += 1
+
+        # Pass 1: each item is "matched" if its own text matches OR
+        # any descendant did. Process bottom-up so descendants are
+        # resolved first.
+        matched = {}
+        for item in reversed(all_items):
+            self_match = query in item.text(0).lower()
+            any_child = False
+            for k in range(item.childCount()):
+                if matched.get(id(item.child(k)), False):
+                    any_child = True
+                    break
+            matched[id(item)] = self_match or any_child
+
+        # Pass 2: hide unmatched items; expand parents of matches.
+        for item in all_items:
+            is_match = matched[id(item)]
+            item.setHidden(not is_match)
+            if is_match and item.childCount():
+                # Auto-expand so matches are visible.
+                item.setExpanded(True)
 
     def _handle_tree_item_changed(self, item, column):
         self.tree_widget.blockSignals(True)
