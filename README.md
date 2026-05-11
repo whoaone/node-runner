@@ -1,4 +1,4 @@
-# Node Runner v3.2.5
+# Node Runner v3.2.6
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -15,7 +15,19 @@ run.bat            (or)
 
 `run.py` works too, as long as you've activated the project venv first.
 
-## Changelog for v3.2.5
+## Changelog for v3.2.6
+
+Revert release. v3.2.5's Entity Selection redesign had a bug where the new `right_col` layout was created but never added to the dialog body, so the entire right side (Select All / Reset / Previous / Pick / Method / More / Delete / Hilite / OK / Cancel) was missing on screen.
+
+v3.2.6 reverts `node_runner/dialogs/selection.py` to the v3.2.4 state. The original Femap-style layout (3x3 grid: Select All / Reset / Pick+H | Previous / Delete / OK | More / Method / Cancel) is back. Everything else from v3.2.4 stays: the deferred quality-compute fix, the Hilite-count-label feedback, the tighter spacing, the model-tree search bar, the Stage 6/6 scene-build progress.
+
+The redesign idea (uniform button sizes, OK/Cancel separated) will be redone properly in a future release once we have screen-tested the layout end-to-end before shipping.
+
+## Changelog for v3.2.5 (withdrawn)
+
+This release had a layout bug that hid the right-column buttons. It has been superseded by v3.2.6.
+
+## Changelog for v3.2.4
 
 Patch release: Entity Selection window redesign.
 

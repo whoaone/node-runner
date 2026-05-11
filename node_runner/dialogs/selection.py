@@ -177,104 +177,74 @@ class EntitySelectionBar(QDialog):
         self._list_widget.setMinimumHeight(70)
         body.addWidget(self._list_widget, 1)
 
-        # ---- RIGHT COLUMN: uniform-size action grid + OK/Cancel ----
-        # v3.2.4 layout: every action button is the SAME size (equal
-        # column-stretch on a 3-col grid; no setFixedSize anywhere).
-        # OK/Cancel pair sits in a separate row at the bottom-right,
-        # divided from the action grid by a stretch.
-        #
-        #   [Select All] [Reset]     [Previous]
-        #   [Pick v]     [Method v]  [More]
-        #   [Delete]     [Hilite]
-        #   ---------- (spacer) ---------------
-        #                                [OK]  [Cancel]
-        right_col = QVBoxLayout()
-        right_col.setSpacing(3)
-
+        # ── RIGHT COLUMN: 3×3 button grid ────────────────────────
         grid = QGridLayout()
         grid.setSpacing(3)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
 
-        # Row 0 -- bulk-selection actions
+        # Row 0: Select All | Reset | [Pick][H]
         self._all_btn = QPushButton("Select All")
-        self._all_btn.setToolTip("Select every entity")
+        self._all_btn.setToolTip("Select all entities")
         grid.addWidget(self._all_btn, 0, 0)
 
         self._reset_btn = QPushButton("Reset")
-        self._reset_btn.setToolTip("Clear the entire selection")
+        self._reset_btn.setToolTip("Clear entire selection")
         grid.addWidget(self._reset_btn, 0, 1)
 
-        self._prev_btn = QPushButton("Previous")
-        self._prev_btn.setToolTip("Restore the previous selection")
-        grid.addWidget(self._prev_btn, 0, 2)
-
-        # Row 1 -- input-method buttons + More
+        pick_h_row = QHBoxLayout()
+        pick_h_row.setSpacing(2)
         self._pick_btn = QToolButton()
-        self._pick_btn.setText("Pick ▾")
-        self._pick_btn.setToolTip(
-            "Pick entities from the viewport; arrow for pick modes")
+        self._pick_btn.setText("Pick")
+        self._pick_btn.setToolTip("Pick entities from viewport; arrow for pick modes")
         self._pick_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self._pick_btn.setPopupMode(QToolButton.MenuButtonPopup)
         self._pick_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._pick_menu = QMenu(self)
         self._build_pick_menu()
         self._pick_btn.setMenu(self._pick_menu)
-        grid.addWidget(self._pick_btn, 1, 0)
+        pick_h_row.addWidget(self._pick_btn)
+
+        self._highlight_btn = QToolButton()
+        self._highlight_btn.setText("H")
+        self._highlight_btn.setToolTip("Toggle highlighting in viewport")
+        self._highlight_btn.setCheckable(True)
+        self._highlight_btn.setChecked(True)
+        self._highlight_btn.setFixedSize(26, 26)
+        self._highlight_btn.setStyleSheet(
+            "font-weight: bold; background: #f9e2af; color: #1e1e2e; "
+            "border-radius: 3px; border: 1px solid #cba651;")
+        pick_h_row.addWidget(self._highlight_btn)
+        grid.addLayout(pick_h_row, 0, 2)
+
+        # Row 1: Previous | Delete | OK
+        self._prev_btn = QPushButton("Previous")
+        self._prev_btn.setToolTip("Restore previous selection")
+        grid.addWidget(self._prev_btn, 1, 0)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setToolTip("Remove highlighted entries from the list")
+        grid.addWidget(self._delete_btn, 1, 1)
+
+        self._ok_btn = QPushButton("OK")
+        self._ok_btn.setStyleSheet("font-weight: bold;")
+        grid.addWidget(self._ok_btn, 1, 2)
+
+        # Row 2: More | Method▾ | Cancel
+        self._more_btn = QPushButton("More")
+        self._more_btn.setToolTip("Apply current input and clear for more entries")
+        grid.addWidget(self._more_btn, 2, 0)
 
         self._method_btn = QToolButton()
-        self._method_btn.setText("Method ▾")
-        self._method_btn.setToolTip(
-            "Choose selection method (ID, By Property, By Type, ...)")
+        self._method_btn.setText("Method \u25b4")
+        self._method_btn.setToolTip("Choose selection method")
         self._method_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self._method_btn.setPopupMode(QToolButton.InstantPopup)
         self._method_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._method_menu = QMenu(self)
         self._method_btn.setMenu(self._method_menu)
-        grid.addWidget(self._method_btn, 1, 1)
+        grid.addWidget(self._method_btn, 2, 1)
 
-        self._more_btn = QPushButton("More")
-        self._more_btn.setToolTip(
-            "Apply current input and clear for more entries")
-        grid.addWidget(self._more_btn, 1, 2)
-
-        # Row 2 -- list ops + highlight toggle (col 2 left empty)
-        self._delete_btn = QPushButton("Delete")
-        self._delete_btn.setToolTip(
-            "Remove highlighted entries from the list")
-        grid.addWidget(self._delete_btn, 2, 0)
-
-        self._highlight_btn = QToolButton()
-        self._highlight_btn.setText("Hilite")
-        self._highlight_btn.setToolTip(
-            "Toggle highlighting of the current selection in the 3D view")
-        self._highlight_btn.setCheckable(True)
-        self._highlight_btn.setChecked(True)
-        self._highlight_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._highlight_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        # Amber only when checked so the button blends with the rest
-        # of the action grid when not actively highlighting.
-        self._highlight_btn.setStyleSheet(
-            "QToolButton:checked { font-weight: bold; background: #f9e2af; "
-            "color: #1e1e2e; border: 1px solid #cba651; border-radius: 3px; }")
-        grid.addWidget(self._highlight_btn, 2, 1)
-
-        right_col.addLayout(grid)
-        right_col.addStretch(1)
-
-        # Separated OK / Cancel pair at bottom-right of the column.
-        ok_cancel_row = QHBoxLayout()
-        ok_cancel_row.setSpacing(3)
-        ok_cancel_row.addStretch(1)
-        self._ok_btn = QPushButton("OK")
-        self._ok_btn.setStyleSheet("font-weight: bold;")
-        self._ok_btn.setMinimumWidth(64)
-        ok_cancel_row.addWidget(self._ok_btn)
         self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.setMinimumWidth(64)
-        ok_cancel_row.addWidget(self._cancel_btn)
-        right_col.addLayout(ok_cancel_row)
+        grid.addWidget(self._cancel_btn, 2, 2)
 
         body.addLayout(grid, 0)
 
