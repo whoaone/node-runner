@@ -280,3 +280,127 @@ class TestIncludeStatements:
             str(tmp_path / 'exec' / 'main.dat'))
         assert len(missing) == 1
         assert 'nope.bdf' in missing[0].replace('\\', '/')
+
+
+# ---------------------------------------------------------------------------
+# Multi-line INCLUDE statements
+# ---------------------------------------------------------------------------
+
+class TestMultiLineInclude:
+    """v3.0.2: real-world decks split long INCLUDE paths across lines.
+
+    Three Nastran continuation styles must work:
+      * comma-trailer (the QRG-documented form)
+      * unclosed-quote continuation
+      * leading + or * marker on the continuation line
+    """
+
+    def _make_target(self, root):
+        (root / 'sub').mkdir()
+        target = root / 'sub' / 'piece.bdf'
+        target.write_text('GRID,1,,0.0,0.0,0.0\n')
+        return target
+
+    def test_multi_line_path_with_leading_whitespace(self, tmp_path):
+        # Most common multi-line form: open quote, path continues on
+        # subsequent indented line(s), close quote at the end. Matches
+        # pyNastran's documented multi-line example.
+        self._make_target(tmp_path)
+        main = tmp_path / 'main.dat'
+        main.write_text(
+            "BEGIN BULK\n"
+            "INCLUDE 'sub\n"
+            "         /piece.bdf'\n"  # <- indented continuation
+            "ENDDATA\n"
+        )
+        text, missing = NastranModelGenerator._inline_includes(str(main))
+        assert missing == [], f'unexpected missing: {missing}'
+        assert 'GRID,1' in text
+
+    def test_unclosed_quote_continuation(self, tmp_path):
+        self._make_target(tmp_path)
+        main = tmp_path / 'main.dat'
+        main.write_text(
+            "BEGIN BULK\n"
+            "INCLUDE 'sub/\n"        # <- no close quote, no comma
+            "piece.bdf'\n"
+            "ENDDATA\n"
+        )
+        text, missing = NastranModelGenerator._inline_includes(str(main))
+        assert missing == [], f'unexpected missing: {missing}'
+        assert 'GRID,1' in text
+
+    def test_continuation_line_with_plus_marker(self, tmp_path):
+        self._make_target(tmp_path)
+        main = tmp_path / 'main.dat'
+        main.write_text(
+            "BEGIN BULK\n"
+            "INCLUDE 'sub/\n"
+            "+piece.bdf'\n"   # <- leading + (Nastran cont marker)
+            "ENDDATA\n"
+        )
+        text, missing = NastranModelGenerator._inline_includes(str(main))
+        assert missing == []
+        assert 'GRID,1' in text
+
+    def test_two_line_path_resolves_through_robust(self, tmp_path):
+        self._make_target(tmp_path)
+        main = tmp_path / 'main.dat'
+        main.write_text(
+            "SOL 101\nCEND\nBEGIN BULK\n"
+            "INCLUDE 'sub/\n"
+            "piece.bdf'\n"
+            "ENDDATA\n"
+        )
+        m, lenient = NastranModelGenerator._read_bdf_robust(str(main))
+        assert len(m.nodes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Streaming parser with progress callback
+# ---------------------------------------------------------------------------
+
+class TestStreamingParser:
+    """v3.0.2: _read_bdf_streaming gives per-file progress for big decks."""
+
+    def _build_deck(self, root, n_includes=3):
+        (root / 'bulk').mkdir()
+        for k in range(n_includes):
+            (root / 'bulk' / f'g{k}.bdf').write_text(
+                f'GRID,{k+1},,{k}.0,0.0,0.0\n')
+        main = root / 'main.dat'
+        body = "SOL 101\nCEND\nBEGIN BULK\n"
+        for k in range(n_includes):
+            body += f"INCLUDE 'bulk/g{k}.bdf'\n"
+        body += "ENDDATA\n"
+        main.write_text(body)
+        return main
+
+    def test_streaming_imports_all_nodes(self, tmp_path):
+        main = self._build_deck(tmp_path, n_includes=3)
+        m, lenient = NastranModelGenerator._read_bdf_streaming(str(main))
+        assert len(m.nodes) == 3
+
+    def test_streaming_emits_progress(self, tmp_path):
+        main = self._build_deck(tmp_path, n_includes=4)
+        events = []
+        def prog(stage, msg, frac):
+            events.append((stage, msg, frac))
+        m, _ = NastranModelGenerator._read_bdf_streaming(
+            str(main), progress=prog)
+        assert len(m.nodes) == 4
+        # We expect at least one 'inline' event and one 'done' event.
+        stages = [e[0] for e in events]
+        assert 'inline' in stages
+        assert 'done' in stages
+        # The final event's fraction should be 1.0.
+        assert events[-1][2] == 1.0
+
+    def test_gather_include_chain_lists_files(self, tmp_path):
+        main = self._build_deck(tmp_path, n_includes=2)
+        files, total, missing = (
+            NastranModelGenerator._gather_include_chain(str(main)))
+        assert missing == []
+        # Root + 2 includes = 3 files.
+        assert len(files) == 3
+        assert total > 0

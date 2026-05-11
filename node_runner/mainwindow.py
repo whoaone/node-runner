@@ -222,7 +222,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.0.1"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.0.2"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -3392,7 +3392,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.0.1</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v3.0.2</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 

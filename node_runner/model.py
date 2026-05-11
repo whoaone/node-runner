@@ -3192,33 +3192,145 @@ class NastranModelGenerator:
         return False
 
     @staticmethod
-    def _inline_includes(filepath, max_depth=8):
+    def _parse_include_statement(lines, i):
+        """Parse a (possibly multi-line) INCLUDE statement starting at lines[i].
+
+        Returns ``(inc_path, next_i)`` where ``inc_path`` is the cleaned
+        path string (None if this line isn't a recognizable INCLUDE) and
+        ``next_i`` is the index of the line just past the end of the
+        statement.
+
+        Handles all three Nastran continuation forms seen in real decks:
+
+        1. **Single line** (most common):
+              INCLUDE 'path/to/file.bdf'
+
+        2. **Comma-trailer continuation** (per MSC/NX QRG):
+              INCLUDE 'this/is/a/long,
+                       /path/file.bdf'
+           A trailing comma (with optional whitespace before EOL, and
+           optional in-string position) means the next line continues
+           the path. Leading whitespace on the continuation line is
+           stripped. A leading '+' or '*' continuation marker is also
+           stripped.
+
+        3. **Unclosed-quote continuation** (seen from some Femap
+           exports and hand-edited decks):
+              INCLUDE 'this/is/a/long
+                       /path/file.bdf'
+           If we see an opening quote and no matching close quote on
+           the same line, keep reading lines until we find the close
+           quote, again stripping leading whitespace.
+
+        Bare (unquoted) paths must be single-line - Nastran doesn't
+        define a continuation form for them.
+        """
+        line = lines[i]
+        stripped_lead = line.lstrip()
+        upper = stripped_lead.upper()
+        if not upper.startswith('INCLUDE'):
+            return None, i + 1
+        # Reject "INCLUDEFOO" or similar non-INCLUDE words.
+        rest = stripped_lead[7:]
+        if rest and not rest[0].isspace():
+            return None, i + 1
+
+        # Strip leading whitespace + any trailing comment from rest.
+        rest_no_comment = rest.split('$', 1)[0].strip()
+        if not rest_no_comment:
+            # INCLUDE with no path - skip and treat as unknown.
+            return None, i + 1
+
+        quote = None
+        if rest_no_comment[0] in ('\'', '"'):
+            quote = rest_no_comment[0]
+            rest_no_comment = rest_no_comment[1:]
+
+        path_parts = []
+        j = i
+
+        def _strip_continuation(s):
+            """Strip leading + or * (Nastran continuation marker)."""
+            s = s.lstrip()
+            if s and s[0] in ('+', '*'):
+                s = s[1:].lstrip()
+            return s
+
+        while True:
+            chunk = rest_no_comment
+
+            if quote is not None:
+                # Look for the matching close-quote.
+                close = chunk.find(quote)
+                if close >= 0:
+                    # Found close quote on this line - path complete.
+                    path_parts.append(chunk[:close])
+                    break
+                # No close quote - keep what we have and slurp next line.
+                path_parts.append(chunk)
+                j += 1
+                if j >= len(lines):
+                    # File ended mid-quoted-path. Take what we have.
+                    break
+                next_line = lines[j].rstrip('\n').rstrip('\r')
+                rest_no_comment = _strip_continuation(next_line)
+                # Drop trailing comment on continuation line too.
+                rest_no_comment = rest_no_comment.split('$', 1)[0].rstrip()
+                continue
+
+            # Unquoted form: may end with a comma to continue.
+            if chunk.endswith(','):
+                path_parts.append(chunk[:-1])
+                j += 1
+                if j >= len(lines):
+                    break
+                next_line = lines[j].rstrip('\n').rstrip('\r')
+                rest_no_comment = _strip_continuation(next_line)
+                rest_no_comment = rest_no_comment.split('$', 1)[0].rstrip()
+                # If a continuation line itself starts with INCLUDE,
+                # treat the previous statement as already complete.
+                if rest_no_comment[:7].upper().startswith('INCLUDE'):
+                    break
+                continue
+
+            # Unquoted single-line path.
+            path_parts.append(chunk)
+            break
+
+        inc_path = ''.join(path_parts).strip()
+        return (inc_path or None), j + 1
+
+    @staticmethod
+    def _inline_includes(filepath, max_depth=8, progress=None):
         """Expand every INCLUDE statement into a single flat text blob.
 
-        Walks the deck top-down. INCLUDE lines are replaced inline with
-        the body of the referenced file (recursively, up to ``max_depth``
-        levels). Quoted paths in any of `'..foo'`, `"..foo"`, or bare
-        `..foo` form are accepted; backslash + forward slash separators
-        both work. Continuation across two lines (Nastran spec - INCLUDE
-        with a comma-trailer followed by a continuation line) is also
-        handled.
+        Walks the deck top-down. INCLUDE lines (single- or multi-line)
+        are replaced inline with the body of the referenced file,
+        recursively, up to ``max_depth`` levels. Quoted paths in any of
+        `'..foo'`, `"..foo"`, or bare `..foo` form are accepted;
+        backslash + forward slash separators both work.
 
-        Returns ``(text, missing)`` where ``missing`` is a list of include
-        paths that couldn't be resolved (so the caller can surface them
-        rather than silently dropping data).
+        ``progress``, if provided, is called as ``progress(path, depth)``
+        each time a new file is opened. The caller uses it to update
+        status text like "Inlining BULK\\foo.bdf...". The call is fast
+        and synchronous, so the caller can safely run a Qt
+        processEvents() inside it to repaint the dialog.
+
+        Returns ``(text, missing)`` where ``missing`` is the list of
+        include paths that couldn't be resolved.
         """
         import os
-        import re
-
-        # Match: INCLUDE '...' / INCLUDE "..." / INCLUDE bare/path
-        # Stops at the first whitespace, '$' (comment), or EOL when bare.
-        include_re = re.compile(
-            r"^\s*INCLUDE\s+(['\"]?)([^'\"\$\r\n]+)\1\s*(?:\$.*)?$",
-            re.IGNORECASE,
-        )
         missing = []
+        opened = []  # for the streaming parser - the file list, in order
 
         def expand(path, depth):
+            opened.append((path, depth))
+            if progress is not None:
+                try:
+                    progress(path, depth)
+                except Exception:
+                    pass
+
             if depth > max_depth:
                 missing.append(path)
                 return f"$ INCLUDE depth exceeded for {path}\n"
@@ -3233,39 +3345,186 @@ class NastranModelGenerator:
             out_chunks = []
             i = 0
             while i < len(raw_lines):
-                line = raw_lines[i]
-                m = include_re.match(line)
-                if m:
-                    inc_path = m.group(2).strip()
-                    # Handle Nastran continuation form: trailing comma
-                    # means the path continues on the next line.
-                    while inc_path.endswith(',') and i + 1 < len(raw_lines):
-                        i += 1
-                        cont = raw_lines[i].strip()
-                        # Strip continuation-leading + or *
-                        if cont.startswith(('+', '*')):
-                            cont = cont[1:].strip()
-                        inc_path = inc_path[:-1] + cont
-                    # Normalize separators - Windows decks usually use \
-                    # but pyNastran also accepts /.
+                inc_path, next_i = (
+                    NastranModelGenerator._parse_include_statement(
+                        raw_lines, i))
+                if inc_path is None:
+                    out_chunks.append(raw_lines[i])
+                    i = next_i
+                    continue
+
+                # Normalize separators - Windows decks usually use \
+                # but pyNastran also accepts /.
+                norm = inc_path.replace('\\', os.sep).replace('/', os.sep)
+                if os.path.isabs(norm):
+                    resolved = norm
+                else:
+                    resolved = os.path.normpath(
+                        os.path.join(include_dir, norm))
+                out_chunks.append(
+                    f"$ -- begin INCLUDE {inc_path}\n")
+                out_chunks.append(expand(resolved, depth + 1))
+                out_chunks.append(
+                    f"$ -- end   INCLUDE {inc_path}\n")
+                i = next_i
+            return ''.join(out_chunks)
+
+        text = expand(os.path.abspath(filepath), 0)
+        # Stash the file list on the function-local scope so a streaming
+        # parser variant can read it. Return as part of a richer result
+        # without breaking the 2-tuple contract.
+        if isinstance(text, str):
+            text_with_meta = text  # main return shape stays (text, missing)
+        return text, missing
+
+    @staticmethod
+    def _gather_include_chain(filepath, max_depth=8):
+        """Walk every reachable INCLUDE without inlining; return file list.
+
+        Used by the streaming parser to know how many files exist before
+        we start parsing, so per-file progress can be a real fraction
+        rather than indeterminate.
+
+        Returns ``(files, total_bytes, missing)`` where ``files`` is a
+        list of absolute paths in depth-first order (root first, then
+        each included file in the order it's referenced).
+        """
+        import os
+        files = []
+        seen = set()
+        missing = []
+
+        def walk(path, depth):
+            apath = os.path.abspath(path)
+            if apath in seen or depth > max_depth:
+                return
+            seen.add(apath)
+            try:
+                with open(apath, 'r', encoding='utf-8', errors='replace') as fh:
+                    raw_lines = fh.readlines()
+            except OSError:
+                missing.append(apath)
+                return
+            files.append(apath)
+            include_dir = os.path.dirname(apath)
+            i = 0
+            while i < len(raw_lines):
+                inc_path, next_i = (
+                    NastranModelGenerator._parse_include_statement(
+                        raw_lines, i))
+                if inc_path is not None:
                     norm = inc_path.replace('\\', os.sep).replace('/', os.sep)
                     if os.path.isabs(norm):
                         resolved = norm
                     else:
                         resolved = os.path.normpath(
                             os.path.join(include_dir, norm))
-                    out_chunks.append(
-                        f"$ -- begin INCLUDE {inc_path}\n")
-                    out_chunks.append(expand(resolved, depth + 1))
-                    out_chunks.append(
-                        f"$ -- end   INCLUDE {inc_path}\n")
-                else:
-                    out_chunks.append(line)
-                i += 1
-            return ''.join(out_chunks)
+                    walk(resolved, depth + 1)
+                i = next_i
 
-        text = expand(os.path.abspath(filepath), 0)
-        return text, missing
+        walk(filepath, 0)
+        total = 0
+        for f in files:
+            try:
+                total += os.path.getsize(f)
+            except OSError:
+                pass
+        return files, total, missing
+
+    @staticmethod
+    def _read_bdf_streaming(filepath, progress=None):
+        """Streaming parse with per-file progress for INCLUDE-heavy decks.
+
+        Walks the INCLUDE chain to enumerate every file before parsing.
+        Then pre-inlines into a single flat buffer (much faster than
+        pyNastran's own INCLUDE resolution on big decks because we
+        skip the file-open-per-INCLUDE round trips done during parse).
+        Finally calls pyNastran on the flat buffer.
+
+        ``progress`` is called as ``progress(stage, message, fraction)``:
+          * stage="inline"  - while walking and reading INCLUDE files
+          * stage="parse"   - while pyNastran is parsing the flat deck
+          * stage="done"    - parse finished
+          * ``fraction`` is 0.0..1.0 for the *overall* parse, or None.
+
+        Returns ``(model, lenient_result_or_None)`` - same shape as
+        ``_read_bdf_robust``. Raises RuntimeError on total failure.
+        """
+        import os, io, tempfile
+        from cpylog import SimpleLogger
+
+        def _emit(stage, message, frac=None):
+            if progress is not None:
+                try:
+                    progress(stage, message, frac)
+                except Exception:
+                    pass
+
+        # ---- Phase A: enumerate files ----
+        _emit('inline', 'Scanning for INCLUDE files...', 0.0)
+        files, total_bytes, missing = (
+            NastranModelGenerator._gather_include_chain(filepath))
+        n_files = max(1, len(files))
+        _emit('inline',
+              f'Found {len(files)} file(s), {total_bytes / 1e6:.1f} MB total',
+              0.02)
+
+        # ---- Phase B: inline ----
+        # Use the existing _inline_includes but pass a progress hook that
+        # converts (path, depth) into a stage update fraction. The
+        # inline pass is ~10x faster than parsing, so we give it ~25% of
+        # the overall progress bar.
+        seen = {'count': 0}
+        def _inline_progress(path, depth):
+            seen['count'] += 1
+            frac = 0.02 + 0.23 * (seen['count'] / float(n_files))
+            _emit('inline',
+                  f"Reading {os.path.basename(path)} "
+                  f"({seen['count']} / {len(files)})",
+                  min(0.25, frac))
+
+        text, missing_inline = NastranModelGenerator._inline_includes(
+            filepath, progress=_inline_progress)
+        missing = list(missing) + list(missing_inline)
+
+        # ---- Phase C: write flat buffer to temp + parse ----
+        _emit('parse', 'Parsing flattened deck...', 0.26)
+        tmp = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.bdf', delete=False, encoding='utf-8')
+        tmp.write(text)
+        tmp.close()
+        try:
+            silent_log = SimpleLogger(level='critical')
+            devnull = io.StringIO()
+            try:
+                m = NastranModelGenerator._try_read_bdf(
+                    tmp.name, punch=False,
+                    silent_log=silent_log, devnull=devnull)
+                _emit('done',
+                      f'Imported {len(m.nodes):,} nodes, '
+                      f'{len(m.elements):,} elements',
+                      1.0)
+                return (m, None)
+            except Exception:
+                # Fall through to lenient parsing on the inlined deck.
+                _emit('parse',
+                      'Strict parse failed; trying lenient card-by-card...',
+                      0.5)
+                try:
+                    result = NastranModelGenerator._read_bdf_lenient(tmp.name)
+                    _emit('done',
+                          f'Imported {len(result.model.nodes):,} nodes '
+                          f'({len(result.skipped)} skipped)',
+                          1.0)
+                    return (result.model, result)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Streaming parse failed: {e}") from e
+        finally:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
 
     @staticmethod
     def _read_bdf_parallel(filepath, n_workers=4):

@@ -19,8 +19,8 @@ the sync path.
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressDialog,
-    QApplication,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QProgressBar,
+    QProgressDialog, QApplication,
 )
 
 
@@ -109,24 +109,44 @@ class _SyncImportDialog(QDialog):
     """Plain non-modal status dialog shown while we parse synchronously.
 
     Deliberately NOT a QProgressDialog with busy indicator - that
-    animation poisoned the GIL and starved the parse worker on Windows.
-    Just a label + (informational) Cancel button that dismisses the
-    dialog when clicked but does NOT actually interrupt pyNastran's
-    parser (it's a single C-extension call we can't preempt).
+    animation poisoned the GIL and starved the parse worker on Windows
+    (see v3.0.0 history). The progress bar here is DETERMINATE - a
+    static rectangle that fills as the parser walks INCLUDEs, not a
+    marching-ants spinner. That avoids the GIL-starvation issue while
+    still giving the user feedback that work is happening.
+
+    The Hide button dismisses the dialog without interrupting the
+    parse (pyNastran's bulk-data read is a single blocking call we
+    can't preempt).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Import")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(440)
         self.setModal(False)
 
         layout = QVBoxLayout(self)
         self._label = QLabel("Reading BDF...")
         layout.addWidget(self._label)
+
+        # Determinate progress bar. The streaming reader updates the
+        # value as it walks INCLUDE files; legacy callers that don't
+        # emit progress just leave it at zero.
+        self._bar = QProgressBar(self)
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(True)
+        layout.addWidget(self._bar)
+
+        self._detail = QLabel("")
+        self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(self._detail)
+
         hint = QLabel(
-            "The window may freeze briefly while pyNastran parses the deck. "
-            "This is normal."
+            "The window may freeze briefly while pyNastran parses the "
+            "bulk-data section. Multi-file decks update file-by-file."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
@@ -142,15 +162,28 @@ class _SyncImportDialog(QDialog):
     def set_message(self, text: str):
         self._label.setText(text)
 
+    def set_detail(self, text: str):
+        self._detail.setText(text)
+
+    def set_fraction(self, frac):
+        """Update the bar; ``frac`` is 0.0..1.0 or None for no change."""
+        if frac is None:
+            return
+        try:
+            v = max(0, min(100, int(float(frac) * 100)))
+            self._bar.setValue(v)
+        except (TypeError, ValueError):
+            pass
+
 
 def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
     """Run a BDF import. Despite the legacy name this is now SYNCHRONOUS.
 
-    Walks: detect_bdf_field_format -> _read_bdf_robust -> on_success.
-    Shows a small status dialog and a wait cursor; the main thread
-    blocks for the 5-10 s parse (compared to the threaded variant which
-    locked up indefinitely due to GIL contention with the progress
-    dialog's busy animator).
+    Walks: detect_bdf_field_format -> _read_bdf_robust (or streaming
+    for INCLUDE-heavy decks) -> on_success. Shows a small status dialog
+    with a determinate progress bar; the main thread blocks for the
+    parse (in the same way the v3.0.0 sync-import fix works, without
+    the spinner that starved the worker thread of CPU).
 
     Return shape kept the same `(thread, worker, dialog)` tuple so the
     callers in MainWindow don't need to be rewritten.
@@ -169,11 +202,41 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
         QApplication.processEvents()
         detected_format = detect_bdf_field_format(filepath)
 
-        dialog.set_message("Parsing BDF (this may take a moment)...")
-        QApplication.processEvents()
-
+        # If the deck has INCLUDE statements, take the streaming path.
+        # That path enumerates files first so the progress bar can be
+        # determinate (file N / M), pre-inlines into a flat buffer, and
+        # then parses once with no per-include round trips inside
+        # pyNastran's reader.
+        has_includes = NastranModelGenerator._file_has_includes(filepath)
         generator = NastranModelGenerator()
-        model, lenient_result = NastranModelGenerator._read_bdf_robust(filepath)
+
+        if has_includes:
+            dialog.set_message("Multi-file deck detected. Inlining INCLUDEs...")
+            QApplication.processEvents()
+
+            def _progress(stage, message, frac):
+                if stage == 'inline':
+                    dialog.set_message("Reading multi-file deck...")
+                elif stage == 'parse':
+                    dialog.set_message(
+                        "Parsing flattened deck (pyNastran)...")
+                else:
+                    dialog.set_message(message)
+                dialog.set_detail(message)
+                dialog.set_fraction(frac)
+                QApplication.processEvents()
+
+            model, lenient_result = (
+                NastranModelGenerator._read_bdf_streaming(
+                    filepath, progress=_progress))
+        else:
+            dialog.set_message("Parsing BDF (this may take a moment)...")
+            dialog.set_fraction(0.1)
+            QApplication.processEvents()
+            model, lenient_result = (
+                NastranModelGenerator._read_bdf_robust(filepath))
+            dialog.set_fraction(1.0)
+
         generator.model = model
     except Exception as exc:
         QApplication.restoreOverrideCursor()

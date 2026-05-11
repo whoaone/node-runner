@@ -1,4 +1,4 @@
-# Node Runner v3.0.1
+# Node Runner v3.0.2
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,23 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.0.2
+
+Follow-up to v3.0.1 focused on big multi-INCLUDE decks where the user has no idea whether the import is making progress or hung.
+
+### Streaming parser with per-file progress
+- New `_read_bdf_streaming` walks the INCLUDE chain first to enumerate every reachable file, then inlines them one at a time, then hands the flat buffer to pyNastran. The import dialog now shows a determinate progress bar (0..100%) that advances file-by-file during the inline pass.
+- Per-file status: "Reading BULK\\foo.bdf (3 of 12)". The previous import dialog showed only "Parsing BDF..." with no indication of progress on multi-file decks; that flag has been replaced with concrete file-counter text plus a percentage bar.
+- The progress bar is deliberately determinate (a static rectangle that fills), not the marching-ants spinner that caused the GIL-starvation bug in v3.0.0. The window may still freeze briefly during pyNastran's parse phase, but you can see how far the inline pass got before that.
+
+### Hardened multi-line INCLUDE statement parsing
+- The `_inline_includes` parser was rewritten to handle all three Nastran continuation forms: single-line, unclosed-quote (most common multi-line form), and continuation lines with leading `+` or `*` Nastran markers.
+- Previously a 2-line INCLUDE with the close quote on the second line was silently rejected and that file's cards were dropped.
+- New `_gather_include_chain` walks every reachable INCLUDE without inlining, so the streaming parser can enumerate files (and total bytes) up front without paying to read them twice.
+
+### Tests
+- Seven new pytest cases in `TestMultiLineInclude` and `TestStreamingParser` cover indented continuation, unclosed-quote continuation, `+` continuation markers, end-to-end streaming, progress-callback emission, and the include-chain enumerator.
 
 ## Changelog for v3.0.1
 
