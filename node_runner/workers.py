@@ -211,18 +211,28 @@ def run_bdf_import_threaded(parent, filepath, on_success, on_failure):
         generator = NastranModelGenerator()
 
         if has_includes:
-            dialog.set_message("Multi-file deck detected. Inlining INCLUDEs...")
+            dialog.set_message(
+                "Stage 1/4: Scanning INCLUDE chain (counting files + sizes)...")
             QApplication.processEvents()
 
             def _progress(stage, message, frac):
-                if stage == 'inline':
-                    dialog.set_message("Reading multi-file deck...")
-                elif stage == 'parse':
-                    dialog.set_message(
-                        "Parsing flattened deck (pyNastran)...")
+                # Show the rich message verbatim - the model layer's
+                # stage labels and per-stage details are designed to
+                # be read by the end user. We used to overwrite this
+                # with a generic 'Parsing flattened deck...' which
+                # hid all the useful per-file/per-card detail.
+                short_msg = message
+                # If the message is too long for the main label, put
+                # the first sentence in the title and the rest in the
+                # detail line. Otherwise keep both in sync.
+                if '. ' in message and len(message) > 80:
+                    head, _, tail = message.partition('. ')
+                    short_msg = head + '.'
+                    detail_msg = tail.strip() or message
                 else:
-                    dialog.set_message(message)
-                dialog.set_detail(message)
+                    detail_msg = message
+                dialog.set_message(short_msg)
+                dialog.set_detail(detail_msg)
                 dialog.set_fraction(frac)
                 QApplication.processEvents()
 

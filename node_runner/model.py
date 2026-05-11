@@ -3592,6 +3592,10 @@ class NastranModelGenerator:
             except Exception:
                 pass
 
+        # Track the first failure reason per source-file so we have
+        # something concrete to tell the user when chunks fall back to
+        # lenient. {source_file: "human-readable reason"}
+        first_failure_per_file = {}
         old_stdout = sys.stdout
         for k, (cs, ce) in enumerate(chunk_bounds):
             chunk_lines = bulk_lines[cs:ce]
@@ -3617,8 +3621,20 @@ class NastranModelGenerator:
                                 validate=False)
                     sys.stdout = old_stdout
                     _merge(master, cb)
-                except Exception:
+                except Exception as exc:
                     sys.stdout = old_stdout
+                    # Capture the first failure per source file - this
+                    # is the most useful diagnostic ("file X contains
+                    # something pyNastran can't parse strictly:
+                    # <reason>"). The reason becomes a SkippedCard-like
+                    # entry at the end so the user can see it.
+                    src_key = chunk_src or '<top-level>'
+                    if src_key not in first_failure_per_file:
+                        raw = str(exc).split('\n')[0].strip()
+                        if len(raw) > 200:
+                            raw = raw[:197] + '...'
+                        first_failure_per_file[src_key] = (
+                            raw or type(exc).__name__)
                     # Chunk failed strict - fall back to lenient on just
                     # this chunk's lines. Pass progress through so the
                     # bar moves within the chunk (otherwise the dialog
@@ -3663,6 +3679,22 @@ class NastranModelGenerator:
 
             cards_done += chunk_card_n
             _emit(cards_done, chunk_src)
+
+        # Inject one synthetic SkippedCard per source file that had a
+        # chunk fail strict, with the actual exception reason. The
+        # MainWindow LenientImportReportDialog already knows how to
+        # display SkippedCard entries, so the user sees something like:
+        #
+        #   line 0  CHUNK-IN-Wing_SE_Complete.pch  ...real reason...
+        #
+        # in the post-import skipped-cards report.
+        for src_key, reason in first_failure_per_file.items():
+            all_skipped.insert(0, SkippedCard(
+                line=0,
+                card=f"CHUNK-IN-{src_key}",
+                raw=f"(first strict-parse failure in {src_key})",
+                error=reason,
+            ))
 
         return master, any_lenient, all_skipped
 
@@ -3709,170 +3741,244 @@ class NastranModelGenerator:
         # converts (path, depth) into a stage update fraction. The
         # inline pass is ~10x faster than parsing, so we give it ~25% of
         # the overall progress bar.
-        seen = {'count': 0, 'bytes': 0}
+        # Track the most recent file we successfully finished reading
+        # so we can name it in the next-stage status text.
+        inline_state = {
+            'count': 0,
+            'bytes': 0,
+            'last_file': '',
+        }
         def _inline_progress(path, depth):
-            seen['count'] += 1
+            inline_state['count'] += 1
+            inline_state['last_file'] = os.path.basename(path)
             try:
-                seen['bytes'] += os.path.getsize(path)
+                inline_state['bytes'] += os.path.getsize(path)
             except OSError:
                 pass
-            frac = 0.02 + 0.23 * (seen['count'] / float(n_files))
-            mb_so_far = seen['bytes'] / 1e6
+            frac = 0.02 + 0.23 * (inline_state['count'] / float(n_files))
+            mb_so_far = inline_state['bytes'] / 1e6
             mb_total = total_bytes / 1e6 if total_bytes else mb_so_far
             indent = '  ' * min(depth, 4)
             _emit('inline',
-                  f"Reading {indent}{os.path.basename(path)} "
-                  f"({seen['count']} / {len(files)} files, "
+                  f"Stage 2/4: Reading include files - "
+                  f"{indent}{os.path.basename(path)} "
+                  f"({inline_state['count']} / {len(files)} files, "
                   f"{mb_so_far:.1f} / {mb_total:.1f} MB)",
                   min(0.25, frac))
 
+        _emit('inline',
+              f"Stage 2/4: Reading {len(files)} include files "
+              f"({total_bytes / 1e6:.1f} MB total) into a single buffer...",
+              0.02)
         text, missing_inline = NastranModelGenerator._inline_includes(
             filepath, progress=_inline_progress)
         missing = list(missing) + list(missing_inline)
 
-        # ---- Phase C: write flat buffer to temp + parse ----
-        _emit('parse', 'Parsing flattened deck...', 0.26)
+        # ---- Phase C: parse the flat buffer ----
+        # Count card-starts up front so we can:
+        #   (a) decide whether to attempt whole-deck strict at all, and
+        #   (b) tell the user what we're about to do in concrete terms.
+        # On big multi-INCLUDE decks (typically >100k cards), whole-deck
+        # strict is almost guaranteed to fail because real industrial
+        # decks have at least one card pyNastran rejects. Worse, the
+        # strict call is a single blocking pyNastran call we can't
+        # progress-update, so the UI freezes for minutes only to fail
+        # at the end. v3.1.3 skips it for big decks and goes straight
+        # to chunked-strict, which has per-chunk progress.
+
+        def _count_card_starts_in_text(t):
+            n = 0
+            in_bulk = False
+            for ln in t.splitlines():
+                stripped = ln.strip()
+                if not stripped or stripped.startswith('$'):
+                    continue
+                upper = stripped.upper()
+                if not in_bulk:
+                    if upper.startswith('BEGIN BULK'):
+                        in_bulk = True
+                    continue
+                if upper.startswith('ENDDATA'):
+                    break
+                # Continuation line?
+                if ln[:1] in ('+', '*'):
+                    continue
+                if ln[:1] == ' ' and stripped and stripped[0].isdigit():
+                    continue
+                n += 1
+            return n
+
+        approx_card_count = _count_card_starts_in_text(text)
+        flat_mb = len(text) / 1e6
+        SKIP_STRICT_THRESHOLD = 100_000  # cards
+        skip_whole_strict = (
+            approx_card_count >= SKIP_STRICT_THRESHOLD
+            or flat_mb >= 50.0
+        )
+
+        last_file_msg = (
+            f" Last file read: {inline_state['last_file']}."
+            if inline_state['last_file'] else ""
+        )
+
+        if skip_whole_strict:
+            _emit('parse',
+                  f"Stage 3/4: Big deck detected "
+                  f"({approx_card_count:,} cards, {flat_mb:.1f} MB). "
+                  f"Skipping whole-deck strict parse (it would freeze the "
+                  f"window for minutes and usually fails on big decks); "
+                  f"going straight to chunked-strict.{last_file_msg}",
+                  0.26)
+        else:
+            _emit('parse',
+                  f"Stage 3/4: Parsing flat deck strictly "
+                  f"({approx_card_count:,} cards, {flat_mb:.1f} MB). "
+                  f"Window will appear frozen for this step.{last_file_msg}",
+                  0.26)
+
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.bdf', delete=False, encoding='utf-8')
         tmp.write(text)
         tmp.close()
+
         try:
             silent_log = SimpleLogger(level='critical')
             devnull = io.StringIO()
-            try:
-                m = NastranModelGenerator._try_read_bdf(
-                    tmp.name, punch=False,
-                    silent_log=silent_log, devnull=devnull)
-                _emit('done',
-                      f'Imported {len(m.nodes):,} nodes, '
-                      f'{len(m.elements):,} elements',
-                      1.0)
-                return (m, None)
-            except Exception:
-                # Strict parse on the whole deck failed. Try the chunked
-                # path next: split bulk-data into ~8k-card chunks and
-                # parse each chunk with pyNastran's punch reader
-                # (validate=False). Bad chunks fall back to lenient on
-                # just their lines, with progress emitted card-by-card
-                # so the bar advances within slow chunks instead of
-                # appearing to freeze.
+            strict_fail_reason = None
+
+            # ---- Attempt whole-deck strict (only on smallish decks) ----
+            if not skip_whole_strict:
+                try:
+                    m = NastranModelGenerator._try_read_bdf(
+                        tmp.name, punch=False,
+                        silent_log=silent_log, devnull=devnull)
+                    _emit('done',
+                          f'Imported {len(m.nodes):,} nodes, '
+                          f'{len(m.elements):,} elements',
+                          1.0)
+                    return (m, None)
+                except Exception as exc:
+                    raw = str(exc).split('\n')[0].strip()
+                    if len(raw) > 150:
+                        raw = raw[:147] + '...'
+                    strict_fail_reason = raw or type(exc).__name__
+
+            # ---- Chunked-strict (always reached for big decks) ----
+            if strict_fail_reason:
                 _emit('parse',
-                      'Strict parse failed; switching to chunked-strict '
-                      '(pyNastran punch chunks)...',
+                      f"Stage 4/4: Whole-deck strict failed "
+                      f"({strict_fail_reason}). Switching to chunked-strict "
+                      f"({approx_card_count:,} cards, ~8k cards per chunk).",
+                      0.26)
+            else:
+                _emit('parse',
+                      f"Stage 4/4: Running chunked-strict parse "
+                      f"({approx_card_count:,} cards, ~8k cards per chunk). "
+                      f"Bad chunks fall back to lenient automatically.",
                       0.26)
 
-                # Rate-limit progress messages by time to avoid Qt repaint
-                # storm on million-card decks.
-                import time as _time
-                rate_state = {
-                    't0': _time.time(),
-                    'last_emit': 0.0,
-                    'last_done': 0,
-                    'rate': 0.0,
-                }
+            # Rate-limited, novice-friendly progress callback.
+            import time as _time
+            rate_state = {
+                't0': _time.time(),
+                'last_emit': 0.0,
+                'last_done': 0,
+                'rate': 0.0,
+            }
 
-                def _chunked_progress(done, total, src=''):
+            def _chunked_progress(done, total, src=''):
+                if total <= 0:
+                    return
+                now = _time.time()
+                dt = now - rate_state['last_emit']
+                if dt < 0.25 and done < total:
+                    return  # at most ~4 updates/sec
+                if rate_state['last_emit'] > 0 and dt > 0:
+                    inst = (done - rate_state['last_done']) / dt
+                    rate_state['rate'] = (
+                        0.7 * rate_state['rate'] + 0.3 * inst)
+                rate_state['last_emit'] = now
+                rate_state['last_done'] = done
+
+                base = 0.26
+                span = 0.72
+                frac = base + span * (done / float(total))
+
+                rate = rate_state['rate']
+                if rate > 0:
+                    remaining = (total - done) / rate
+                    if remaining > 90:
+                        eta = f"{remaining / 60:.1f} min"
+                    else:
+                        eta = f"{int(remaining)} s"
+                else:
+                    eta = "calculating..."
+
+                msg_parts = [f"Card {done:,} / {total:,}"]
+                if src:
+                    msg_parts.append(f"from {src}")
+                if rate > 0:
+                    msg_parts.append(f"{int(rate):,} cards/s")
+                msg_parts.append(f"ETA {eta}")
+                _emit('parse',
+                      "Parsing bulk data - " + " | ".join(msg_parts),
+                      min(0.98, frac))
+
+            try:
+                (chunked_model, used_lenient, skipped) = (
+                    NastranModelGenerator._read_bdf_chunked(
+                        tmp.name, progress=_chunked_progress))
+                n_nodes = len(chunked_model.nodes)
+                n_elements = len(chunked_model.elements)
+                if n_nodes == 0 and n_elements == 0:
+                    raise RuntimeError("Chunked parse imported zero cards")
+                _emit('done',
+                      f'Imported {n_nodes:,} nodes, '
+                      f'{n_elements:,} elements'
+                      + (f' ({len(skipped)} skipped)' if skipped else ''),
+                      1.0)
+                if used_lenient:
+                    counts = {}
+                    for fname in ('nodes', 'elements', 'properties',
+                                  'materials'):
+                        d = getattr(chunked_model, fname, None)
+                        if isinstance(d, dict) and d:
+                            counts[fname.upper()] = len(d)
+                    lenient_res = LenientResult(
+                        model=chunked_model,
+                        skipped=skipped,
+                        counts=counts)
+                    return (chunked_model, lenient_res)
+                return (chunked_model, None)
+            except Exception:
+                # Last-resort whole-deck lenient.
+                _emit('parse',
+                      'Chunked parse failed; running whole-deck '
+                      'lenient (slow, but the most forgiving path)...',
+                      0.26)
+
+                def _lenient_progress(idx, total):
                     if total <= 0:
                         return
-                    now = _time.time()
-                    dt = now - rate_state['last_emit']
-                    if dt < 0.25 and done < total:
-                        return  # at most ~4 updates/sec
-                    # Update rate (cards / sec) using a simple
-                    # exponential moving average.
-                    if rate_state['last_emit'] > 0 and dt > 0:
-                        inst = (done - rate_state['last_done']) / dt
-                        rate_state['rate'] = (
-                            0.7 * rate_state['rate'] + 0.3 * inst)
-                    rate_state['last_emit'] = now
-                    rate_state['last_done'] = done
-
                     base = 0.26
                     span = 0.72
-                    frac = base + span * (done / float(total))
-
-                    # Format an ETA from the running rate.
-                    rate = rate_state['rate']
-                    if rate > 0:
-                        remaining = (total - done) / rate
-                        if remaining > 90:
-                            eta = f"{remaining / 60:.1f} min"
-                        else:
-                            eta = f"{int(remaining)} s"
-                    else:
-                        eta = "calculating..."
-
-                    msg_parts = [f"{done:,} / {total:,} cards"]
-                    if src:
-                        msg_parts.append(f"file: {src}")
-                    if rate > 0:
-                        msg_parts.append(f"{int(rate):,} cards/s")
-                    msg_parts.append(f"ETA {eta}")
+                    frac = base + span * (idx / float(total))
                     _emit('parse',
-                          "Parsing - " + " | ".join(msg_parts),
+                          f"Lenient parsing card {idx:,} of {total:,}...",
                           min(0.98, frac))
 
                 try:
-                    (chunked_model, used_lenient, skipped) = (
-                        NastranModelGenerator._read_bdf_chunked(
-                            tmp.name, progress=_chunked_progress))
-                    n_nodes = len(chunked_model.nodes)
-                    n_elements = len(chunked_model.elements)
-                    if n_nodes == 0 and n_elements == 0:
-                        # Chunked got nothing useful - fall through to
-                        # whole-deck lenient as a last resort.
-                        raise RuntimeError("Chunked parse imported zero cards")
+                    result = NastranModelGenerator._read_bdf_lenient(
+                        tmp.name, progress=_lenient_progress)
                     _emit('done',
-                          f'Imported {n_nodes:,} nodes, '
-                          f'{n_elements:,} elements'
-                          + (f' ({len(skipped)} skipped)' if skipped else ''),
+                          f'Imported {len(result.model.nodes):,} nodes '
+                          f'({len(result.skipped)} skipped)',
                           1.0)
-                    if used_lenient:
-                        # Build a LenientResult so callers can show the
-                        # report dialog if there were any skipped cards.
-                        counts = {}
-                        for fname in ('nodes', 'elements', 'properties',
-                                      'materials'):
-                            d = getattr(chunked_model, fname, None)
-                            if isinstance(d, dict) and d:
-                                counts[fname.upper()] = len(d)
-                        lenient_res = LenientResult(
-                            model=chunked_model,
-                            skipped=skipped,
-                            counts=counts)
-                        return (chunked_model, lenient_res)
-                    return (chunked_model, None)
-                except Exception:
-                    # Last-resort whole-deck lenient.
-                    _emit('parse',
-                          'Chunked parse failed; running whole-deck '
-                          'lenient (slow, but the most forgiving path)...',
-                          0.26)
-
-                    def _lenient_progress(idx, total):
-                        if total <= 0:
-                            return
-                        base = 0.26
-                        span = 0.72
-                        frac = base + span * (idx / float(total))
-                        _emit('parse',
-                              f"Lenient parsing card {idx:,} of {total:,}...",
-                              min(0.98, frac))
-
-                    try:
-                        result = NastranModelGenerator._read_bdf_lenient(
-                            tmp.name, progress=_lenient_progress)
-                        _emit('done',
-                              f'Imported {len(result.model.nodes):,} nodes '
-                              f'({len(result.skipped)} skipped)',
-                              1.0)
-                        return (result.model, result)
-                    except Exception as e:
-                        # Even whole-deck lenient bombed; surface a
-                        # message that tells the user where to look.
-                        raise RuntimeError(
-                            f"Streaming parse failed at lenient stage: {e}"
-                        ) from e
+                    return (result.model, result)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Streaming parse failed at lenient stage: {e}"
+                    ) from e
         finally:
             try:
                 os.remove(tmp.name)

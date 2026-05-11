@@ -1,4 +1,4 @@
-# Node Runner v3.1.2
+# Node Runner v3.1.3
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,30 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.1.3
+
+Patch release that fixes the v3.1.2 "stuck at 26% (Not Responding) with no real status" symptom on big multi-INCLUDE decks.
+
+### Root cause
+At 26%, the importer was attempting a whole-deck strict parse (one blocking `pyNastran.read_bdf()` call on the entire flattened buffer). On a 100k+ card deck this can take many minutes, the call holds the GIL the whole time so Qt can't repaint, the dialog title goes to "(Not Responding)", and our status text is stuck on whatever it said last. Worst of all, whole-deck strict almost always fails on real industrial aerospace decks (one bad card type kills the whole call), so we paid the freeze cost only to fall through to chunked-strict anyway.
+
+### Skip the freeze entirely on big decks
+- After the inline phase, we count card-starts in the flattened buffer. If the deck has >= 100k cards or >= 50 MB of flat text, we **skip whole-deck strict entirely** and go straight to chunked-strict. The 26% freeze disappears.
+- Smaller decks still try whole-deck strict (it's the fastest happy path) and now show a clear pre-warning: "Stage 3/4: Parsing flat deck strictly (12,000 cards, 4.2 MB). Window will appear frozen for this step. Last file read: foo.bdf."
+
+### When strict fails, show WHY
+- We now capture pyNastran's actual exception message ("eid=12345 must be positive; elem=...") and put it in the status text: "Stage 4/4: Whole-deck strict failed (eid=12345 must be positive). Switching to chunked-strict...".
+- Per-chunk failures inside chunked-strict are also captured. The first failure per source file becomes a `SkippedCard` entry visible in the post-import report, so you know which file (e.g. `Wing_SE_Complete.pch`) contains the problematic card and what pyNastran said about it.
+
+### Stage labels + novice-friendly status
+- All status messages now lead with a stage label:
+  - Stage 1/4: Detecting field format
+  - Stage 2/4: Reading N include files (M MB total)
+  - Stage 3/4: Parsing flat deck strictly OR Stage 3/4: Big deck detected, skipping whole-deck strict
+  - Stage 4/4: Chunked-strict parse (N cards in ~8k-card chunks)
+- The chunked phase shows: "Parsing bulk data - Card 6,360,000 / 6,375,641 | from Wing_SE_Complete.pch | 22,500 cards/s | ETA 0.6 s".
+- Whatever the model layer emits is now passed through to the dialog verbatim. v3.1.2 was overwriting the rich message with a generic "Parsing flattened deck (pyNastran)..." string in `workers.py`; that hardcoded override is gone.
 
 ## Changelog for v3.1.2
 
