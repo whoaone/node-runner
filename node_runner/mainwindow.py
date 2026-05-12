@@ -223,7 +223,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.4.1"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.4.2"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -252,6 +252,17 @@ class MainWindow(QMainWindow):
         # the scene-build pass so _populate_tree doesn't re-iterate all
         # elements to compute By-Type/By-Shape Counters.
         self._cached_element_group_counts = {'by_type': {}, 'by_shape': {}}
+
+        # v3.4.2: lazy load-actor caches. _create_all_load_actors does
+        # scaling + arrays only; per-SID actors are built on demand by
+        # _ensure_load_actor_for_sid when the visibility update path
+        # actually needs them. Caps import time on decks with hundreds
+        # or thousands of load SIDs (FUSE-XWFF_04A_DUL_FUL-Entry.dat
+        # has 1,962 SIDs).
+        self._lazy_load_centers = None
+        self._lazy_load_normals = None
+        self._lazy_load_eid_to_idx = None
+        self._lazy_load_built_sids: set = set()
 
         # --- Measurement tools state ---
         self._measurement_picks = []
@@ -9340,14 +9351,18 @@ class MainWindow(QMainWindow):
         return centers, normals
 
     def _create_all_load_actors(self):
-        """Creates load actors per SID (FORCE / MOMENT / PLOAD4).
+        """v3.4.2: scaling-info pass + cache prep ONLY. Per-SID actors
+        are built on demand by ``_ensure_load_actor_for_sid`` when the
+        visibility-update path actually needs them.
 
-        v3.4.1 rewrite: fully vectorized. Per-load Python work is now
-        only ~3 dict lookups; the heavy lifting (cell-center, normal)
-        is precomputed in ``_compute_grid_centers_and_normals`` once
-        per grid. On a deck with 600k+ PLOAD4 references this drops
-        the load-actor build from minutes to under a second.
+        On `FUSE-XWFF_04A_DUL_FUL-Entry.dat` (1,962 SIDs) the prior
+        per-SID `add_mesh` loop hit Qt/VTK at ~50ms each = ~100 s of
+        scene build, even though every actor was created with
+        opacity=0 (invisible until a checkbox toggled it). Now we
+        delay actor creation until the user actually shows a SID,
+        which in practice is 1-5 SIDs at a time.
         """
+        # Clear any previously-built actors AND invalidate our caches.
         actor_names_to_remove = [
             name for name in self.plotter.actors
             if name.startswith(('force_actors_', 'moment_actors_',
@@ -9355,6 +9370,10 @@ class MainWindow(QMainWindow):
         ]
         self.plotter.remove_actor(actor_names_to_remove, render=False)
         self.load_scaling_info.clear()
+        self._lazy_load_centers = None
+        self._lazy_load_normals = None
+        self._lazy_load_eid_to_idx = None
+        self._lazy_load_built_sids = set()
 
         if not self.current_generator or not self.current_grid:
             return
@@ -9362,7 +9381,7 @@ class MainWindow(QMainWindow):
         if not model.loads:
             return
 
-        # ---- Scaling pass (cheap; pre-numpy). ----
+        # ---- Scaling pass (cheap; bounded by total load cards). ----
         all_force_mags, all_moment_mags, all_pressure_mags = [], [], []
         for load_list in model.loads.values():
             for load in load_list:
@@ -9381,98 +9400,108 @@ class MainWindow(QMainWindow):
             float(np.max(all_moment_mags)) if all_moment_mags else 0.0)
         self.load_scaling_info['pressure_max_mag'] = (
             float(np.max(all_pressure_mags)) if all_pressure_mags else 0.0)
+        # Deliberately NO per-SID actor creation here. The visibility
+        # update path calls _ensure_load_actor_for_sid(sid) for any
+        # SID whose checkbox is checked.
 
-        # ---- v3.4.1: precompute the per-cell arrays ONCE. ----
+    def _ensure_load_actor_for_sid(self, sid):
+        """v3.4.2: lazily build the FORCE / MOMENT / PRESSURE actors
+        for ONE load SID. Idempotent - returns immediately if any
+        actor for this SID is already in the plotter.
+
+        Centers/normals/eid-lookup caches are populated on first call
+        and reused for subsequent SIDs in the same grid lifetime.
+        """
+        if sid in self._lazy_load_built_sids:
+            return
+        if not self.current_generator or not self.current_grid:
+            return
         grid = self.current_grid
         if 'EID' not in grid.cell_data:
             return
-        eid_array = np.asarray(grid.cell_data['EID'])
-        # EID -> cell index lookup. dict for O(1) per load access.
-        eid_to_idx = {int(e): int(i) for i, e in enumerate(eid_array)}
-        cell_centers, cell_normals = self._compute_grid_centers_and_normals(grid)
+        model = self.current_generator.model
+        load_list = (model.loads or {}).get(sid)
+        if not load_list:
+            self._lazy_load_built_sids.add(sid)
+            return
 
-        # Node-position cache (cheap; the user's biggest decks have
-        # < 1M nodes, lookup is fast).
-        node_positions = {}
+        # First-call cache: compute centers + normals + EID lookup once.
+        if self._lazy_load_centers is None:
+            (self._lazy_load_centers,
+             self._lazy_load_normals) = self._compute_grid_centers_and_normals(grid)
+        if self._lazy_load_eid_to_idx is None:
+            self._lazy_load_eid_to_idx = {
+                int(e): int(i)
+                for i, e in enumerate(np.asarray(grid.cell_data['EID']))
+            }
+        cell_centers = self._lazy_load_centers
+        cell_normals = self._lazy_load_normals
+        eid_to_idx = self._lazy_load_eid_to_idx
 
-        n_sids = len(model.loads)
-        sid_count = 0
-        for sid, load_list in model.loads.items():
-            sid_count += 1
-            if n_sids > 5 and sid_count % 5 == 0:
-                # Lightweight progress signal so the dialog doesn't
-                # freeze on monster decks during build.
-                self._emit_render_progress(
-                    f"Building load actors ({sid_count}/{n_sids} SIDs)...")
-            f_pts, f_vecs = [], []
-            m_pts, m_vecs = [], []
-            p_pts, p_vecs = [], []
+        f_pts, f_vecs = [], []
+        m_pts, m_vecs = [], []
+        p_pts, p_vecs = [], []
+        nodes = model.nodes
 
-            for load in load_list:
-                t = load.type
-                if t == 'FORCE':
-                    nid = load.node
-                    if nid in model.nodes:
-                        pos = node_positions.get(nid)
-                        if pos is None:
-                            pos = model.nodes[nid].get_position()
-                            node_positions[nid] = pos
-                        f_pts.append(pos)
-                        f_vecs.append(np.asarray(load.xyz) * load.mag)
-                elif t == 'MOMENT':
-                    nid = load.node
-                    if nid in model.nodes:
-                        pos = node_positions.get(nid)
-                        if pos is None:
-                            pos = model.nodes[nid].get_position()
-                            node_positions[nid] = pos
-                        m_pts.append(pos)
-                        m_vecs.append(np.asarray(load.xyz) * load.mag)
-                elif t == 'PLOAD4':
-                    # v3.4.1 fast path: batch-resolve eids -> cell idx,
-                    # then bulk-index the precomputed centers/normals.
-                    eids = load.eids
-                    if not eids:
-                        continue
-                    idxs = [eid_to_idx.get(int(e)) for e in eids]
-                    idxs = [i for i in idxs if i is not None]
-                    if not idxs:
-                        continue
-                    idx_arr = np.asarray(idxs, dtype=np.int64)
-                    p_pts.append(cell_centers[idx_arr])
-                    p_vecs.append(cell_normals[idx_arr]
-                                  * float(load.pressures[0]))
+        for load in load_list:
+            t = load.type
+            if t == 'FORCE':
+                nid = load.node
+                if nid in nodes:
+                    f_pts.append(nodes[nid].get_position())
+                    f_vecs.append(np.asarray(load.xyz) * load.mag)
+            elif t == 'MOMENT':
+                nid = load.node
+                if nid in nodes:
+                    m_pts.append(nodes[nid].get_position())
+                    m_vecs.append(np.asarray(load.xyz) * load.mag)
+            elif t == 'PLOAD4':
+                eids = load.eids
+                if not eids:
+                    continue
+                idxs = [eid_to_idx.get(int(e)) for e in eids]
+                idxs = [i for i in idxs if i is not None]
+                if not idxs:
+                    continue
+                idx_arr = np.asarray(idxs, dtype=np.int64)
+                p_pts.append(cell_centers[idx_arr])
+                p_vecs.append(cell_normals[idx_arr]
+                              * float(load.pressures[0]))
 
-            if f_pts:
-                actor = pv.PolyData(np.asarray(f_pts))
-                actor['vectors'] = np.asarray(f_vecs)
-                actor.set_active_vectors('vectors')
-                self.plotter.add_mesh(actor, name=f"force_actors_{sid}",
-                                      style='wireframe',
-                                      render_lines_as_tubes=False,
-                                      show_edges=False, pickable=False,
-                                      color='red', opacity=0)
-            if m_pts:
-                actor = pv.PolyData(np.asarray(m_pts))
-                actor['vectors'] = np.asarray(m_vecs)
-                actor.set_active_vectors('vectors')
-                self.plotter.add_mesh(actor, name=f"moment_actors_{sid}",
-                                      style='wireframe',
-                                      render_lines_as_tubes=False,
-                                      show_edges=False, pickable=False,
-                                      color='cyan', opacity=0)
-            if p_pts:
-                # Each PLOAD4 contributed a (k, 3) chunk; concat.
-                pts_arr = np.concatenate(p_pts, axis=0)
-                vecs_arr = np.concatenate(p_vecs, axis=0)
-                actor = pv.PolyData(pts_arr)
-                actor['vectors'] = vecs_arr
-                actor.set_active_vectors('vectors')
-                self.plotter.add_mesh(actor, name=f"pressure_actors_{sid}",
-                                      style='wireframe',
-                                      render_lines_as_tubes=False,
-                                      show_edges=False, pickable=False,
-                                      color='yellow', opacity=0)
+        if f_pts:
+            actor = pv.PolyData(np.asarray(f_pts))
+            actor['vectors'] = np.asarray(f_vecs)
+            actor.set_active_vectors('vectors')
+            self.plotter.add_mesh(actor, name=f"force_actors_{sid}",
+                                  style='wireframe',
+                                  render_lines_as_tubes=False,
+                                  show_edges=False, pickable=False,
+                                  color='red', opacity=0,
+                                  reset_camera=False)
+        if m_pts:
+            actor = pv.PolyData(np.asarray(m_pts))
+            actor['vectors'] = np.asarray(m_vecs)
+            actor.set_active_vectors('vectors')
+            self.plotter.add_mesh(actor, name=f"moment_actors_{sid}",
+                                  style='wireframe',
+                                  render_lines_as_tubes=False,
+                                  show_edges=False, pickable=False,
+                                  color='cyan', opacity=0,
+                                  reset_camera=False)
+        if p_pts:
+            pts_arr = np.concatenate(p_pts, axis=0)
+            vecs_arr = np.concatenate(p_vecs, axis=0)
+            actor = pv.PolyData(pts_arr)
+            actor['vectors'] = vecs_arr
+            actor.set_active_vectors('vectors')
+            self.plotter.add_mesh(actor, name=f"pressure_actors_{sid}",
+                                  style='wireframe',
+                                  render_lines_as_tubes=False,
+                                  show_edges=False, pickable=False,
+                                  color='yellow', opacity=0,
+                                  reset_camera=False)
+
+        self._lazy_load_built_sids.add(sid)
     
     
     def _create_all_constraint_actors(self):
@@ -10261,7 +10290,16 @@ class MainWindow(QMainWindow):
             is_visible = False
             if (sid_item_list := self._find_tree_items(('load_set', sid))) and sid_item_list[0].checkState(0) == QtCore.Qt.Checked:
                 is_visible = True
-            
+
+            # v3.4.2: lazily build per-SID actors the first time the
+            # user shows this SID. Decks with thousands of SIDs (e.g.
+            # FUSE-XWFF_04A_DUL_FUL-Entry.dat has 1962) used to spend
+            # ~50ms per SID at import time creating opacity=0 actors;
+            # deferring it caps import time and adds only the cost
+            # of the few SIDs the user actually shows.
+            if is_visible:
+                self._ensure_load_actor_for_sid(sid)
+
             for type, max_mag in [('force', max_force_mag), ('moment', max_moment_mag), ('pressure', max_pressure_mag)]:
                 actor_name = f"{type}_actors_{sid}"; glyph_name = f"{type}_glyphs_{sid}"
                 self.plotter.remove_actor(glyph_name, render=False)

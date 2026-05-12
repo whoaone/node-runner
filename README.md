@@ -1,4 +1,4 @@
-# Node Runner v3.4.1
+# Node Runner v3.4.2
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,31 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.4.2
+
+Hotfix for an import hang on decks with thousands of load SIDs (e.g. `FUSE-XWFF_04A_DUL_FUL-Entry.dat` has 1,962 SIDs).
+
+### Symptom
+Even after v3.4.1's PLOAD4 fix, import would still creep through "Stage 6/6: Building 3D scene -> Building load actors (840/1962 SIDs)..." over minutes.
+
+### Root cause
+`_create_all_load_actors` created three `add_mesh(..., opacity=0)` actors per SID up-front. On 1,962 SIDs that's ~5,886 Qt/VTK actor allocations even though almost all of them were invisible (every SID's checkbox is off by default).
+
+### Fix
+v3.4.2 splits the function:
+- **`_create_all_load_actors`** now only does the scaling pass (FORCE/MOMENT/PLOAD4 max magnitudes for arrow scaling) and clears caches. Zero per-SID actor work.
+- **`_ensure_load_actor_for_sid(sid)`** (new) builds the three actors for ONE SID. Idempotent. Centers/normals/EID-lookup are cached on first call and reused.
+- **`_update_plot_visibility`** calls `_ensure_load_actor_for_sid(sid)` lazily when the user actually toggles a SID checkbox on.
+
+Net effect on the user's deck:
+- Import time: cut from minutes-hung to seconds.
+- First SID shown: small build cost (~50ms for typical SID).
+- All subsequent toggles: instantaneous.
+
+Workflows that visualize 1-5 SIDs at a time (the common case) now pay only for those SIDs. Workflows that want every SID built can still get there by checking everything in the Loads tab - the cost is just deferred to when the user actually requests it.
+
+170 tests still pass.
 
 ## Changelog for v3.4.1
 
