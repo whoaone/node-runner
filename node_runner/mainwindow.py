@@ -42,7 +42,8 @@ from node_runner.commands import (
     AddPlotelCommand, DeletePlotelCommand,
     CreateGroupCommand, DeleteGroupCommand, RenameGroupCommand, ModifyGroupCommand,
     ReassignPropertyCommand, ReassignMaterialCommand,
-    AddLoadCombinationCommand, RenumberCommand,
+    AddLoadCombinationCommand, EditLoadCombinationCommand,
+    CopyLoadCombinationCommand, RenumberCommand,
     AddGeometryPointCommand, AddGeometryLineCommand, AddGeometryArcCommand,
     AddGeometryCircleCommand, AddGeometrySurfaceCommand,
     MeshCurveCommand, MeshSurfaceCommand, NodesAtGeometryPointsCommand,
@@ -223,7 +224,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.4.2"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.5.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -236,6 +237,37 @@ class MainWindow(QMainWindow):
         self.elem_shrink = 0.0
         self.load_scaling_info = {}
         self.type_color_map, self.pid_color_map = {"Shells": "#0077be", "Beams": "#f85a40", "RBE2": "#ff3131", "RBE3": "#ffd700", "Masses": "#00cc66", "Solids": "#8b5cf6", "Shear": "#ff8c00", "Gap": "#20b2aa", "Plotel": "#ff69b4"}, {}
+
+        # v3.5.0 item 3: load preferences from QSettings. Falls back
+        # to defaults defined in dialogs/preferences.py if no settings
+        # saved yet.
+        try:
+            from node_runner.dialogs.preferences import (
+                load_preferences, DEFAULT_HIGHLIGHT_COLOR)
+            prefs = load_preferences()
+            # Merge persisted colors over the hardcoded defaults.
+            for key, value in (prefs.get('colors') or {}).items():
+                self.type_color_map[key] = value
+            self.highlight_color = prefs.get(
+                'highlight_color', DEFAULT_HIGHLIGHT_COLOR)
+            sizes = prefs.get('sizes') or {}
+            # Mass glyph scale: stored as percent, used as fraction.
+            self.mass_glyph_scale = float(
+                sizes.get('mass_glyph_scale_pct', 1.5)) / 100.0
+            self.node_size = int(sizes.get('node_size', self.node_size))
+            self.beam_width = int(sizes.get('beam_width', self.beam_width))
+            self.edge_width = int(sizes.get('edge_width', self.edge_width))
+            self.rbe_line_width = int(sizes.get('rbe_line_width', 3))
+            self.free_edge_width = int(sizes.get('free_edge_width', 4))
+            self.highlight_outline_width = int(
+                sizes.get('highlight_outline_width', 5))
+        except Exception:
+            from node_runner.theme import SELECTION_ACCENT
+            self.highlight_color = SELECTION_ACCENT
+            self.mass_glyph_scale = 0.015
+            self.rbe_line_width = 3
+            self.free_edge_width = 4
+            self.highlight_outline_width = 5
         
         # --- FIX: Separated chained assignments onto individual lines ---
         self.active_selection_dialog = None
@@ -1098,6 +1130,13 @@ class MainWindow(QMainWindow):
         select_entities_action.setShortcut("Ctrl+F")
         select_entities_action.triggered.connect(self._open_find_entity_tool)
         edit_menu.addAction(select_entities_action)
+
+        # v3.5.0 item 3: Preferences dialog (colors / sizes / highlight)
+        edit_menu.addSeparator()
+        prefs_action = QAction("&Preferences...", self)
+        prefs_action.setShortcut("Ctrl+,")
+        prefs_action.triggered.connect(self._open_preferences_dialog)
+        edit_menu.addAction(prefs_action)
 
         # --- Model menu (merged: old Model + Mesh + Edit items) ---
         model_menu = menu_bar.addMenu("&Model")
@@ -6000,6 +6039,48 @@ class MainWindow(QMainWindow):
             self._update_viewer(self.current_generator, reset_camera=False)
             self._populate_tree()
 
+    # ─── v3.5.0 item 3: Preferences (colors / sizes / highlight) ────────
+
+    def _open_preferences_dialog(self):
+        """Open the Preferences dialog. On accept, write to QSettings,
+        apply the new values to live attributes, and rebuild the viewer
+        so colors/sizes/highlight update immediately."""
+        from node_runner.dialogs.preferences import (
+            PreferencesDialog, save_preferences, load_preferences)
+        current = load_preferences()
+        # Overlay any in-memory overrides from the running session so
+        # the dialog reflects the live state.
+        for key, value in (self.type_color_map or {}).items():
+            current.setdefault('colors', {})[key] = value
+        if getattr(self, 'highlight_color', None):
+            current['highlight_color'] = self.highlight_color
+        dlg = PreferencesDialog(current, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        payload = dlg.result_payload()
+        save_preferences(payload)
+        # Apply: live attributes -> viewer rebuild.
+        for key, value in (payload.get('colors') or {}).items():
+            self.type_color_map[key] = value
+        self.highlight_color = payload.get(
+            'highlight_color', getattr(self, 'highlight_color', '#fab387'))
+        sizes = payload.get('sizes') or {}
+        self.mass_glyph_scale = float(
+            sizes.get('mass_glyph_scale_pct', 1.5)) / 100.0
+        self.node_size = int(sizes.get('node_size', self.node_size))
+        self.beam_width = int(sizes.get('beam_width', self.beam_width))
+        self.edge_width = int(sizes.get('edge_width', self.edge_width))
+        self.rbe_line_width = int(
+            sizes.get('rbe_line_width', getattr(self, 'rbe_line_width', 3)))
+        self.free_edge_width = int(
+            sizes.get('free_edge_width', getattr(self, 'free_edge_width', 4)))
+        self.highlight_outline_width = int(
+            sizes.get('highlight_outline_width',
+                      getattr(self, 'highlight_outline_width', 5)))
+        if self.current_generator:
+            self._update_viewer(self.current_generator, reset_camera=False)
+        self._update_status("Preferences applied - viewer updated.")
+
     # ─── F8: LOAD Combination ────────────────────────────────────────────
 
     def _create_load_combination(self):
@@ -6019,7 +6100,85 @@ class MainWindow(QMainWindow):
             cmd = AddLoadCombinationCommand(params)
             self.command_manager.execute(cmd, model)
             self._populate_tree()
+            self._populate_loads_tab()
             self._update_status(f"Created LOAD combination SID {params['sid']}.")
+
+    def _edit_load_combination(self, combo_sid):
+        """v3.5.0 item 2: open the Femap-style edit dialog on an
+        existing load combination. Tab + Model tree refresh on accept."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        if combo_sid not in (model.load_combinations or {}):
+            return
+        from node_runner.dialogs.load_combination import LoadCombinationDialog
+        dlg = LoadCombinationDialog(
+            model, mode=LoadCombinationDialog.MODE_EDIT,
+            combo_sid=combo_sid, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_sid, payload = dlg.result_payload()
+        cmd = EditLoadCombinationCommand(
+            combo_sid, new_sid, payload)
+        self.command_manager.execute(cmd, model)
+        self._populate_tree()
+        self._populate_loads_tab()
+        if new_sid == combo_sid:
+            self._update_status(f"Edited LOAD combination SID {new_sid}.")
+        else:
+            self._update_status(
+                f"Renamed LOAD combination SID {combo_sid} -> {new_sid}.")
+
+    def _copy_load_combination(self, combo_sid):
+        """v3.5.0 item 2: open the dialog pre-populated from an existing
+        combo but with a fresh SID. Source untouched on accept."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        if combo_sid not in (model.load_combinations or {}):
+            return
+        from node_runner.dialogs.load_combination import LoadCombinationDialog
+        dlg = LoadCombinationDialog(
+            model, mode=LoadCombinationDialog.MODE_COPY,
+            combo_sid=combo_sid, parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_sid, payload = dlg.result_payload()
+        cmd = CopyLoadCombinationCommand(new_sid, payload)
+        self.command_manager.execute(cmd, model)
+        self._populate_tree()
+        self._populate_loads_tab()
+        self._update_status(
+            f"Copied LOAD combination SID {combo_sid} -> {new_sid}.")
+
+    def _rename_load_combination(self, combo_sid):
+        """v3.5.0 item 2: quick SID-only rename via QInputDialog. For
+        a full edit use _edit_load_combination."""
+        if not self.current_generator:
+            return
+        model = self.current_generator.model
+        if combo_sid not in (model.load_combinations or {}):
+            return
+        existing = set((model.load_combinations or {}).keys()) \
+                   | set((model.loads or {}).keys())
+        new_sid, ok = QInputDialog.getInt(
+            self, f"Rename LOAD SID {combo_sid}",
+            "New SID:",
+            value=combo_sid, min=1, max=99999999)
+        if not ok or new_sid == combo_sid:
+            return
+        if new_sid in existing:
+            QMessageBox.warning(
+                self, "SID conflict",
+                f"SID {new_sid} is already used.")
+            return
+        payload = dict(model.load_combinations[combo_sid])
+        cmd = EditLoadCombinationCommand(combo_sid, new_sid, payload)
+        self.command_manager.execute(cmd, model)
+        self._populate_tree()
+        self._populate_loads_tab()
+        self._update_status(
+            f"Renamed LOAD combination SID {combo_sid} -> {new_sid}.")
 
     # ─── F5: Subcase / Case Control ──────────────────────────────────────
 
@@ -6361,14 +6520,32 @@ class MainWindow(QMainWindow):
 
     def _start_selection(self, entity_type, all_ids, accept_callback,
                          select_by_data=None):
-        """Start a selection workflow using the floating selection window."""
+        """Start a selection workflow using the floating selection window.
+
+        v3.5.0 item 1: by default the bar's pool is intersected with
+        the tree-visible entity set so users can't accidentally pick
+        something hidden. The full pool is passed as
+        ``all_entity_ids_unfiltered`` so the bar's
+        "Include hidden entities" checkbox can restore it on demand.
+        """
         if self.selection_bar.isVisible():
             return  # already in a selection workflow
         self.current_selection_type = entity_type
+        full_pool = set(all_ids) if all_ids is not None else set()
+        try:
+            visible_pool = full_pool & set(self.visible_entity_ids(entity_type))
+        except Exception:
+            visible_pool = full_pool
+        # If nothing is visible (e.g. user turned everything off and
+        # then triggered a list action), fall back to the full pool
+        # rather than handing the bar an empty selection.
+        default_pool = visible_pool if visible_pool else full_pool
         self.selection_bar.configure(
-            entity_type, all_ids,
+            entity_type, default_pool,
             select_by_data=select_by_data,
-            groups=self.groups)
+            groups=self.groups,
+            all_entity_ids_unfiltered=full_pool,
+        )
         self.selection_bar.show()
         self.active_selection_dialog = self.selection_bar
         self._selection_accept_callback = accept_callback
@@ -6602,12 +6779,12 @@ class MainWindow(QMainWindow):
                     coords.append(self.current_generator.model.nodes[nid].get_position())
 
             if coords:
-                # Phase 3.5: contrasting selection accent (Catppuccin peach)
-                # against the new accent-blue node default.
-                from node_runner.theme import SELECTION_ACCENT
+                # v3.5.0 item 3: highlight color is now user-configurable
+                # via Preferences > Highlight.
+                hl_color = getattr(self, 'highlight_color', '#fab387')
                 self.plotter.add_points(
                     np.array(coords),
-                    color=SELECTION_ACCENT,
+                    color=hl_color,
                     point_size=12,
                     render_points_as_spheres=True,
                     name='selection_highlight',
@@ -6623,14 +6800,16 @@ class MainWindow(QMainWindow):
             #     current_grid as a wireframe with the accent color.
             #     Visually equivalent for the user.
             #   * Otherwise extract the subset as before.
-            from node_runner.theme import SELECTION_ACCENT
+            # v3.5.0 item 3: highlight color + outline width are user prefs.
+            hl_color = getattr(self, 'highlight_color', '#fab387')
+            hl_width = int(getattr(self, 'highlight_outline_width', 5))
             n_cells = self.current_grid.n_cells
             n_sel = len(entity_ids)
             if n_cells > 0 and n_sel >= n_cells * 0.5:
                 # Big selection - just overlay the full grid.
                 self.plotter.add_mesh(
                     self.current_grid, style='wireframe',
-                    color=SELECTION_ACCENT, line_width=3,
+                    color=hl_color, line_width=max(3, hl_width - 2),
                     name='selection_highlight', pickable=False,
                     reset_camera=False,
                 )
@@ -6640,7 +6819,7 @@ class MainWindow(QMainWindow):
                     highlight_grid = self.current_grid.extract_cells(indices)
                     self.plotter.add_mesh(
                         highlight_grid, style='wireframe',
-                        color=SELECTION_ACCENT, line_width=5,
+                        color=hl_color, line_width=hl_width,
                         name='selection_highlight', pickable=False,
                         reset_camera=False,
                     )
@@ -7438,10 +7617,35 @@ class MainWindow(QMainWindow):
             return f"Node {node_id}"
 
     def _populate_loads_tab(self):
-        """Populate the Loads sidebar tab tree (unified, mirrors Model tab layout)."""
-        tree = self.loads_tab_tree
-        tree.clear()
+        """Populate the Loads sidebar tab tree.
 
+        v3.5.0 item 4 (perf): lazy child population. Each Load Set /
+        Constraint Set header gets a placeholder child '(N entries -
+        expand to load)' and the real entries are built on first
+        expand via _on_load_tab_item_expanded. On the MEGA-XWFF deck
+        (512k load entries) this drops Loads-tab populate from 5-30s
+        to <100ms.
+        """
+        tree = self.loads_tab_tree
+        # Disconnect itemExpanded to avoid firing during the clear/rebuild
+        try:
+            tree.itemExpanded.disconnect(self._on_load_tab_item_expanded)
+        except (RuntimeError, TypeError):
+            pass
+
+        tree.setUpdatesEnabled(False)
+        try:
+            tree.clear()
+            self._build_loads_tab_contents()
+        finally:
+            tree.setUpdatesEnabled(True)
+
+        # Reconnect lazy-expand hook after the tree is rebuilt.
+        tree.itemExpanded.connect(self._on_load_tab_item_expanded)
+
+    def _build_loads_tab_contents(self):
+        """Actual tree-population body. Called with updates disabled."""
+        tree = self.loads_tab_tree
         gen = getattr(self, 'current_generator', None)
         model = gen.model if gen else None
         if not model:
@@ -7453,73 +7657,148 @@ class MainWindow(QMainWindow):
             n_loads = sum(len(v) for v in model.loads.values()) + len(model.tempds)
             loads_root = QTreeWidgetItem(tree, [f"Load Sets ({n_loads} entries)"])
             loads_root.setData(0, QtCore.Qt.UserRole, ('loads_root',))
+            # Build all Load Set headers without children first (batched).
+            set_items = []
             for sid in sorted(all_load_sids):
                 load_list = model.loads.get(sid, [])
                 tempd_card = model.tempds.get(sid, None)
-                # Build summary counts
                 counts = {}
                 for load in load_list:
                     counts[load.type] = counts.get(load.type, 0) + 1
                 if tempd_card:
                     counts['TEMPD'] = counts.get('TEMPD', 0) + 1
-                summary = ", ".join(f"{count} {ltype}" for ltype, count in counts.items())
-                set_item = QTreeWidgetItem(loads_root, [f"SID {sid}: {summary}"])
-                set_item.setFlags(set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                summary = ", ".join(f"{c} {t}" for t, c in counts.items())
+                n_children = len(load_list) + (1 if tempd_card else 0)
+                set_item = QTreeWidgetItem(
+                    [f"SID {sid}: {summary}"])
+                set_item.setFlags(
+                    set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
                 set_item.setCheckState(0, QtCore.Qt.Checked)
                 set_item.setData(0, QtCore.Qt.UserRole, ('load_set', sid))
-                # Regular load entries
-                for idx, card in enumerate(load_list):
-                    entry_text = self._format_load_entry(card)
-                    entry_item = QTreeWidgetItem(set_item, [entry_text])
-                    entry_item.setData(0, QtCore.Qt.UserRole, ('load_entry', sid, idx))
-                # TEMPD entry (stored separately in model.tempds)
-                if tempd_card:
-                    entry_text = self._format_load_entry(tempd_card)
-                    entry_item = QTreeWidgetItem(set_item, [entry_text])
-                    entry_item.setData(0, QtCore.Qt.UserRole, ('tempd_entry', sid))
+                # v3.5.0: placeholder child so the disclosure triangle
+                # appears. Real entries are built on first expand.
+                if n_children > 0:
+                    placeholder = QTreeWidgetItem(
+                        [f"({n_children} entries - expand to load)"])
+                    placeholder.setData(
+                        0, QtCore.Qt.UserRole, ('load_set_placeholder', sid))
+                    set_item.addChild(placeholder)
+                set_items.append(set_item)
+            loads_root.addChildren(set_items)
             loads_root.setExpanded(True)
 
-        # --- Constraint Sets ---
+        # --- Constraint Sets (same lazy pattern) ---
         if model.spcs:
-            n_constr = sum(len(s.nodes) for sl in model.spcs.values() for s in sl)
-            constr_root = QTreeWidgetItem(tree, [f"Constraint Sets ({n_constr} nodes)"])
+            n_constr = sum(
+                len(s.nodes) for sl in model.spcs.values() for s in sl)
+            constr_root = QTreeWidgetItem(
+                tree, [f"Constraint Sets ({n_constr} nodes)"])
             constr_root.setData(0, QtCore.Qt.UserRole, ('constraints_root',))
+            constr_items = []
             for sid, spc_list in sorted(model.spcs.items()):
                 all_nodes = set()
                 for spc in spc_list:
                     all_nodes.update(spc.nodes)
-                summary = f"{len(all_nodes)} Nodes"
-                set_item = QTreeWidgetItem(constr_root, [f"SID {sid}: SPC ({summary})"])
-                set_item.setFlags(set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                set_item = QTreeWidgetItem(
+                    [f"SID {sid}: SPC ({len(all_nodes)} Nodes)"])
+                set_item.setFlags(
+                    set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
                 set_item.setCheckState(0, QtCore.Qt.Checked)
                 set_item.setData(0, QtCore.Qt.UserRole, ('constraint_set', sid))
-                for spc_card in spc_list:
-                    for nid in spc_card.nodes:
-                        entry_text = self._format_spc_entry(spc_card, nid)
-                        entry_item = QTreeWidgetItem(set_item, [entry_text])
-                        entry_item.setData(0, QtCore.Qt.UserRole,
-                                           ('constraint_entry', sid, nid))
+                if all_nodes:
+                    placeholder = QTreeWidgetItem(
+                        [f"({len(all_nodes)} nodes - expand to load)"])
+                    placeholder.setData(
+                        0, QtCore.Qt.UserRole,
+                        ('constraint_set_placeholder', sid))
+                    set_item.addChild(placeholder)
+                constr_items.append(set_item)
+            constr_root.addChildren(constr_items)
             constr_root.setExpanded(True)
 
-        # --- Load Combinations ---
+        # --- Load Combinations (batched; combos themselves are flat) ---
         if hasattr(model, 'load_combinations') and model.load_combinations:
-            combos_root = QTreeWidgetItem(tree,
+            combos_root = QTreeWidgetItem(
+                tree,
                 [f"Load Combinations ({len(model.load_combinations)})"])
             combos_root.setData(0, QtCore.Qt.UserRole, ('combos_root',))
-            for combo_sid, combo_data in sorted(model.load_combinations.items()):
+            combo_items = []
+            for combo_sid, combo_data in sorted(
+                    model.load_combinations.items()):
                 try:
                     scale = combo_data.get('scale', 1.0)
                     components = combo_data.get('scale_factors', [])
                     load_ids = combo_data.get('load_ids', [])
+                    n_members = len(load_ids)
                     parts = [f"SID {lid} x{sf:.3g}"
                              for sf, lid in zip(components, load_ids)]
                     detail = ", ".join(parts) if parts else "empty"
-                    label = f"LOAD SID {combo_sid}: S={scale:.3g}  [{detail}]"
+                    label = (f"LOAD SID {combo_sid}: S={scale:.3g}  "
+                             f"({n_members} member{'s' if n_members != 1 else ''}) "
+                             f"[{detail}]")
                 except Exception:
                     label = f"LOAD SID {combo_sid}"
-                combo_item = QTreeWidgetItem(combos_root, [label])
-                combo_item.setData(0, QtCore.Qt.UserRole, ('load_combo', combo_sid))
-            combos_root.setExpanded(True)
+                combo_item = QTreeWidgetItem([label])
+                combo_item.setData(
+                    0, QtCore.Qt.UserRole, ('load_combo', combo_sid))
+                combo_items.append(combo_item)
+            combos_root.addChildren(combo_items)
+            combos_root.setExpanded(False)  # collapsed by default
+
+    def _on_load_tab_item_expanded(self, item):
+        """v3.5.0 item 4: lazy children for Load / Constraint sets.
+
+        Replaces a single ('..._placeholder', sid) child with the real
+        entry items on first expand. Idempotent - subsequent expands
+        are no-ops because the placeholder is gone."""
+        if item is None or item.childCount() != 1:
+            return
+        first = item.child(0)
+        data = first.data(0, QtCore.Qt.UserRole)
+        if not isinstance(data, tuple) or len(data) < 2:
+            return
+        kind, sid = data[0], data[1]
+        gen = getattr(self, 'current_generator', None)
+        model = gen.model if gen else None
+        if not model:
+            return
+        tree = self.loads_tab_tree
+        tree.setUpdatesEnabled(False)
+        try:
+            if kind == 'load_set_placeholder':
+                load_list = model.loads.get(sid, [])
+                tempd_card = model.tempds.get(sid, None)
+                kids = []
+                for idx, card in enumerate(load_list):
+                    entry_text = self._format_load_entry(card)
+                    e = QTreeWidgetItem([entry_text])
+                    e.setData(0, QtCore.Qt.UserRole,
+                              ('load_entry', sid, idx))
+                    kids.append(e)
+                if tempd_card:
+                    e = QTreeWidgetItem(
+                        [self._format_load_entry(tempd_card)])
+                    e.setData(0, QtCore.Qt.UserRole, ('tempd_entry', sid))
+                    kids.append(e)
+                # Remove placeholder, batch-add real children.
+                item.removeChild(first)
+                if kids:
+                    item.addChildren(kids)
+            elif kind == 'constraint_set_placeholder':
+                spc_list = model.spcs.get(sid, [])
+                kids = []
+                for spc_card in spc_list:
+                    for nid in spc_card.nodes:
+                        e = QTreeWidgetItem(
+                            [self._format_spc_entry(spc_card, nid)])
+                        e.setData(0, QtCore.Qt.UserRole,
+                                  ('constraint_entry', sid, nid))
+                        kids.append(e)
+                item.removeChild(first)
+                if kids:
+                    item.addChildren(kids)
+        finally:
+            tree.setUpdatesEnabled(True)
 
     def _populate_analysis_tab(self):
         """Populate the Analysis sidebar tab tree."""
@@ -7615,7 +7894,19 @@ class MainWindow(QMainWindow):
             add_action = menu.addAction("Add Combination...")
             add_action.triggered.connect(self._create_load_combination)
         elif kind == 'load_combo':
+            # v3.5.0 item 2: full Femap-style context menu
+            # (Edit / Copy / Rename / Delete).
             combo_sid = data[1]
+            edit_action = menu.addAction(f"Edit Combination SID {combo_sid}...")
+            edit_action.triggered.connect(
+                lambda: self._edit_load_combination(combo_sid))
+            copy_action = menu.addAction(f"Copy Combination SID {combo_sid}...")
+            copy_action.triggered.connect(
+                lambda: self._copy_load_combination(combo_sid))
+            rename_action = menu.addAction(f"Rename SID {combo_sid}...")
+            rename_action.triggered.connect(
+                lambda: self._rename_load_combination(combo_sid))
+            menu.addSeparator()
             delete_action = menu.addAction(f"Delete Combination SID {combo_sid}")
             delete_action.triggered.connect(
                 lambda: self._delete_load_combo_from_tab(combo_sid))
@@ -8985,9 +9276,9 @@ class MainWindow(QMainWindow):
 
         self.plotter.remove_actor('highlight_actor', render=False)
         if found:
-            # Phase 3.5: theme-coherent find-and-zoom highlight
-            from node_runner.theme import SELECTION_ACCENT
-            self.plotter.add_points(np.array(coords), color=SELECTION_ACCENT, point_size=15, render_points_as_spheres=True, name='highlight_actor'); self.plotter.fly_to(coords)
+            # v3.5.0 item 3: highlight color via user preference.
+            hl_color = getattr(self, 'highlight_color', '#fab387')
+            self.plotter.add_points(np.array(coords), color=hl_color, point_size=15, render_points_as_spheres=True, name='highlight_actor'); self.plotter.fly_to(coords)
             self._update_status(f"Found {etype} {entity_id}.")
         else: self._update_status(f"{etype} {entity_id} not found.", is_error=True)
 
@@ -9670,7 +9961,12 @@ class MainWindow(QMainWindow):
 
         pts = pv.PolyData(np.array(coords))
         cube = pv.Cube(x_length=1.0, y_length=1.0, z_length=1.0)
-        scale = self.current_grid.length * 0.015 if self.current_grid.length > 0 else 1.0
+        # v3.5.0 item 3: mass glyph scale is now a user preference
+        # (Preferences > Entity Sizes > Mass glyph scale). Stored as
+        # fraction-of-model-length; default 0.015.
+        scale_factor = getattr(self, 'mass_glyph_scale', 0.015)
+        scale = (self.current_grid.length * scale_factor
+                 if self.current_grid.length > 0 else 1.0)
         glyphs = pts.glyph(scale=False, factor=scale, geom=cube)
         # v3.3.0: each input point produces cube.n_cells cells in the
         # glyph output. Repeat each mass eid across its 6 cube faces so

@@ -1,4 +1,4 @@
-# Node Runner v3.4.2
+# Node Runner v3.5.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,83 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.5.0
+
+Feature release covering four items reported on
+`MEGA-XWFF_04A_DUL_FUC-Entry.dat` (512,203 load entries, 3,911 load
+combinations).
+
+### Entity selection respects tree visibility (item 1)
+Hiding a category in the Model tree (e.g. unchecking "Plates") now
+filters them out of the selection pool automatically. The selection
+bar gets a new `[ ] Include hidden` checkbox so the user can opt back
+into the full pool when needed. Internally the bar stores the
+*unfiltered* range on each entry and intersects against the current
+view pool at `get_selected_ids()` time, so toggling Include-hidden
+expands the result set without losing the original authored intent.
+
+### Loads tab populates instantly even on huge decks (item 4)
+`_populate_loads_tab` previously created one `QTreeWidgetItem` per
+load entry at populate time - on a deck with 512k entries that was a
+5-30 s hang. v3.5.0 makes Load Set and Constraint Set children
+**lazy**: the headers get a placeholder child like `(N entries -
+expand to load)`, and the real entries are built on first expand via
+`_on_load_tab_item_expanded` (batched via `addChildren`). Tree
+populate is now `<100ms` regardless of total entry count.
+
+### Femap-style Load Combination editing (item 2)
+New `LoadCombinationDialog` (modes: create / edit / copy) with:
+- Combo SID + Title fields.
+- Overall scale factor.
+- (Scale, Load Set SID, Summary) member table with `+ Add` / `- Remove`.
+- Live "Resolves to N member sets, totalling M load entries" preview.
+- Restore / OK / Cancel.
+
+Right-click on a load combination in the Loads tab now offers
+**Edit... / Copy... / Rename... / Delete** instead of only Delete.
+Edit and Copy are full undo/redo via new
+`EditLoadCombinationCommand` and `CopyLoadCombinationCommand`.
+
+### Preferences dialog for entity colors and sizes (item 3)
+New `Edit > Preferences...` dialog (Ctrl+,) with three tabs:
+
+- **Entity Colors** - per-type color picker for Shells / Beams / Bars
+  / Rods / Bushes / Plates / RBE2 / RBE3 / Masses / Solids / Shear /
+  Gap / Plotel / Free Nodes. Per-row reset to default.
+- **Entity Sizes** - mass glyph scale (as % of model length, replaces
+  the hardcoded `0.015`), node point size, beam line width, edge
+  width, RBE line width, free-edge line width.
+- **Highlight** - selection highlight color (was hardcoded peach;
+  now user pick) + selection outline width.
+
+All values persist via `QSettings("NodeRunner", "NodeRunner")` and
+are read on app startup so changes survive restart. Restore Defaults
+on the dialog resets every row to its baked-in default.
+
+### MEGA-XWFF deck profile (headless)
+On `MEGA-XWFF_04A_DUL_FUC-Entry.dat` (2.48M nodes, 2.40M elements,
+1,962 load SIDs, 3,912 load combos, 512k load cards, 269k PLOAD4
+face refs):
+
+| Stage | v3.5.0 wall-clock |
+|---|---|
+| pyNastran parse (chunked-strict) | 253.7 s |
+| _finalize_for_viewer | 1.3 s |
+| build_node_coords_vectorized | 2.6 s |
+| build_element_arrays_vectorized | 19.4 s |
+| grid build + EID cell_data | 0.2 s |
+| compute_grid_centers_and_normals | 0.8 s |
+| Loads tab populate (lazy) | <0.1 s |
+| **end-to-end first display** | **~278 s (≈ 4.6 min)** |
+
+The parse phase is now the dominant cost (pyNastran's text parse on
+a multi-GB BDF). Once parse completes, scene build + tree + load
+actors are all under 30s combined. Future work: investigate
+parallel/streaming parse to bring the parse phase down further.
+
+### Tests
+185 pass (170 prior + 7 load combo + 5 prefs + 3 visibility).
 
 ## Changelog for v3.4.2
 

@@ -168,28 +168,69 @@ def test_append_id_set_skips_dangling(bar):
 # v3.4.0 - Phase A regressions
 # ----------------------------------------------------------------------
 
-def test_single_id_more_creates_one_entry(bar):
+def test_single_id_more_creates_one_entry(qapp):
     """Item 3: typing one ID with To/By blank and clicking More must
     create a single-ID bucket row, not a range or nothing."""
-    bar._id_input.setText("12345")
-    # Configure has set all_entity_ids = 1..100 by default, so 12345
-    # is out of range; widen the entity set for this test.
-    bar.all_entity_ids = set(range(1, 100001))
-    bar._on_more_clicked()
-    labels = [bar._list_widget.item(i).text()
-              for i in range(bar._list_widget.count())]
+    from node_runner.dialogs.selection import EntitySelectionBar
+    b = EntitySelectionBar()
+    b.configure('Element', set(range(1, 100001)))
+    b._id_input.setText("12345")
+    b._on_more_clicked()
+    labels = [b._list_widget.item(i).text()
+              for i in range(b._list_widget.count())]
     assert labels == ["12345"]
-    assert bar.get_selected_ids() == [12345]
+    assert b.get_selected_ids() == [12345]
 
 
-def test_single_id_more_with_stray_whitespace(bar):
+def test_single_id_more_with_stray_whitespace(qapp):
     """Whitespace around the ID should not break the single-ID path."""
-    bar._id_input.setText("  42  ")
-    bar.all_entity_ids = set(range(1, 1000))
-    bar._on_more_clicked()
-    labels = [bar._list_widget.item(i).text()
-              for i in range(bar._list_widget.count())]
+    from node_runner.dialogs.selection import EntitySelectionBar
+    b = EntitySelectionBar()
+    b.configure('Element', set(range(1, 1000)))
+    b._id_input.setText("  42  ")
+    b._on_more_clicked()
+    labels = [b._list_widget.item(i).text()
+              for i in range(b._list_widget.count())]
     assert labels == ["42"]
+
+
+def test_visibility_filter_excludes_hidden_by_default(qapp):
+    """v3.5.0 item 1: configure with visible={1..5}, unfiltered={1..10}.
+    Adding 1..10 results in only 1..5 in the final selection."""
+    from node_runner.dialogs.selection import EntitySelectionBar
+    b = EntitySelectionBar()
+    b.configure('Element', set(range(1, 6)),
+                all_entity_ids_unfiltered=set(range(1, 11)))
+    b._append_id_set('+', set(range(1, 11)))
+    assert b.get_selected_ids() == [1, 2, 3, 4, 5]
+
+
+def test_include_hidden_toggle_restores_pool(qapp):
+    """v3.5.0 item 1: toggling Include hidden ON widens the view pool
+    without losing the original authored range."""
+    from node_runner.dialogs.selection import EntitySelectionBar
+    b = EntitySelectionBar()
+    b.configure('Element', set(range(1, 6)),
+                all_entity_ids_unfiltered=set(range(1, 11)))
+    b._append_id_set('+', set(range(1, 11)))
+    assert b.get_selected_ids() == [1, 2, 3, 4, 5]
+    b._include_hidden_check.setChecked(True)
+    assert b.get_selected_ids() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    b._include_hidden_check.setChecked(False)
+    assert b.get_selected_ids() == [1, 2, 3, 4, 5]
+
+
+def test_visibility_filter_still_drops_dangling(qapp):
+    """v3.5.0: IDs outside the *unfiltered* pool are dropped even when
+    Include hidden is on (they're truly absent from the model)."""
+    from node_runner.dialogs.selection import EntitySelectionBar
+    b = EntitySelectionBar()
+    b.configure('Element', set(range(1, 6)),
+                all_entity_ids_unfiltered=set(range(1, 11)))
+    b._append_id_set('+', {3, 50, 100, 200})
+    b._include_hidden_check.setChecked(True)
+    # 50, 100, 200 never existed -> dropped at append time.
+    assert b.get_selected_ids() == [3]
 
 
 def test_paste_via_internal_helper_into_bucket(qapp):

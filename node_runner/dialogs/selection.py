@@ -332,6 +332,16 @@ class EntitySelectionBar(QDialog):
 
         _bottom = QHBoxLayout()
         _bottom.setSpacing(3)
+        # v3.5.0 item 1: "Include hidden entities" toggle on the left.
+        # Default OFF -> bar's pool is tree-visible entities only.
+        from PySide6.QtWidgets import QCheckBox
+        self._include_hidden_check = QCheckBox("Include hidden")
+        self._include_hidden_check.setToolTip(
+            "When OFF (default), only entities currently visible in the "
+            "Model tree can be picked. Toggle ON to include hidden "
+            "entities in the pool.")
+        self._include_hidden_check.toggled.connect(self._on_include_hidden_toggled)
+        _bottom.addWidget(self._include_hidden_check)
         _bottom.addStretch(1)
 
         self._highlight_btn = QToolButton()
@@ -492,10 +502,25 @@ class EntitySelectionBar(QDialog):
     # ------------------------------------------------------------------
 
     def configure(self, entity_type, all_entity_ids, select_by_data=None,
-                  groups=None, single_selection_mode=False):
-        """Reset the dialog for a new entity selection workflow."""
+                  groups=None, single_selection_mode=False,
+                  all_entity_ids_unfiltered=None):
+        """Reset the dialog for a new entity selection workflow.
+
+        v3.5.0 item 1: ``all_entity_ids`` is now the *visible* default
+        pool (filtered by tree checkbox state). ``all_entity_ids_unfiltered``
+        is the full pool (every entity in the model). The bar's
+        "Include hidden entities" checkbox swaps between the two so
+        the user can opt back into picking hidden entities.
+        """
         self.entity_type = entity_type
         self.all_entity_ids = set(all_entity_ids)
+        if all_entity_ids_unfiltered is None:
+            self._all_entity_ids_unfiltered = set(all_entity_ids)
+        else:
+            self._all_entity_ids_unfiltered = set(all_entity_ids_unfiltered)
+        # The visible pool is the default; remember it so we can
+        # restore on toggle-off.
+        self._all_entity_ids_visible = set(all_entity_ids)
         self.selected_ids = set()
         self._entries = []
         self.single_selection_mode = single_selection_mode
@@ -505,6 +530,17 @@ class EntitySelectionBar(QDialog):
 
         self._title_label.setText(f"Select {entity_type}")
         self.setWindowTitle(f"{entity_type} Selection")
+
+        # v3.5.0 item 1: reset "Include hidden" checkbox to OFF on
+        # every configure call so the default pool is always visible-
+        # only. Setter blocks signals so we don't immediately fire a
+        # swap during configure.
+        if hasattr(self, '_include_hidden_check'):
+            self._include_hidden_check.blockSignals(True)
+            try:
+                self._include_hidden_check.setChecked(False)
+            finally:
+                self._include_hidden_check.blockSignals(False)
 
         # Reset action mode to Add
         self._add_radio.setChecked(True)
@@ -602,12 +638,14 @@ class EntitySelectionBar(QDialog):
     def _append_entry(self, mode_char, start, end, step):
         """Append a new _RangeEntry to the bucket and refresh the UI.
 
-        ``mode_char`` is '+', '-', or 'x'. The entry's expanded ID set
-        is intersected against ``self.all_entity_ids`` so dangling IDs
-        never leak into the final selection.
+        v3.5.0 item 1: entries are stored against the *unfiltered* model
+        pool (so the user's authored intent survives a pool change).
+        ``get_selected_ids`` re-intersects against the current view
+        pool at compute time. That way toggling Include-hidden doesn't
+        erase what the user picked.
         """
         entry = _RangeEntry(mode_char, start, end, step,
-                            all_entity_ids=self.all_entity_ids)
+                            all_entity_ids=self._all_entity_ids_unfiltered)
         if not entry.ids:
             return  # nothing to add
         self._entries.append(entry)
@@ -617,10 +655,16 @@ class EntitySelectionBar(QDialog):
     def _append_id_set(self, mode_char, ids):
         """Decompose an arbitrary id set into contiguous ranges and
         append one entry per range. Used by Pick / Select All / Select
-        Visible / Paste."""
+        Visible / Paste.
+
+        v3.5.0: clamps against the *unfiltered* pool only (drops
+        model-dangling IDs). Visibility filtering happens at
+        get_selected_ids time.
+        """
         if not ids:
             return
-        valid = sorted(int(i) for i in self.all_entity_ids.intersection(ids))
+        valid = sorted(int(i) for i
+                       in self._all_entity_ids_unfiltered.intersection(ids))
         if not valid:
             return
         if self.single_selection_mode and mode_char == '+':
@@ -629,7 +673,7 @@ class EntitySelectionBar(QDialog):
             valid = [valid[0]]
         for start, end, step in self.compress_ids_to_range_tuples(valid):
             entry = _RangeEntry(mode_char, start, end, step,
-                                all_entity_ids=self.all_entity_ids)
+                                all_entity_ids=self._all_entity_ids_unfiltered)
             if entry.ids:
                 self._entries.append(entry)
         self._refresh_list()
@@ -752,9 +796,12 @@ class EntitySelectionBar(QDialog):
 
         + entries union their IDs into the result; - and x entries
         subtract. Order matters: an 'add 1..10' then 'remove 8' yields
-        {1..7, 9, 10}. The same two entries in opposite order would
-        yield {1..10} (the remove subtracts from an empty result, then
-        the add unions in everything).
+        {1..7, 9, 10}.
+
+        v3.5.0 item 1: the final set is intersected against
+        ``self.all_entity_ids`` (the current view pool) so toggling
+        Include-hidden naturally hides/un-hides IDs without rebuilding
+        any entry.
         """
         result = set()
         for entry in self._entries:
@@ -763,7 +810,9 @@ class EntitySelectionBar(QDialog):
                 result |= ids
             else:
                 result -= ids
-        return sorted(result)
+        # Visibility filter at compute time. Truly dangling IDs were
+        # already dropped at append time.
+        return sorted(result & self.all_entity_ids)
 
     # ------------------------------------------------------------------
     # Utility actions
@@ -817,6 +866,18 @@ class EntitySelectionBar(QDialog):
         if self._highlight_btn.isChecked():
             self.request_show_selection.emit(
                 self.entity_type, self.get_selected_ids())
+
+    def _on_include_hidden_toggled(self, checked):
+        """v3.5.0 item 1: swap the bar's pool between visible-only and
+        unfiltered. Entries are stored against the unfiltered pool,
+        so get_selected_ids automatically re-evaluates against
+        ``self.all_entity_ids`` and we don't need to rebuild them."""
+        if checked:
+            self.all_entity_ids = set(self._all_entity_ids_unfiltered)
+        else:
+            self.all_entity_ids = set(self._all_entity_ids_visible)
+        self._refresh_list()
+        self._show_selection()
 
     def _on_highlight_toggled(self, checked):
         if checked:

@@ -1901,6 +1901,73 @@ class AddLoadCombinationCommand(Command):
         return f"Add LOAD combination SID {self._sid}"
 
 
+class EditLoadCombinationCommand(Command):
+    """v3.5.0 item 2: edit an existing LOAD combination in place.
+
+    Stores the pre-edit snapshot so undo/redo restores it. Optionally
+    handles a SID change (rename / copy-to-new-SID) by deleting the
+    old key after writing the new one.
+    """
+
+    def __init__(self, old_sid: int, new_sid: int, new_payload: dict):
+        self._old_sid = int(old_sid)
+        self._new_sid = int(new_sid)
+        self._new_payload = dict(new_payload)
+        self._snapshot_old = None  # populated by execute()
+
+    def execute(self, model) -> None:
+        if not hasattr(model, 'load_combinations'):
+            model.load_combinations = {}
+        # Snapshot for undo.
+        if self._old_sid in model.load_combinations:
+            self._snapshot_old = dict(model.load_combinations[self._old_sid])
+        # Write new SID (may be the same as old).
+        model.load_combinations[self._new_sid] = dict(self._new_payload)
+        # If renaming to a different SID, remove the old entry.
+        if self._new_sid != self._old_sid and self._old_sid in model.load_combinations:
+            del model.load_combinations[self._old_sid]
+
+    def undo(self, model) -> None:
+        if not hasattr(model, 'load_combinations'):
+            return
+        # Remove the new SID we wrote.
+        if self._new_sid in model.load_combinations:
+            del model.load_combinations[self._new_sid]
+        # Restore the old SID snapshot (if there was one).
+        if self._snapshot_old is not None:
+            model.load_combinations[self._old_sid] = dict(self._snapshot_old)
+
+    @property
+    def description(self) -> str:
+        if self._old_sid == self._new_sid:
+            return f"Edit LOAD combination SID {self._new_sid}"
+        return (f"Edit LOAD combination SID {self._old_sid} "
+                f"-> {self._new_sid}")
+
+
+class CopyLoadCombinationCommand(Command):
+    """v3.5.0 item 2: copy an existing LOAD combination to a new SID
+    (independent of the source). Source remains untouched."""
+
+    def __init__(self, new_sid: int, payload: dict):
+        self._new_sid = int(new_sid)
+        self._payload = dict(payload)
+
+    def execute(self, model) -> None:
+        if not hasattr(model, 'load_combinations'):
+            model.load_combinations = {}
+        model.load_combinations[self._new_sid] = dict(self._payload)
+
+    def undo(self, model) -> None:
+        if hasattr(model, 'load_combinations') \
+                and self._new_sid in model.load_combinations:
+            del model.load_combinations[self._new_sid]
+
+    @property
+    def description(self) -> str:
+        return f"Copy LOAD combination to SID {self._new_sid}"
+
+
 # ---------------------------------------------------------------------------
 # Renumber command
 # ---------------------------------------------------------------------------
