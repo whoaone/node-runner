@@ -62,6 +62,36 @@ ETYPE_INFO = {
 # normals / lighting in the plotter).
 SHELL_KINDS = {'shell', 'shear'}
 
+# v3.3.0: tree-grouping maps. These used to be local dicts inside
+# MainWindow._populate_tree (which iterated every element twice to
+# build Counters). Hoisting them up means we can piggy-back the
+# counting onto build_element_arrays_vectorized's existing single
+# pass over all elements.
+TREE_BY_TYPE_MAP = {
+    'CBEAM': 'Beams', 'CBAR': 'Bars', 'CROD': 'Rods',
+    'CBUSH': 'Bushes',
+    'CQUAD4': 'Plates', 'CMEMBRAN': 'Plates', 'CTRIA3': 'Plates',
+    'RBE2': 'Rigid', 'RBE3': 'Rigid',
+    'CHEXA': 'Solids', 'CHEXA8': 'Solids', 'CHEXA20': 'Solids',
+    'CTETRA': 'Solids', 'CTETRA4': 'Solids', 'CTETRA10': 'Solids',
+    'CPENTA': 'Solids', 'CPENTA6': 'Solids', 'CPENTA15': 'Solids',
+    'CSHEAR': 'Shear', 'CGAP': 'Gap',
+}
+TREE_SHAPE_MAP = {
+    'Line': ('CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'),
+    'Quad': ('CQUAD4', 'CMEMBRAN', 'CSHEAR'),
+    'Tria': ('CTRIA3',),
+    'Rigid': ('RBE2', 'RBE3'),
+    'Hex': ('CHEXA', 'CHEXA8', 'CHEXA20'),
+    'Tet': ('CTETRA', 'CTETRA4', 'CTETRA10'),
+    'Wedge': ('CPENTA', 'CPENTA6', 'CPENTA15'),
+}
+# Inverted for O(1) lookup in the element loop.
+_TYPE_TO_SHAPE = {
+    etype: shape for shape, etypes in TREE_SHAPE_MAP.items()
+    for etype in etypes
+}
+
 
 def build_node_coords_vectorized(model, sorted_node_ids):
     """Return (N, 3) numpy array of global node positions.
@@ -152,6 +182,13 @@ def build_element_arrays_vectorized(
         getattr(model, 'rigid_elements', {}) or {},
     )
     n_total = sum(len(d) for d in elem_dicts)
+    # v3.3.0: counters for the tree's By-Type / By-Shape groups,
+    # accumulated in the same pass as the cell-building so we don't
+    # have to iterate all elements a second time later in
+    # MainWindow._populate_tree.
+    by_type_counts: dict = {}
+    by_shape_counts: dict = {}
+
     if n_total == 0:
         return {
             'cells': np.array([], dtype=np.int64),
@@ -161,6 +198,8 @@ def build_element_arrays_vectorized(
             'etype': np.array([], dtype=object),
             'is_shell': np.array([], dtype=np.int8),
             'nodes_used': nodes_used,
+            'by_type_counts': by_type_counts,
+            'by_shape_counts': by_shape_counts,
         }
 
     # Pre-sort element IDs by kind. RBE2/RBE3 are rigid; we record
@@ -188,6 +227,11 @@ def build_element_arrays_vectorized(
             etype = getattr(elem, 'type', None)
             if etype is None:
                 continue
+            # v3.3.0: bump tree-group counters in the same pass.
+            group = TREE_BY_TYPE_MAP.get(etype, 'Other')
+            by_type_counts[group] = by_type_counts.get(group, 0) + 1
+            shape = _TYPE_TO_SHAPE.get(etype, 'Other')
+            by_shape_counts[shape] = by_shape_counts.get(shape, 0) + 1
             if etype in ('RBE2', 'RBE3'):
                 # Record node usage for free-node detection.
                 try:
@@ -306,6 +350,8 @@ def build_element_arrays_vectorized(
         'etype': etype,
         'is_shell': is_shell,
         'nodes_used': nodes_used,
+        'by_type_counts': by_type_counts,
+        'by_shape_counts': by_shape_counts,
     }
 
 

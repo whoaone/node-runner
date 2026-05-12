@@ -3355,40 +3355,118 @@ class NastranModelGenerator:
         ``'NoneType' object has no attribute 'transform_node_to_global'``.
 
         This function does the minimum xref needed for visualization:
+          * Resolve every COORD's ``rid`` reference IN DEPENDENCY ORDER
+            (parents before children) and explicitly call ``setup()``
+            so the local unit vectors (i, j, k) are computed. Coords
+            with dangling parents (rid references a coord not in the
+            model, e.g. defined in a missing INCLUDE) get re-pointed
+            at basic so they don't poison ``node.get_position()``.
           * Resolve every GRID's ``cp`` integer ID into a ``cp_ref``
-            COORD object reference.
-          * Resolve every COORD2x's ``rid`` reference (chain of
-            coordinate systems).
+            COORD object reference (falling back to basic when cp is
+            unknown).
         We DON'T resolve elements, properties, loads, etc. - those
         aren't needed to render the model and would trip up on the
         permissive merges chunked-strict does.
 
-        Safe to call on any pyNastran BDF object; silently skips
+        v3.3.0: rewritten to be crash-proof. Previously a CORD2R whose
+        ``rid`` referenced a coord absent from the deck would leave
+        ``rid_ref = None`` and any later ``setup()`` call would raise
+        "Local unit vectors haven't been set." The viewer would die on
+        the import-summary popup. Now the dangling case is logged on
+        ``model._coord_resolution_warnings`` (a list of
+        ``(cid, reason)`` tuples) and the import continues.
+
+        Safe to call on any pyNastran BDF object; silently records
         anything it can't resolve.
         """
         if model is None:
             return
-        # First pass: resolve coord systems' own RID chain. Walk in a
-        # loop because CORD2R can reference another CORD2R.
         coords = getattr(model, 'coords', None) or {}
-        for _ in range(8):  # max chain depth; CORD chains are usually 1-2
-            still_unresolved = False
-            for cid, cs in coords.items():
-                if getattr(cs, 'rid_ref', None) is not None:
+        warnings = []  # list of (cid, reason) tuples for the UI
+
+        # ---- Pass 1: topo-sort coords by rid dependency and setup() ----
+        # Kahn's algorithm. Start with everything that has no parent
+        # (rid 0/None or self-reference). Each iteration adds coords
+        # whose rid was already resolved.
+        basic = coords.get(0)
+        resolved = set()  # cids whose rid_ref + setup() have been handled
+        if 0 in coords:
+            # Basic coord is its own root. Force-resolve so setup() is
+            # idempotent on it (pyNastran's basic returns early anyway).
+            try:
+                coords[0].setup()
+            except Exception:
+                pass
+            resolved.add(0)
+
+        def _rid_of(cs):
+            rid = getattr(cs, 'rid', None)
+            try:
+                return int(rid) if rid is not None else 0
+            except (TypeError, ValueError):
+                return 0
+
+        # Build cid -> rid map for fast lookup.
+        cid_to_rid = {cid: _rid_of(cs) for cid, cs in coords.items()
+                      if cid != 0}
+
+        # Drain the queue: each pass picks up coords whose parent is
+        # already resolved. Loop terminates when no progress can be made.
+        progress = True
+        while progress:
+            progress = False
+            for cid, rid in list(cid_to_rid.items()):
+                if cid in resolved:
                     continue
-                rid = getattr(cs, 'rid', None)
-                if rid is None or rid == 0:
-                    # Basic - has no parent
-                    continue
+                if rid == cid:
+                    # Self-reference - treat as basic-rooted.
+                    parent = basic
+                elif rid == 0:
+                    parent = basic
+                elif rid in resolved:
+                    parent = coords.get(rid)
+                else:
+                    # Parent not yet resolved (or not in coords at all).
+                    if rid not in coords:
+                        # Dangling parent - fall back to basic and log.
+                        parent = basic
+                        warnings.append(
+                            (cid, f"dangling rid={rid} - using basic"))
+                    else:
+                        continue  # Parent will be resolved in a later pass.
+                cs = coords[cid]
                 try:
-                    cs.rid_ref = coords.get(int(rid))
-                    if cs.rid_ref is None:
-                        still_unresolved = True
+                    cs.rid_ref = parent
                 except Exception:
-                    still_unresolved = True
-            if not still_unresolved:
-                break
-        # Second pass: wire each grid's cp_ref to the coord object.
+                    pass
+                try:
+                    cs.setup()
+                except Exception as exc:
+                    warnings.append(
+                        (cid, f"setup() failed: {exc.__class__.__name__}"))
+                resolved.add(cid)
+                progress = True
+
+        # Anything left in cid_to_rid but not in resolved is in a cycle.
+        for cid in cid_to_rid:
+            if cid in resolved:
+                continue
+            cs = coords[cid]
+            try:
+                cs.rid_ref = basic
+                cs.setup()
+            except Exception:
+                pass
+            warnings.append((cid, "rid cycle - using basic"))
+            resolved.add(cid)
+
+        # Expose warnings for the UI to read.
+        try:
+            model._coord_resolution_warnings = warnings
+        except Exception:
+            pass
+
+        # ---- Pass 2: wire each grid's cp_ref to the coord object. ----
         nodes = getattr(model, 'nodes', None) or {}
         basic = coords.get(0)
         for nid, node in nodes.items():

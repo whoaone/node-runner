@@ -13,22 +13,63 @@ from PySide6.QtGui import QAction, QActionGroup, QFont
 
 
 # ---------------------------------------------------------------------------
-# EntitySelectionBar - Femap-style floating selection window
+# EntitySelectionBar - Femap-style floating selection window (v3.3.0)
 # ---------------------------------------------------------------------------
 #
 #  Layout (3-column):
 #
-#  ┌─────────────────────────────────────────────────────────────────┐
-#  │ (•Add)(•Rem)(•Excl) ┌──────────────┐ [SelAll] [Reset] [Pick][H]│
-#  │ ID[__] To[__] By[__]│  entries     │ [Prev]  [Delete] [OK]    │
-#  │ Group [________▾]   │  list        │ [More]  [Method▾][Cancel] │
-#  └─────────────────────────────────────────────────────────────────┘
+#  +-----------------------------------------------------------------+
+#  | (oAdd)(oRem)(oExcl) +-------------+ [SelAll][SelVis][Reset]     |
+#  | ID[__] To[__] By[__]|  bucket     | [More][Previous][Delete]    |
+#  | Group [________v]   |  list       | [Pick v][Method v][Grow v]  |
+#  +-----------------------------------------------------------------+
+#  Count: N / Total
+#  -----------------------------------------------------------------
+#                                           [Hilite]  [OK] [Cancel]
 #
-#  The center list is a COLLECTION of entries.  Each entry represents
-#  one batch of IDs added by the user (via More, Pick, Select All, etc.).
-#  Entries can be highlighted and removed individually via the Delete button.
-#  selected_ids = union of all entry IDs.
+#  v3.3.0: each pick action becomes a *bucket entry* with a sign:
+#    add range 1..10 step 2 -> "1, 10, 2"
+#    remove single 8        -> "-8"
+#    exclude range 5..7     -> "x5, x7, 1"
+#  Final selection = walk entries in order, expand each range, apply
+#  set arithmetic (+ unions, - and x subtract). Delete removes a row
+#  from the bucket (literally undoes that pick action).
 #
+
+
+class _RangeEntry:
+    """One bucket row.
+
+    Attributes:
+        mode:  '+', '-', or 'x'  (add / remove / exclude)
+        start, end, step:        the Femap-style range tuple. For a
+                                 single ID, start == end and step == 1.
+        label:                   display string with sign prefix.
+        ids:                     cached frozenset of integer IDs the
+                                 entry expands to.
+    """
+
+    __slots__ = ('mode', 'start', 'end', 'step', 'label', 'ids')
+
+    def __init__(self, mode, start, end, step, all_entity_ids=None):
+        self.mode = mode
+        self.start = int(start)
+        self.end = int(end)
+        self.step = max(1, int(step))
+        prefix = {'+': '', '-': '-', 'x': 'x'}.get(mode, '')
+        if self.start == self.end and self.step == 1:
+            self.label = f"{prefix}{self.start}"
+        else:
+            self.label = (f"{prefix}{self.start}, "
+                          f"{prefix}{self.end}, {self.step}")
+        expanded = set(range(self.start, self.end + 1, self.step))
+        if all_entity_ids is not None:
+            expanded &= all_entity_ids
+        self.ids = frozenset(expanded)
+
+    def expand(self):
+        return set(self.ids)
+
 
 class EntitySelectionBar(QDialog):
     """Femap-style entity selection window - floating, movable, non-modal."""
@@ -43,13 +84,13 @@ class EntitySelectionBar(QDialog):
         super().__init__(parent)
         self.entity_type = 'Node'
         self.all_entity_ids = set()
-        self.selected_ids = set()       # union of all entry IDs (kept in sync)
-        self._excluded_ids = set()
+        self.selected_ids = set()       # computed from _entries (kept in sync)
         self.single_selection_mode = False
         self.select_by_data = {}
         self.groups = {}
         self._current_method = "ID"
-        self._entries = []  # [{"label": str, "ids": set}, ...]
+        # v3.3.0: each entry is a _RangeEntry with sign + (start,end,step).
+        self._entries = []  # type: list[_RangeEntry]
 
         self.setWindowTitle("Entity Selection")
         self.setWindowFlags(
@@ -59,10 +100,6 @@ class EntitySelectionBar(QDialog):
         )
         self.setModal(False)
 
-        # v3.2.4: tightened vertical padding so the dialog isn't taller
-        # than it needs to be. Previously buttons had min-height 24 +
-        # padding 3 + container spacing 4 = ~31px per row × ~6 rows of
-        # buttons / inputs adds up to a dialog that's mostly whitespace.
         self.setStyleSheet("""
             QLabel { font-size: 11px; }
             QLineEdit { padding: 1px 4px; min-height: 18px; font-size: 11px; }
@@ -75,9 +112,6 @@ class EntitySelectionBar(QDialog):
                           padding: 2px; }
         """)
 
-        # ============================================================
-        # Main 3-column horizontal layout
-        # ============================================================
         outer = QVBoxLayout(self)
         outer.setContentsMargins(5, 5, 5, 5)
         outer.setSpacing(2)
@@ -90,11 +124,11 @@ class EntitySelectionBar(QDialog):
         body = QHBoxLayout()
         body.setSpacing(4)
 
-        # ── LEFT COLUMN ──────────────────────────────────────────
+        # ----- LEFT COLUMN -----
         left = QVBoxLayout()
         left.setSpacing(2)
 
-        # Row 1: Action mode radios
+        # Action mode radios
         radio_row = QHBoxLayout()
         radio_row.setSpacing(6)
         self._action_group = QButtonGroup(self)
@@ -110,7 +144,7 @@ class EntitySelectionBar(QDialog):
         radio_row.addStretch()
         left.addLayout(radio_row)
 
-        # Row 2: Method-dependent input (QStackedWidget)
+        # Method-dependent input (QStackedWidget)
         self._method_stack = QStackedWidget()
 
         # Page 0: ID / to / by
@@ -155,7 +189,7 @@ class EntitySelectionBar(QDialog):
 
         left.addWidget(self._method_stack)
 
-        # Row 3: Group combo
+        # Group combo
         grp_row = QHBoxLayout()
         grp_row.setSpacing(4)
         self._group_label = QLabel("Group")
@@ -170,102 +204,81 @@ class EntitySelectionBar(QDialog):
 
         body.addLayout(left, 0)
 
-        # ── CENTER: Entries list (QListWidget) ───────────────────
+        # ----- CENTER: bucket list -----
         self._list_widget = QListWidget()
         self._list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._list_widget.setMinimumWidth(140)
-        self._list_widget.setMinimumHeight(70)
+        self._list_widget.setMinimumWidth(160)
+        self._list_widget.setMinimumHeight(110)
         body.addWidget(self._list_widget, 1)
 
-        # ── RIGHT COLUMN: 3×3 button grid ────────────────────────
+        # ----- RIGHT COLUMN: 3x3 button grid (v3.3.0) -----
+        # Row 0: Select All  | Select Visible | Reset
+        # Row 1: More        | Previous       | Delete
+        # Row 2: Pick v      | Method v       | Grow v
         grid = QGridLayout()
         grid.setSpacing(3)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 1)
 
-        # Row 0: Select All | Reset | [Pick][H]
+        # Row 0
         self._all_btn = QPushButton("Select All")
-        self._all_btn.setToolTip("Select all entities")
+        self._all_btn.setToolTip("Select all entities (one entry).")
         grid.addWidget(self._all_btn, 0, 0)
 
-        self._reset_btn = QPushButton("Reset")
-        self._reset_btn.setToolTip("Clear entire selection")
-        grid.addWidget(self._reset_btn, 0, 1)
+        self._visible_btn = QPushButton("Select Visible")
+        self._visible_btn.setToolTip(
+            "Select every entity currently visible in the viewport "
+            "(respects tree on/off state).")
+        grid.addWidget(self._visible_btn, 0, 1)
 
-        pick_h_row = QHBoxLayout()
-        pick_h_row.setSpacing(2)
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setToolTip("Clear entire bucket.")
+        grid.addWidget(self._reset_btn, 0, 2)
+
+        # Row 1
+        self._more_btn = QPushButton("More")
+        self._more_btn.setToolTip(
+            "Apply the current ID/To/By input as a new bucket row.")
+        grid.addWidget(self._more_btn, 1, 0)
+
+        self._prev_btn = QPushButton("Previous")
+        self._prev_btn.setToolTip("Restore previous selection.")
+        grid.addWidget(self._prev_btn, 1, 1)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setToolTip(
+            "Remove the highlighted bucket row(s) - undoes those picks.")
+        grid.addWidget(self._delete_btn, 1, 2)
+
+        # Row 2
         self._pick_btn = QToolButton()
-        self._pick_btn.setText("Pick")
-        self._pick_btn.setToolTip("Pick entities from viewport; arrow for pick modes")
+        self._pick_btn.setText("Pick ▾")
+        self._pick_btn.setToolTip(
+            "Pick entities from viewport; dropdown for pick mode "
+            "(Box/Circle/Polygon).")
         self._pick_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self._pick_btn.setPopupMode(QToolButton.MenuButtonPopup)
         self._pick_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._pick_menu = QMenu(self)
         self._build_pick_menu()
         self._pick_btn.setMenu(self._pick_menu)
-        pick_h_row.addWidget(self._pick_btn)
-
-        self._highlight_btn = QToolButton()
-        self._highlight_btn.setText("H")
-        self._highlight_btn.setToolTip("Toggle highlighting in viewport")
-        self._highlight_btn.setCheckable(True)
-        self._highlight_btn.setChecked(True)
-        # v3.2.7: drop the fixed 26x26 size - the grid cell now
-        # sizes it to match the other buttons. Amber only when
-        # checked so it blends with the rest in default state.
-        self._highlight_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
-        self._highlight_btn.setText("Hilite")
-        self._highlight_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._highlight_btn.setStyleSheet(
-            "QToolButton:checked { font-weight: bold; background: #f9e2af; "
-            "color: #1e1e2e; border: 1px solid #cba651; border-radius: 3px; }")
-        # v3.2.7: Hilite leaves pick_h_row and gets its own cell
-        # at (2, 1) so it sits next to Delete in row 2.
-        grid.addLayout(pick_h_row, 1, 0)
-        grid.addWidget(self._highlight_btn, 2, 1)
-
-        # Row 1: Previous | Delete | OK
-        self._prev_btn = QPushButton("Previous")
-        self._prev_btn.setToolTip("Restore previous selection")
-        grid.addWidget(self._prev_btn, 0, 2)
-
-        self._delete_btn = QPushButton("Delete")
-        self._delete_btn.setToolTip("Remove highlighted entries from the list")
-        grid.addWidget(self._delete_btn, 2, 0)
-
-        # v3.2.7: OK button moves to the dialog's bottom row. The
-        # row-1 col-2 cell is now the More button (it was already
-        # row-2 col-0; we move it here so the grid stays 3x3 with
-        # no holes in the action area).
-        self._ok_btn = QPushButton("OK")
-        self._ok_btn.setStyleSheet("font-weight: bold;")
-
-        # Row 2: More | Method▾ | Cancel
-        self._more_btn = QPushButton("More")
-        self._more_btn.setToolTip("Apply current input and clear for more entries")
-        grid.addWidget(self._more_btn, 1, 2)
+        grid.addWidget(self._pick_btn, 2, 0)
 
         self._method_btn = QToolButton()
-        self._method_btn.setText("Method \u25b4")
-        self._method_btn.setToolTip("Choose selection method")
+        self._method_btn.setText("Method ▾")
+        self._method_btn.setToolTip("Choose selection method.")
         self._method_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self._method_btn.setPopupMode(QToolButton.InstantPopup)
         self._method_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._method_menu = QMenu(self)
         self._method_btn.setMenu(self._method_menu)
-        grid.addWidget(self._method_btn, 1, 1)
+        grid.addWidget(self._method_btn, 2, 1)
 
-        # v3.2.7: Cancel button moves to the dialog's bottom row
-        # (below the count label + divider) along with OK. The
-        # row-2 col-2 cell is now the Grow submenu button.
-        self._cancel_btn = QPushButton("Cancel")
-
-        # Grow submenu (v3.2.7): replaces the inline advanced row.
-        # Same handlers as the (now-hidden) inline buttons, but
-        # tucked behind a single dropdown that fills the empty
-        # row-2 col-2 slot of the action grid.
         self._grow_menu_btn = QToolButton()
-        self._grow_menu_btn.setText("Grow \u25be")
+        self._grow_menu_btn.setText("Grow ▾")
         self._grow_menu_btn.setToolTip(
-            "Adjacent / Connected / Grow / Shrink ; angle threshold")
+            "Adjacent / Connected / Grow / Shrink ; angle threshold.")
         self._grow_menu_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
         self._grow_menu_btn.setPopupMode(QToolButton.InstantPopup)
         self._grow_menu_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -284,13 +297,13 @@ class EntitySelectionBar(QDialog):
 
         outer.addLayout(body)
 
-        # ── Count label + advanced frame (below the 3-column body) ──
+        # Count label
         self._count_label = QLabel("Count: 0 / 0")
         self._count_label.setStyleSheet("font-weight: bold; font-size: 11px;")
-        self._count_label.setToolTip("Selected / Total entities")
+        self._count_label.setToolTip("Final selected / Total entities")
         outer.addWidget(self._count_label)
 
-        # Advanced selection (Elements only, hidden by default)
+        # Hidden adv frame (kept for back-compat with handlers, never shown)
         self._adv_frame = QFrame()
         adv_lay = QHBoxLayout(self._adv_frame)
         adv_lay.setContentsMargins(0, 0, 0, 0)
@@ -299,7 +312,7 @@ class EntitySelectionBar(QDialog):
         self._angle_input = QLineEdit("30")
         self._angle_input.setMaximumWidth(35)
         adv_lay.addWidget(self._angle_input)
-        adv_lay.addWidget(QLabel("\u00b0"))
+        adv_lay.addWidget(QLabel("°"))
         self._adj_btn = QPushButton("Adj")
         self._conn_btn = QPushButton("Conn")
         self._grow_btn = QPushButton("Grow")
@@ -308,47 +321,58 @@ class EntitySelectionBar(QDialog):
             btn.setMaximumWidth(52)
             adv_lay.addWidget(btn)
         adv_lay.addStretch()
-        # v3.2.7: the inline advanced row is replaced by the
-        # Grow submenu in the action grid above. We KEEP the
-        # button objects so their .clicked signal connections
-        # at lines below still resolve, but the frame itself is
-        # never shown.
         self._adv_frame.hide()
         self._adv_frame.setVisible(False)
-        # Do NOT add _adv_frame to outer (would leave dead space).
 
-        # v3.2.7: separator + bottom-right OK / Cancel row.
+        # Separator + bottom row: Hilite + OK / Cancel (v3.3.0)
         _sep = QFrame()
         _sep.setFrameShape(QFrame.HLine)
         _sep.setFrameShadow(QFrame.Sunken)
         outer.addWidget(_sep)
+
         _bottom = QHBoxLayout()
         _bottom.setSpacing(3)
         _bottom.addStretch(1)
+
+        self._highlight_btn = QToolButton()
+        self._highlight_btn.setText("Hilite")
+        self._highlight_btn.setToolTip("Toggle highlighting in viewport.")
+        self._highlight_btn.setCheckable(True)
+        self._highlight_btn.setChecked(True)
+        self._highlight_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._highlight_btn.setMinimumWidth(70)
+        self._highlight_btn.setStyleSheet(
+            "QToolButton:checked { font-weight: bold; background: #f9e2af; "
+            "color: #1e1e2e; border: 1px solid #cba651; border-radius: 3px; }")
+        _bottom.addWidget(self._highlight_btn)
+
+        self._ok_btn = QPushButton("OK")
+        self._ok_btn.setStyleSheet("font-weight: bold;")
         self._ok_btn.setMinimumWidth(80)
-        self._cancel_btn.setMinimumWidth(80)
         _bottom.addWidget(self._ok_btn)
+
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setMinimumWidth(80)
         _bottom.addWidget(self._cancel_btn)
+
         outer.addLayout(_bottom)
 
         # === Connect internal signals ===
         self._pick_btn.clicked.connect(self._activate_picking)
-
         self._more_btn.clicked.connect(self._on_more_clicked)
         self._prev_btn.clicked.connect(self._request_previous)
-
         self._all_btn.clicked.connect(self._select_all)
+        self._visible_btn.clicked.connect(self._select_visible)
         self._reset_btn.clicked.connect(self._clear_all)
         self._delete_btn.clicked.connect(self._delete_selected_entries)
-
         self._highlight_btn.toggled.connect(self._on_highlight_toggled)
 
-        # ID field Enter → More
+        # ID field Enter -> More
         self._id_input.returnPressed.connect(self._on_more_clicked)
         self._to_input.returnPressed.connect(self._on_more_clicked)
         self._by_input.returnPressed.connect(self._on_more_clicked)
 
-        # Advanced selection
+        # Advanced selection (legacy hidden buttons)
         self._adj_btn.clicked.connect(self._request_select_adjacent)
         self._conn_btn.clicked.connect(self._request_select_connected)
         self._grow_btn.clicked.connect(self._request_grow)
@@ -433,7 +457,6 @@ class EntitySelectionBar(QDialog):
         self._method_action_group = QActionGroup(self)
         self._method_action_group.setExclusive(True)
 
-        # ID (always present, default)
         id_act = menu.addAction("ID")
         id_act.setCheckable(True)
         id_act.setChecked(True)
@@ -466,7 +489,6 @@ class EntitySelectionBar(QDialog):
         self.entity_type = entity_type
         self.all_entity_ids = set(all_entity_ids)
         self.selected_ids = set()
-        self._excluded_ids = set()
         self._entries = []
         self.single_selection_mode = single_selection_mode
         self.select_by_data = select_by_data or {}
@@ -481,7 +503,7 @@ class EntitySelectionBar(QDialog):
 
         # Rebuild Method menu
         self._build_method_menu()
-        self._method_btn.setText("Method \u25b4")
+        self._method_btn.setText("Method ▾")
         self._method_stack.setCurrentIndex(0)
 
         # Rebuild Group combo - always visible, shows "GID: Name"
@@ -495,20 +517,12 @@ class EntitySelectionBar(QDialog):
         self._group_combo.setCurrentIndex(0)
         self._group_combo.blockSignals(False)
 
-        # Show/hide advanced selection frame (Elements only)
-        # v3.2.7: adv frame stays hidden; the Grow submenu is the path.
+        # Adv frame stays hidden; Grow submenu is the path.
         self._adv_frame.setVisible(False)
 
-        # Clear inputs
         self._clear_inputs()
-
-        # Clear list
         self._list_widget.clear()
-
-        # Reset highlight toggle to ON
         self._highlight_btn.setChecked(True)
-
-        # Update count
         self._update_count()
 
         # Position near the bottom-right of the parent window
@@ -532,45 +546,36 @@ class EntitySelectionBar(QDialog):
             return 'exclude'
         return 'add'
 
+    def _mode_char(self):
+        """Action mode as the single-char prefix used by entries."""
+        m = self.get_action_mode()
+        return {'add': '+', 'remove': '-', 'exclude': 'x'}[m]
+
     # ------------------------------------------------------------------
     # Method switching
     # ------------------------------------------------------------------
 
     def _on_method_changed(self, text):
-        """Switch the input area based on the selected method."""
         self._current_method = text
         if text == "ID":
             self._method_stack.setCurrentIndex(0)
-            self._method_btn.setText("Method \u25b4")
         elif text in self.select_by_data:
             self._method_stack.setCurrentIndex(1)
             self._update_value_combo(text)
-            self._method_btn.setText(f"Method \u25b4")
         else:
             self._method_stack.setCurrentIndex(2)
-            self._method_btn.setText(f"Method \u25b4")
+        self._method_btn.setText("Method ▾")
 
     def _update_value_combo(self, method_text):
-        """Populate the value combo from select_by_data.
-
-        v3.2.4: 'By Quality' is a deferred-compute placeholder (the
-        sentinel '__deferred_quality__'). When the user picks it,
-        MainWindow's _compute_quality_select_data() runs the slow
-        calc on demand and returns the real category dict.
-        """
+        """Populate the value combo from select_by_data."""
         self._value_combo.clear()
         data = self.select_by_data.get(method_text)
         if data == '__deferred_quality__':
-            # Resolve the deferred compute via a callback on the parent
-            # MainWindow. We do this so the bar itself stays free of
-            # quality knowledge.
             parent = self.parent()
             resolver = getattr(parent, '_compute_quality_select_data', None)
             if callable(resolver):
                 try:
                     data = resolver()
-                    # Cache the resolved dict so we don't recompute
-                    # next time the user picks the method.
                     self.select_by_data[method_text] = data
                 except Exception:
                     data = {}
@@ -583,224 +588,213 @@ class EntitySelectionBar(QDialog):
                 self._value_combo.addItem(f"{key} ({count} elems)", key)
 
     # ------------------------------------------------------------------
-    # Entry helpers
+    # Bucket entry helpers
     # ------------------------------------------------------------------
 
-    def _make_label(self, sorted_ids):
-        """Create a compact label for a set of IDs."""
-        ranges = self.compress_ids_to_ranges(sorted_ids)
-        return ', '.join(ranges)
+    def _append_entry(self, mode_char, start, end, step):
+        """Append a new _RangeEntry to the bucket and refresh the UI.
 
-    def _add_entry(self, ids, label=None):
-        """Add a new entry to the entries list."""
+        ``mode_char`` is '+', '-', or 'x'. The entry's expanded ID set
+        is intersected against ``self.all_entity_ids`` so dangling IDs
+        never leak into the final selection.
+        """
+        entry = _RangeEntry(mode_char, start, end, step,
+                            all_entity_ids=self.all_entity_ids)
+        if not entry.ids:
+            return  # nothing to add
+        self._entries.append(entry)
+        self._refresh_list()
+        self._show_selection()
+
+    def _append_id_set(self, mode_char, ids):
+        """Decompose an arbitrary id set into contiguous ranges and
+        append one entry per range. Used by Pick / Select All / Select
+        Visible / Paste."""
         if not ids:
             return
-        if label is None:
-            label = self._make_label(sorted(ids))
-        self._entries.append({"label": label, "ids": set(ids)})
-
-    def _recompute_selected_ids(self):
-        """Rebuild selected_ids as union of all entry IDs."""
-        self.selected_ids = set()
-        for entry in self._entries:
-            self.selected_ids.update(entry["ids"])
-
-    def _remove_ids_from_entries(self, ids_to_remove):
-        """Remove IDs from all entries and prune empties."""
-        remove_set = set(ids_to_remove)
-        for entry in self._entries:
-            entry["ids"] -= remove_set
-        self._entries = [e for e in self._entries if e["ids"]]
+        valid = sorted(int(i) for i in self.all_entity_ids.intersection(ids))
+        if not valid:
+            return
+        if self.single_selection_mode and mode_char == '+':
+            # Keep only the first id, replace bucket.
+            self._entries.clear()
+            valid = [valid[0]]
+        for start, end, step in self.compress_ids_to_range_tuples(valid):
+            entry = _RangeEntry(mode_char, start, end, step,
+                                all_entity_ids=self.all_entity_ids)
+            if entry.ids:
+                self._entries.append(entry)
+        self._refresh_list()
+        self._show_selection()
+        if self.single_selection_mode and self.selected_ids:
+            self.accepted.emit()
 
     # ------------------------------------------------------------------
     # Input collection & application
     # ------------------------------------------------------------------
 
-    def _collect_current_input(self):
-        """Read current Method + inputs and return a set of IDs."""
-        ids = set()
-
-        # Check group dropdown first (currentData stores the real name)
+    def _collect_current_input_range(self):
+        """Read current Method + inputs and return either a
+        ``(start, end, step)`` tuple OR a set of IDs (for value-based
+        methods / groups). Returns None on empty / invalid input.
+        """
+        # Group dropdown wins if active
         group_name = self._group_combo.currentData()
         if group_name and group_name in self.groups:
             group = self.groups[group_name]
             if self.entity_type == 'Node':
-                ids.update(group.get("nodes", []))
+                return set(group.get("nodes", []))
             elif self.entity_type == 'Element':
-                ids.update(group.get("elements", []))
-            return ids
+                return set(group.get("elements", []))
+            return None
 
         method = self._current_method
-
-        if method == "ID":
-            id_text = self._id_input.text().strip()
-            to_text = self._to_input.text().strip()
-            by_text = self._by_input.text().strip()
-
-            if not id_text:
-                return ids
-
-            try:
-                id_val = int(id_text)
-            except ValueError:
-                return ids
-
-            if to_text:
-                try:
-                    to_val = int(to_text)
-                except ValueError:
-                    return ids
-
-                by_val = 1
-                if by_text:
-                    try:
-                        by_val = int(by_text)
-                        if by_val <= 0:
-                            by_val = 1
-                    except ValueError:
-                        by_val = 1
-
-                start, end = min(id_val, to_val), max(id_val, to_val)
-                ids = set(range(start, end + 1, by_val))
-            else:
-                ids = {id_val}
-        else:
-            # Value-based selection (Property, Material, Type, Quality)
+        if method != "ID":
             value = self._value_combo.currentData()
             if method in self.select_by_data and value in self.select_by_data[method]:
-                ids = set(self.select_by_data[method][value])
+                return set(self.select_by_data[method][value])
+            return None
 
-        return ids
-
-    def _apply_ids(self, ids):
-        """Apply collected IDs respecting the current Add/Remove/Exclude mode."""
-        if not ids:
-            return
-
-        valid_ids = self.all_entity_ids.intersection(ids)
-        if not valid_ids:
-            return
-
-        mode = self.get_action_mode()
-        if mode == 'remove':
-            self._remove_ids_from_entries(valid_ids)
-        elif mode == 'exclude':
-            self._excluded_ids.update(valid_ids)
-        else:  # add
-            if self.single_selection_mode:
-                self._entries.clear()
-                valid_ids = {next(iter(valid_ids))}
-            self._add_entry(valid_ids)
-
-        self._refresh_list()
-        self._show_selection()
-
-        if self.single_selection_mode and self.selected_ids:
-            self.accepted.emit()
+        id_text = self._id_input.text().strip()
+        to_text = self._to_input.text().strip()
+        by_text = self._by_input.text().strip()
+        if not id_text:
+            return None
+        try:
+            id_val = int(id_text)
+        except ValueError:
+            return None
+        if to_text:
+            try:
+                to_val = int(to_text)
+            except ValueError:
+                return None
+            by_val = 1
+            if by_text:
+                try:
+                    by_val = max(1, int(by_text))
+                except ValueError:
+                    by_val = 1
+            start, end = min(id_val, to_val), max(id_val, to_val)
+            return (start, end, by_val)
+        return (id_val, id_val, 1)
 
     def _on_more_clicked(self):
-        """Apply current input and clear fields for more entries."""
-        ids = self._collect_current_input()
-        self._apply_ids(ids)
+        """Apply current input as a new bucket row (with the mode sign)."""
+        result = self._collect_current_input_range()
+        if result is None:
+            return
+        mode = self._mode_char()
+        if isinstance(result, tuple):
+            start, end, step = result
+            self._append_entry(mode, start, end, step)
+        else:
+            self._append_id_set(mode, result)
         self._clear_inputs()
 
     def _clear_inputs(self):
-        """Clear all input fields."""
         self._id_input.clear()
         self._to_input.clear()
         self._by_input.clear()
         self._group_combo.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
-    # Selection manipulation (called by interactor / external code)
+    # External selection-manipulation hooks (interactor / parent)
     # ------------------------------------------------------------------
 
     def add_selection(self, ids_to_add):
-        """Add IDs to the current selection as a new entry."""
-        if self.single_selection_mode:
-            self._entries.clear()
-            if ids_to_add:
-                ids_to_add = {list(ids_to_add)[0]}
-
-        valid_ids = self.all_entity_ids.intersection(set(ids_to_add))
-        if valid_ids:
-            self._add_entry(valid_ids)
-        self._refresh_list()
-        self._show_selection()
-        if self.single_selection_mode and self.selected_ids:
-            self.accepted.emit()
+        """Bulk-add IDs as one or more add-entries (signed '+')."""
+        self._append_id_set('+', set(ids_to_add))
 
     def remove_selection(self, ids_to_remove):
-        """Remove IDs from all entries."""
-        self._remove_ids_from_entries(ids_to_remove)
-        self._refresh_list()
-        self._show_selection()
+        """Bulk-remove IDs as one or more remove-entries (signed '-')."""
+        self._append_id_set('-', set(ids_to_remove))
 
     def replace_selection(self, new_ids):
-        """Replace entire selection with new IDs as a single entry."""
+        """Clear bucket then add given IDs as one or more add-entries."""
         self._entries.clear()
-        valid = self.all_entity_ids.intersection(set(new_ids))
-        if valid:
-            self._add_entry(valid)
-        self._refresh_list()
-        self._show_selection()
+        self._append_id_set('+', set(new_ids))
 
     def toggle_selection(self, id_to_toggle):
-        """Toggle a single ID in/out of selection."""
+        """Pick-mode hook for a single-click. Mode comes from the radio:
+        Add appends a '+', Remove appends a '-', Exclude appends 'x'.
+
+        Toggle semantics: if Add mode and the id is already in the
+        selection, the click is treated as a Remove (so users can pick
+        in Add mode and click again to undo). For Remove/Exclude, the
+        click always appends an entry of that mode.
+        """
         if self.single_selection_mode:
             self._entries.clear()
             if id_to_toggle in self.all_entity_ids:
-                self._add_entry({id_to_toggle})
-            self._refresh_list()
-            self._show_selection()
-            if self.selected_ids:
-                self.accepted.emit()
+                self._append_entry('+', id_to_toggle, id_to_toggle, 1)
             return
 
-        if id_to_toggle in self.selected_ids:
-            # Remove from whichever entries contain it
-            self._remove_ids_from_entries({id_to_toggle})
-        elif id_to_toggle in self.all_entity_ids:
-            self._add_entry({id_to_toggle})
-        self._refresh_list()
-        self._show_selection()
+        mode = self._mode_char()
+        if mode == '+':
+            if id_to_toggle in self.selected_ids:
+                # Convenience toggle: clicking a selected id in Add
+                # mode removes it.
+                mode = '-'
+        if id_to_toggle in self.all_entity_ids:
+            self._append_entry(mode, id_to_toggle, id_to_toggle, 1)
 
     def get_selected_ids(self):
-        """Return final selection (union of all entries minus excluded)."""
-        return sorted(list(self.selected_ids - self._excluded_ids))
+        """Compute final selection by walking the bucket in order.
+
+        + entries union their IDs into the result; - and x entries
+        subtract. Order matters: an 'add 1..10' then 'remove 8' yields
+        {1..7, 9, 10}. The same two entries in opposite order would
+        yield {1..10} (the remove subtracts from an empty result, then
+        the add unions in everything).
+        """
+        result = set()
+        for entry in self._entries:
+            ids = entry.ids
+            if entry.mode == '+':
+                result |= ids
+            else:
+                result -= ids
+        return sorted(result)
 
     # ------------------------------------------------------------------
     # Utility actions
     # ------------------------------------------------------------------
 
     def _select_all(self):
-        """Add an 'All' entry containing every entity."""
-        all_ids = self.all_entity_ids.copy()
-        self._add_entry(all_ids, label=f"All ({len(all_ids)})")
-        self._refresh_list()
-        self._show_selection()
+        """Add an add-entry containing every entity (compressed range)."""
+        self._append_id_set('+', set(self.all_entity_ids))
 
-    def _invert_selection(self):
-        """Replace all entries with a single inverted entry."""
-        current = set()
-        for entry in self._entries:
-            current.update(entry["ids"])
-        inverted = self.all_entity_ids - current
-        self._entries.clear()
-        if inverted:
-            self._add_entry(inverted, label=f"Inverted ({len(inverted)})")
-        self._refresh_list()
-        self._show_selection()
+    def _select_visible(self):
+        """v3.3.0: add an entry containing every currently-visible entity.
+
+        'Visible' = the parent MainWindow's tree-checked filter. We
+        request the visible-id set from the parent via the
+        ``visible_entity_ids(entity_type)`` callback. Falls back to
+        select-all if the parent doesn't expose that helper.
+        """
+        parent = self.parent()
+        resolver = getattr(parent, 'visible_entity_ids', None)
+        if callable(resolver):
+            try:
+                vis = resolver(self.entity_type)
+            except Exception:
+                vis = None
+        else:
+            vis = None
+        if not vis:
+            # Conservative fallback: every entity is "visible".
+            vis = set(self.all_entity_ids)
+        self._append_id_set(self._mode_char(), set(vis))
 
     def _clear_all(self):
-        """Remove all entries (Reset)."""
+        """Empty the bucket (Reset)."""
         self._entries.clear()
-        self._excluded_ids.clear()
         self._refresh_list()
         self.request_show_selection.emit(self.entity_type, [])
 
     def _delete_selected_entries(self):
-        """Remove entries that are highlighted in the list widget."""
+        """Remove highlighted bucket rows from _entries."""
         rows = sorted(
             {idx.row() for idx in self._list_widget.selectedIndexes()},
             reverse=True)
@@ -817,18 +811,10 @@ class EntitySelectionBar(QDialog):
                 self.entity_type, self.get_selected_ids())
 
     def _on_highlight_toggled(self, checked):
-        """Toggle highlighting of selected entities in the viewport.
-
-        v3.2.4: also update the count label so the user sees feedback
-        when nothing's selected yet. Before, clicking H with no
-        entries added produced no visible change anywhere; users
-        thought the button was broken.
-        """
         if checked:
             ids = self.get_selected_ids()
             self.request_show_selection.emit(self.entity_type, ids)
             if not ids:
-                # No entries yet - tell the user nothing to highlight.
                 self._count_label.setText(
                     f"Count: 0 / {len(self.all_entity_ids):,}  "
                     f"(nothing selected to highlight yet)")
@@ -853,9 +839,6 @@ class EntitySelectionBar(QDialog):
     # ------------------------------------------------------------------
 
     def _prompt_angle_threshold(self):
-        """v3.2.7: prompt for the dihedral-angle threshold used by
-        Adjacent/Grow operations. Updates the (hidden) _angle_input
-        widget so the existing handlers continue to read from it."""
         from PySide6.QtWidgets import QInputDialog
         try:
             current = float(self._angle_input.text())
@@ -893,69 +876,67 @@ class EntitySelectionBar(QDialog):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def compress_ids_to_range_tuples(sorted_ids):
+        """Compress a sorted iterable of ints into list of (start, end, step)
+        tuples. Single IDs are returned as (id, id, 1)."""
+        ids = list(sorted_ids)
+        if not ids:
+            return []
+        out = []
+        i = 0
+        n = len(ids)
+        while i < n:
+            start = ids[i]
+            if i + 1 >= n:
+                out.append((start, start, 1))
+                i += 1
+                continue
+            step = ids[i + 1] - start
+            if step <= 0:
+                out.append((start, start, 1))
+                i += 1
+                continue
+            j = i + 1
+            while j < n and ids[j] - ids[j - 1] == step:
+                j += 1
+            end = ids[j - 1]
+            out.append((start, end, step))
+            i = j
+        return out
+
+    @staticmethod
     def compress_ids_to_ranges(sorted_ids):
-        """Compress a sorted list of IDs into range strings.
+        """Back-compat: string form for clipboard / legacy callers.
 
         Returns a list of strings:
           "5"       - single ID
-          "1,5,1"   - consecutive IDs 1 through 5 (step 1)
-          "1,9,2"   - stepped IDs 1, 3, 5, 7, 9 (step 2)
+          "1,5,1"   - consecutive IDs 1..5 step 1
+          "1,9,2"   - stepped IDs 1, 3, 5, 7, 9
         """
-        if not sorted_ids:
-            return []
-
-        ranges = []
-        i = 0
-        n = len(sorted_ids)
-
-        while i < n:
-            start = sorted_ids[i]
-
-            if i + 1 >= n:
-                ranges.append(str(start))
-                i += 1
-                continue
-
-            step = sorted_ids[i + 1] - start
-            if step <= 0:
-                ranges.append(str(start))
-                i += 1
-                continue
-
-            # Find how far this arithmetic sequence extends
-            j = i + 1
-            while j < n and sorted_ids[j] - sorted_ids[j - 1] == step:
-                j += 1
-
-            end = sorted_ids[j - 1]
-            count = j - i
-
-            if count == 1:
-                ranges.append(str(start))
+        parts = []
+        for s, e, k in EntitySelectionBar.compress_ids_to_range_tuples(
+                sorted_ids):
+            if s == e:
+                parts.append(str(s))
             else:
-                ranges.append(f"{start},{end},{step}")
-
-            i = j
-
-        return ranges
+                parts.append(f"{s},{e},{k}")
+        return parts
 
     # ------------------------------------------------------------------
     # Clipboard operations
     # ------------------------------------------------------------------
 
     def _copy_selection_ranges(self):
-        """Copy selected IDs in compressed range format to clipboard."""
-        sorted_ids = sorted(self.selected_ids)
+        sorted_ids = self.get_selected_ids()
         ranges = self.compress_ids_to_ranges(sorted_ids)
         QApplication.clipboard().setText('\n'.join(ranges))
 
     def _copy_selection_list(self):
-        """Copy selected IDs as a comma-separated list to clipboard."""
-        sorted_ids = sorted(self.selected_ids)
-        QApplication.clipboard().setText(','.join(str(i) for i in sorted_ids))
+        sorted_ids = self.get_selected_ids()
+        QApplication.clipboard().setText(
+            ','.join(str(i) for i in sorted_ids))
 
     def _paste_selection(self):
-        """Parse IDs from clipboard text and add as a new entry."""
         text = QApplication.clipboard().text()
         if not text:
             return
@@ -964,23 +945,23 @@ class EntitySelectionBar(QDialog):
             token = token.strip()
             if not token:
                 continue
-            # Try range format: "start,end,step"
             parts = [p.strip() for p in token.split(',')]
             if len(parts) == 3:
                 try:
-                    start, end, step = int(parts[0]), int(parts[1]), int(parts[2])
+                    start, end, step = (int(parts[0]), int(parts[1]),
+                                        int(parts[2]))
                     if step > 0:
                         ids.update(range(start, end + 1, step))
                         continue
                 except ValueError:
                     pass
-            # Fall back to comma-separated individual IDs
             for p in parts:
                 try:
                     ids.add(int(p.strip()))
                 except ValueError:
                     pass
-        self._apply_ids(ids)
+        if ids:
+            self._append_id_set(self._mode_char(), ids)
 
     # ------------------------------------------------------------------
     # UI helpers
@@ -988,21 +969,20 @@ class EntitySelectionBar(QDialog):
 
     def _refresh_list(self):
         """Rebuild the list widget from entries and recompute selected_ids."""
-        self._list_widget.clear()
-        for entry in self._entries:
-            self._list_widget.addItem(entry["label"])
-        self._recompute_selected_ids()
+        self._list_widget.setUpdatesEnabled(False)
+        try:
+            self._list_widget.clear()
+            for entry in self._entries:
+                self._list_widget.addItem(entry.label)
+        finally:
+            self._list_widget.setUpdatesEnabled(True)
+        self.selected_ids = set(self.get_selected_ids())
         self._update_count()
 
     def _update_count(self):
         n_sel = len(self.selected_ids)
-        n_excl = len(self._excluded_ids)
         n_total = len(self.all_entity_ids)
-        if n_excl:
-            self._count_label.setText(
-                f"Count: {n_sel} / {n_total}  (-{n_excl} excl)")
-        else:
-            self._count_label.setText(f"Count: {n_sel} / {n_total}")
+        self._count_label.setText(f"Count: {n_sel} / {n_total}")
 
     def _on_ok(self):
         self.accept()
@@ -1039,24 +1019,20 @@ class EntitySelectionDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(6)
 
-        # Title
         title = QLabel(f"Select {entity_type}(s)")
         title.setStyleSheet("font-weight: bold; font-size: 12px;")
         main_layout.addWidget(title)
 
-        # Count
         self.count_label = QLabel("0 of 0 selected")
         self.count_label.setStyleSheet("font-size: 11px;")
         main_layout.addWidget(self.count_label)
 
-        # Selected list
         self.list_widget = QListWidget()
         if self.single_selection_mode:
             self.list_widget.setSelectionMode(QListWidget.SingleSelection)
         self.list_widget.setMaximumHeight(80)
         main_layout.addWidget(self.list_widget)
 
-        # Action buttons
         action_layout = QHBoxLayout()
         action_layout.setSpacing(2)
         select_all_button = QToolButton(); select_all_button.setText("All")
@@ -1069,7 +1045,6 @@ class EntitySelectionDialog(QDialog):
         action_layout.addStretch()
         main_layout.addLayout(action_layout)
 
-        # ID input row
         id_row = QHBoxLayout()
         id_row.addWidget(QLabel("ID:"))
         self.single_id_input = QLineEdit()
@@ -1094,7 +1069,6 @@ class EntitySelectionDialog(QDialog):
         id_row.addStretch()
         main_layout.addLayout(id_row)
 
-        # Paste list
         paste_row = QHBoxLayout()
         self.paste_edit = QTextEdit()
         self.paste_edit.setPlaceholderText("Paste IDs (comma/space/newline)")
@@ -1105,7 +1079,6 @@ class EntitySelectionDialog(QDialog):
         paste_row.addWidget(add_list_button)
         main_layout.addLayout(paste_row)
 
-        # Disable in single mode
         if self.single_selection_mode:
             select_all_button.setEnabled(False)
             invert_button.setEnabled(False)
@@ -1115,11 +1088,9 @@ class EntitySelectionDialog(QDialog):
             self.paste_edit.setEnabled(False)
             add_list_button.setEnabled(False)
 
-        # OK / Cancel
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         main_layout.addWidget(button_box)
 
-        # Connect
         select_all_button.clicked.connect(self._select_all)
         invert_button.clicked.connect(self._invert_selection)
         remove_button.clicked.connect(self._remove_selected)

@@ -223,7 +223,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.2.7"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.3.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -247,6 +247,11 @@ class MainWindow(QMainWindow):
         self.active_creation_dialog = None
         self.current_selection_type = None
         self.quality_results = None
+
+        # v3.3.0: element group counts cached by _update_viewer from
+        # the scene-build pass so _populate_tree doesn't re-iterate all
+        # elements to compute By-Type/By-Shape Counters.
+        self._cached_element_group_counts = {'by_type': {}, 'by_shape': {}}
 
         # --- Measurement tools state ---
         self._measurement_picks = []
@@ -6406,6 +6411,15 @@ class MainWindow(QMainWindow):
 
         nodes_used_by_elements = elem_arrays['nodes_used']
 
+        # v3.3.0: stash the tree-group counts the helper accumulated
+        # for us during its single pass over all elements. The tree
+        # population code reads these via self._cached_element_group_counts
+        # instead of running its own 1.2M-iteration Counter loop.
+        self._cached_element_group_counts = {
+            'by_type': dict(elem_arrays.get('by_type_counts') or {}),
+            'by_shape': dict(elem_arrays.get('by_shape_counts') or {}),
+        }
+
         # PLOTELs are rendered separately but their nodes should not appear as free nodes
         for eid, elem in model.plotels.items():
             try: nodes_used_by_elements.update(elem.nodes)
@@ -6622,6 +6636,19 @@ class MainWindow(QMainWindow):
 
 
     def _populate_tree(self):
+        """Populate the model tree.
+
+        v3.3.0: speed up by (a) reading element By-Type / By-Shape
+        counts from ``self._cached_element_group_counts`` (filled by
+        ``_update_viewer`` from the scene-build pass) instead of running
+        two more 600k-element Counter loops here, (b) wrapping the
+        whole build with ``setUpdatesEnabled(False)`` so Qt does one
+        layout pass at the end instead of one per insert, (c) building
+        QTreeWidgetItem lists then calling ``addChildren()`` once per
+        high-cardinality parent, (d) replacing ``expandAll()`` + collapse
+        with explicit per-group expand so the coord group never gets
+        the full layout treatment.
+        """
         try:
             self.tree_widget.itemChanged.disconnect(self._handle_tree_item_changed)
         except (RuntimeError, TypeError): pass
@@ -6630,29 +6657,46 @@ class MainWindow(QMainWindow):
         if not self.current_generator:
             self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
             return
-        
+
         model = self.current_generator.model
-        def create_item(parent, text, data=None, checked=True):
-            item = QTreeWidgetItem(parent, [text])
+
+        # v3.3.0: batch all the work between setUpdatesEnabled toggles.
+        self.tree_widget.setUpdatesEnabled(False)
+        try:
+            self._build_tree_contents(model)
+        finally:
+            self.tree_widget.setUpdatesEnabled(True)
+
+        self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+        self._populate_loads_tab()
+        self._populate_analysis_tab()
+
+    def _build_tree_contents(self, model):
+        """Actual tree-population body. Called with updates disabled."""
+        def _make_item(text, data=None, checked=True):
+            item = QTreeWidgetItem([text])
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            item.setCheckState(
+                0, QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
             item.setData(0, QtCore.Qt.UserRole, data)
             return item
-        
 
+        def add_top(text, data=None, checked=True):
+            item = _make_item(text, data, checked)
+            self.tree_widget.addTopLevelItem(item)
+            return item
+
+        # ---- Coordinate Systems (high cardinality - batch insert) ----
+        coords_top = None
         if model.coords:
-            # v3.2.2: Coordinate Systems group defaults to UNCHECKED
-            # and COLLAPSED. On big aerospace decks there are often
-            # dozens of CORD2R systems (one per superelement boundary,
-            # one per skin panel, etc.) and they clutter the tree on
-            # first open. The user can still expand and check
-            # individual systems if they want to see them.
-            coords_item = create_item(
-                self.tree_widget, "Coordinate Systems",
+            # Group defaults to UNCHECKED + COLLAPSED. Big aerospace
+            # decks have dozens of CORD2R systems and they clutter the
+            # tree on first open.
+            coords_top = add_top(
+                "Coordinate Systems",
                 data=('group', 'coords'), checked=False)
-            coords_item.setExpanded(False)
+            coord_children = []
             for cid in sorted(model.coords.keys()):
-
                 if cid == 0:
                     label = "Global Rectangular"
                 elif cid == 1:
@@ -6661,112 +6705,170 @@ class MainWindow(QMainWindow):
                     label = "Global Spherical"
                 else:
                     coord = model.coords[cid]
-                    type_map = {'CORD2R': 'Rectangular', 'CORD2C': 'Cylindrical', 'CORD2S': 'Spherical'}
+                    type_map = {'CORD2R': 'Rectangular',
+                                'CORD2C': 'Cylindrical',
+                                'CORD2S': 'Spherical'}
                     type_name = type_map.get(coord.type, coord.type)
-                    title = get_entity_title_from_comment(getattr(coord, 'comment', ''), "Coord", cid)
-                    if title != f"Coord {cid}":
-                        label = f"{type_name} - {title}"
-                    else:
-                        label = type_name
+                    title = get_entity_title_from_comment(
+                        getattr(coord, 'comment', ''), "Coord", cid)
+                    label = (f"{type_name} - {title}"
+                             if title != f"Coord {cid}" else type_name)
+                coord_children.append(_make_item(
+                    f"CID {cid}: {label}",
+                    data=('coord', cid), checked=False))
+            coords_top.addChildren(coord_children)
 
-                # Individual coord items also start UNCHECKED. The
-                # parent group is unchecked too so toggling the group
-                # back on lets the user pick which ones to show.
-                create_item(
-                    coords_item, f"CID {cid}: {label}",
-                    data=('coord', cid), checked=False)
-
+        # ---- Materials (batch insert) ----
         if model.materials:
-            mats_item = create_item(self.tree_widget, "Materials", data=('group', 'materials'))
-            for mid, m in sorted(model.materials.items()):
-                title = self._get_entity_title_from_comment(m.comment, "Material", mid)
-                create_item(mats_item, f"{mid}: {title}", data=('material', mid))
+            mats_item = add_top("Materials", data=('group', 'materials'))
+            mat_children = [
+                _make_item(
+                    f"{mid}: {self._get_entity_title_from_comment(m.comment, 'Material', mid)}",
+                    data=('material', mid))
+                for mid, m in sorted(model.materials.items())
+            ]
+            mats_item.addChildren(mat_children)
+            mats_item.setExpanded(True)
 
-        nodes_item = create_item(self.tree_widget, f"Nodes ({len(model.nodes)})", data=('group', 'nodes'))
+        # ---- Nodes header ----
+        nodes_item = add_top(
+            f"Nodes ({len(model.nodes)})", data=('group', 'nodes'))
+        nodes_item.setExpanded(True)
 
-        all_elements = {**model.elements, **model.rigid_elements}
-        if all_elements:
-            elems_item = create_item(self.tree_widget, f"Elements ({len(all_elements)})", data=('group', 'elements'))
-            type_item = create_item(elems_item, "By Type", data=('group', 'elem_by_type'))
-            shape_item = create_item(elems_item, "By Shape", data=('group', 'elem_by_shape'))
+        # ---- Elements (use cached counts) ----
+        all_elements_n = len(model.elements) + len(model.rigid_elements)
+        if all_elements_n:
+            elems_item = add_top(
+                f"Elements ({all_elements_n})", data=('group', 'elements'))
+            type_item = _make_item("By Type", data=('group', 'elem_by_type'))
+            shape_item = _make_item("By Shape", data=('group', 'elem_by_shape'))
+            elems_item.addChildren([type_item, shape_item])
 
-            by_type_map = {
-                'CBEAM': 'Beams', 'CBAR': 'Bars', 'CROD': 'Rods',
-                'CBUSH': 'Bushes',
-                'CQUAD4': 'Plates', 'CMEMBRAN': 'Plates', 'CTRIA3': 'Plates',
-                'RBE2': 'Rigid', 'RBE3': 'Rigid',
-                'CHEXA': 'Solids', 'CHEXA8': 'Solids', 'CHEXA20': 'Solids',
-                'CTETRA': 'Solids', 'CTETRA4': 'Solids', 'CTETRA10': 'Solids',
-                'CPENTA': 'Solids', 'CPENTA6': 'Solids', 'CPENTA15': 'Solids',
-                'CSHEAR': 'Shear', 'CGAP': 'Gap',
-            }
-            by_type_counts = Counter(by_type_map.get(e.type, 'Other') for e in all_elements.values())
-            for type_name, count in sorted(by_type_counts.items()):
-                create_item(type_item, f"{type_name} ({count})", data=('elem_by_type_group', type_name))
+            counts = getattr(self, '_cached_element_group_counts', None) or {}
+            by_type_counts = counts.get('by_type') or {}
+            by_shape_counts = counts.get('by_shape') or {}
+            type_children = [
+                _make_item(f"{name} ({count})",
+                           data=('elem_by_type_group', name))
+                for name, count in sorted(by_type_counts.items())
+            ]
+            if type_children:
+                type_item.addChildren(type_children)
+            shape_children = [
+                _make_item(f"{shape} ({count})",
+                           data=('elem_shape_group', shape))
+                for shape, count in sorted(by_shape_counts.items())
+            ]
+            if shape_children:
+                shape_item.addChildren(shape_children)
+            elems_item.setExpanded(True)
+            type_item.setExpanded(True)
+            shape_item.setExpanded(True)
 
-            shape_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'], 'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'], 'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'], 'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'] }
-            type_to_shape = {elem_type: shape for shape, types in shape_map.items() for elem_type in types}
-            shape_counts = Counter(type_to_shape.get(e.type, 'Other') for e in all_elements.values())
-            for shape, count in sorted(shape_counts.items()):
-                create_item(shape_item, f"{shape} ({count})", data=('elem_shape_group', shape))
-
+        # ---- Masses (batch insert) ----
         if model.masses:
-            masses_item = create_item(self.tree_widget, f"Masses ({len(model.masses)})", data=('group', 'masses'))
-            for eid, mass_elem in sorted(model.masses.items()):
-                create_item(masses_item, f"CONM2 {eid}: Node {mass_elem.nid}, M={mass_elem.mass}", data=('mass', eid))
+            masses_item = add_top(
+                f"Masses ({len(model.masses)})", data=('group', 'masses'))
+            mass_children = [
+                _make_item(
+                    f"CONM2 {eid}: Node {mass_elem.nid}, M={mass_elem.mass}",
+                    data=('mass', eid))
+                for eid, mass_elem in sorted(model.masses.items())
+            ]
+            masses_item.addChildren(mass_children)
+            masses_item.setExpanded(True)
 
+        # ---- Plot Elements (batch insert) ----
         if model.plotels:
-            plotels_item = create_item(self.tree_widget, f"Plot Elements ({len(model.plotels)})", data=('group', 'plotels'))
-            for eid, elem in sorted(model.plotels.items()):
-                create_item(plotels_item, f"PLOTEL {eid}: Nodes {elem.nodes[0]}-{elem.nodes[1]}", data=('plotel', eid))
+            plotels_item = add_top(
+                f"Plot Elements ({len(model.plotels)})",
+                data=('group', 'plotels'))
+            plotel_children = [
+                _make_item(
+                    f"PLOTEL {eid}: Nodes {elem.nodes[0]}-{elem.nodes[1]}",
+                    data=('plotel', eid))
+                for eid, elem in sorted(model.plotels.items())
+            ]
+            plotels_item.addChildren(plotel_children)
+            plotels_item.setExpanded(True)
 
+        # ---- Properties (batch insert) ----
         if model.properties:
-            props_item = create_item(self.tree_widget, "Properties", data=('group', 'properties'))
-            for pid, p in sorted(model.properties.items()):
-                title = self._get_entity_title_from_comment(p.comment, p.type, pid)
-                create_item(props_item, f"{pid}: {title}", data=('property', pid))
-        
-        
+            props_item = add_top("Properties", data=('group', 'properties'))
+            prop_children = [
+                _make_item(
+                    f"{pid}: {self._get_entity_title_from_comment(p.comment, p.type, pid)}",
+                    data=('property', pid))
+                for pid, p in sorted(model.properties.items())
+            ]
+            props_item.addChildren(prop_children)
+            props_item.setExpanded(True)
 
-        # --- Geometry tree section ---
+        # ---- Geometry tree section ----
         if not self.geometry_store.is_empty:
-            geom_item = create_item(self.tree_widget, "Geometry", data=('group', 'geometry'))
+            geom_item = add_top("Geometry", data=('group', 'geometry'))
+            geom_subitems = []
             if self.geometry_store.points:
-                pts_item = create_item(geom_item, f"Points ({len(self.geometry_store.points)})", data=('geom_group', 'points'))
-                for pid, pt in sorted(self.geometry_store.points.items()):
-                    label = f"P{pid}: ({pt.xyz[0]:.4g}, {pt.xyz[1]:.4g}, {pt.xyz[2]:.4g})"
-                    create_item(pts_item, label, data=('geom_point', pid))
+                pts_item = _make_item(
+                    f"Points ({len(self.geometry_store.points)})",
+                    data=('geom_group', 'points'))
+                pt_children = [
+                    _make_item(
+                        f"P{pid}: ({pt.xyz[0]:.4g}, "
+                        f"{pt.xyz[1]:.4g}, {pt.xyz[2]:.4g})",
+                        data=('geom_point', pid))
+                    for pid, pt in sorted(self.geometry_store.points.items())
+                ]
+                pts_item.addChildren(pt_children)
+                geom_subitems.append(pts_item)
             all_curves = self.geometry_store.all_curve_ids()
             if all_curves:
-                curves_item = create_item(geom_item, f"Curves ({len(all_curves)})", data=('geom_group', 'curves'))
+                curves_item = _make_item(
+                    f"Curves ({len(all_curves)})",
+                    data=('geom_group', 'curves'))
+                curve_children = []
                 for cid in all_curves:
                     curve = self.geometry_store.get_curve(cid)
-                    if hasattr(curve, 'start_point_id') and hasattr(curve, 'end_point_id') and not hasattr(curve, 'mid_point_id'):
-                        label = f"Line {cid}: P{curve.start_point_id} -> P{curve.end_point_id}"
+                    if (hasattr(curve, 'start_point_id')
+                            and hasattr(curve, 'end_point_id')
+                            and not hasattr(curve, 'mid_point_id')):
+                        label = (f"Line {cid}: P{curve.start_point_id} -> "
+                                 f"P{curve.end_point_id}")
                     elif hasattr(curve, 'mid_point_id'):
-                        label = f"Arc {cid}: P{curve.start_point_id} -> P{curve.mid_point_id} -> P{curve.end_point_id}"
+                        label = (f"Arc {cid}: P{curve.start_point_id} -> "
+                                 f"P{curve.mid_point_id} -> "
+                                 f"P{curve.end_point_id}")
                     elif hasattr(curve, 'radius'):
-                        label = f"Circle {cid}: Center P{curve.center_point_id}, R={curve.radius:.4g}"
+                        label = (f"Circle {cid}: Center P{curve.center_point_id}, "
+                                 f"R={curve.radius:.4g}")
                     else:
                         label = f"Curve {cid}"
-                    create_item(curves_item, label, data=('geom_curve', cid))
+                    curve_children.append(_make_item(
+                        label, data=('geom_curve', cid)))
+                curves_item.addChildren(curve_children)
+                geom_subitems.append(curves_item)
             if self.geometry_store.surfaces:
-                surfs_item = create_item(geom_item, f"Surfaces ({len(self.geometry_store.surfaces)})", data=('geom_group', 'surfaces'))
-                for sid, surf in sorted(self.geometry_store.surfaces.items()):
-                    label = f"Surface {sid}: {len(surf.boundary_curve_ids)} curves"
-                    create_item(surfs_item, label, data=('geom_surface', sid))
+                surfs_item = _make_item(
+                    f"Surfaces ({len(self.geometry_store.surfaces)})",
+                    data=('geom_group', 'surfaces'))
+                surf_children = [
+                    _make_item(
+                        f"Surface {sid}: {len(surf.boundary_curve_ids)} curves",
+                        data=('geom_surface', sid))
+                    for sid, surf in sorted(self.geometry_store.surfaces.items())
+                ]
+                surfs_item.addChildren(surf_children)
+                geom_subitems.append(surfs_item)
+            if geom_subitems:
+                geom_item.addChildren(geom_subitems)
+                geom_item.setExpanded(True)
 
-        self.tree_widget.expandAll()
-        # v3.2.4: collapse the Coordinate Systems group after the
-        # tree-wide expandAll above. Big aerospace decks routinely
-        # have dozens of CORD2R systems (one per SE boundary, one per
-        # panel) and they clutter the tree on first open. The user
-        # can still click the disclosure triangle to expand.
-        for coords_item in self._find_tree_items(('group', 'coords')):
-            coords_item.setExpanded(False)
-        self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
-        self._populate_loads_tab()
-        self._populate_analysis_tab()
+        # v3.3.0: explicit per-group expand rather than expandAll()
+        # then collapse-just-coords (which forced Qt to compute layout
+        # for every nested branch only to undo it). Coord group stays
+        # collapsed - the only group we never want auto-expanded.
+        if coords_top is not None:
+            coords_top.setExpanded(False)
 
 
     def _emit_render_progress(self, message: str) -> None:
@@ -7529,6 +7631,16 @@ class MainWindow(QMainWindow):
                     advanced.append(
                         f"{total:,} analysis-only cards stashed "
                         f"({top}) - written back on export")
+                # v3.3.0: surface coord systems whose rid pointed at a
+                # coord not in the deck (typically defined in a missing
+                # INCLUDE). _finalize_for_viewer falls them back to basic
+                # so the import doesn't fail.
+                coord_warnings = getattr(
+                    m, '_coord_resolution_warnings', None) or []
+                if coord_warnings:
+                    advanced.append(
+                        f"{len(coord_warnings)} coord system(s) with "
+                        f"dangling parent - treated as basic")
                 advanced_suffix = ""
                 if advanced:
                     advanced_suffix = " - includes " + ", ".join(advanced)
@@ -8877,7 +8989,12 @@ class MainWindow(QMainWindow):
                 self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
 
     def _create_rbe_actors(self):
-        """Creates spider-line visualization for RBE2 and RBE3 rigid elements."""
+        """Creates spider-line visualization for RBE2 and RBE3 rigid elements.
+
+        v3.3.0: each emitted spoke gets a cell_data['EID'] entry equal
+        to its parent RBE's eid, so the cell picker can map any clicked
+        spoke back to the rigid element. Actor is now pickable.
+        """
         self.plotter.remove_actor('rbe_actors', render=False)
 
         if not self.current_generator or not self.current_grid: return
@@ -8887,6 +9004,7 @@ class MainWindow(QMainWindow):
         points = []
         lines = []
         colors = []
+        line_eids = []  # v3.3.0: one entry per emitted spoke (= one cell)
         pt_idx = 0
 
         for eid, elem in model.rigid_elements.items():
@@ -8921,6 +9039,7 @@ class MainWindow(QMainWindow):
                     points.append(leg_pos)
                     lines.append([2, pt_idx, pt_idx + 1])
                     colors.append(color)
+                    line_eids.append(int(eid))
                     pt_idx += 2
             except (AttributeError, KeyError, IndexError) as e:
                 print(f"Warning: Skipping RBE {eid} visualization: {e}")
@@ -8942,12 +9061,20 @@ class MainWindow(QMainWindow):
             point_colors.append(rgb)  # end point
         poly.point_data['colors'] = np.array(point_colors, dtype=np.uint8)
 
+        # v3.3.0: per-cell EID array for graphical picking.
+        poly.cell_data['EID'] = np.asarray(line_eids, dtype=np.int64)
+
         self.plotter.add_mesh(poly, scalars='colors', rgb=True,
                               render_lines_as_tubes=True, line_width=3,
-                              name='rbe_actors', pickable=False)
+                              name='rbe_actors', pickable=True)
 
     def _create_mass_actors(self):
-        """Creates cube glyph visualization for CONM2 mass elements."""
+        """Creates cube glyph visualization for CONM2 mass elements.
+
+        v3.3.0: each glyph cube's 6 faces are tagged with the mass
+        element's eid in cell_data['EID'] so the cell picker can map
+        any clicked face back to the mass element. Actor is now pickable.
+        """
         self.plotter.remove_actor('mass_actors', render=False)
 
         if not self.current_generator or not self.current_grid: return
@@ -8955,11 +9082,13 @@ class MainWindow(QMainWindow):
         if not model.masses: return
 
         coords = []
+        eids = []
         for eid, mass_elem in model.masses.items():
             try:
                 nid = mass_elem.nid
                 if nid in model.nodes:
                     coords.append(model.nodes[nid].get_position())
+                    eids.append(int(eid))
             except (AttributeError, KeyError):
                 continue
 
@@ -8970,8 +9099,26 @@ class MainWindow(QMainWindow):
         cube = pv.Cube(x_length=1.0, y_length=1.0, z_length=1.0)
         scale = self.current_grid.length * 0.015 if self.current_grid.length > 0 else 1.0
         glyphs = pts.glyph(scale=False, factor=scale, geom=cube)
+        # v3.3.0: each input point produces cube.n_cells cells in the
+        # glyph output. Repeat each mass eid across its 6 cube faces so
+        # cell_data['EID'][cell_id] yields the correct mass element id.
+        cells_per_glyph = max(1, cube.n_cells)
+        n_out = glyphs.n_cells
+        expected = len(eids) * cells_per_glyph
+        if n_out == expected:
+            glyphs.cell_data['EID'] = np.repeat(
+                np.asarray(eids, dtype=np.int64), cells_per_glyph)
+        else:
+            # Defensive: if the glyph filter ever changes its output
+            # layout, fall back to a best-effort even split.
+            try:
+                per = max(1, n_out // max(1, len(eids)))
+                glyphs.cell_data['EID'] = np.repeat(
+                    np.asarray(eids, dtype=np.int64), per)[:n_out]
+            except Exception:
+                pass
         self.plotter.add_mesh(glyphs, color=self.type_color_map.get('Masses', '#00cc66'),
-                              name='mass_actors', pickable=False)
+                              name='mass_actors', pickable=True)
 
     def _create_plotel_actors(self):
         """Creates line visualization for PLOTEL elements."""
@@ -9328,6 +9475,118 @@ class MainWindow(QMainWindow):
             self.plotter.render()
 
 
+
+    def visible_entity_ids(self, entity_type):
+        """v3.3.0: return the set of currently-visible EIDs / NIDs based
+        on tree-checkbox state.
+
+        Consumed by EntitySelectionBar._select_visible. The filter
+        mirrors the one used by _update_plot_visibility:
+          - elem_by_type_group + elem_by_shape_group checkboxes hide
+            elements whose type maps to an unchecked group.
+          - property / material checkboxes hide elements by PID.
+          - Masses group checkbox hides CONM2.
+          - Rigid By-Type checkbox hides RBE2/RBE3.
+        For 'Node', returns every grid id (no per-node tree checkbox).
+        """
+        if not self.current_generator:
+            return set()
+        model = self.current_generator.model
+        if entity_type == 'Node':
+            return set(model.nodes.keys())
+        if entity_type != 'Element':
+            return set()
+
+        # Read tree state by group key.
+        def _checked(parent_data, child_label):
+            for parent in self._find_tree_items(parent_data):
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    cd = child.data(0, QtCore.Qt.UserRole)
+                    if isinstance(cd, tuple) and cd[-1] == child_label:
+                        return child.checkState(0) == QtCore.Qt.Checked
+            return True  # default visible if no tree item exists
+
+        type_to_nastran = {
+            'Beams': ('CBEAM',), 'Bars': ('CBAR',), 'Rods': ('CROD',),
+            'Bushes': ('CBUSH',),
+            'Plates': ('CQUAD4', 'CMEMBRAN', 'CTRIA3'),
+            'Rigid': ('RBE2', 'RBE3'),
+            'Solids': ('CHEXA', 'CHEXA8', 'CHEXA20',
+                       'CTETRA', 'CTETRA4', 'CTETRA10',
+                       'CPENTA', 'CPENTA6', 'CPENTA15'),
+            'Shear': ('CSHEAR',), 'Gap': ('CGAP',),
+        }
+        shape_to_nastran = {
+            'Line': ('CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'),
+            'Quad': ('CQUAD4', 'CMEMBRAN', 'CSHEAR'),
+            'Tria': ('CTRIA3',),
+            'Rigid': ('RBE2', 'RBE3'),
+            'Hex': ('CHEXA', 'CHEXA8', 'CHEXA20'),
+            'Tet': ('CTETRA', 'CTETRA4', 'CTETRA10'),
+            'Wedge': ('CPENTA', 'CPENTA6', 'CPENTA15'),
+        }
+        type_check = {}
+        for group, types in type_to_nastran.items():
+            ok = True
+            # Iterate to find the by-type item with matching group name.
+            for parent in self._find_tree_items(('group', 'elem_by_type')):
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    cd = child.data(0, QtCore.Qt.UserRole)
+                    if (isinstance(cd, tuple)
+                            and cd[0] == 'elem_by_type_group'
+                            and cd[1] == group):
+                        ok = child.checkState(0) == QtCore.Qt.Checked
+            for t in types:
+                type_check[t] = ok and type_check.get(t, True)
+
+        for group, types in shape_to_nastran.items():
+            ok = True
+            for parent in self._find_tree_items(('group', 'elem_by_shape')):
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    cd = child.data(0, QtCore.Qt.UserRole)
+                    if (isinstance(cd, tuple)
+                            and cd[0] == 'elem_shape_group'
+                            and cd[1] == group):
+                        ok = child.checkState(0) == QtCore.Qt.Checked
+            for t in types:
+                type_check[t] = type_check.get(t, True) and ok
+
+        # Property visibility
+        hidden_props = set()
+        for parent in self._find_tree_items(('group', 'properties')):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if child.checkState(0) != QtCore.Qt.Checked:
+                    cd = child.data(0, QtCore.Qt.UserRole)
+                    if isinstance(cd, tuple) and cd[0] == 'property':
+                        hidden_props.add(cd[1])
+
+        # Mass group
+        mass_visible = True
+        for parent in self._find_tree_items(('group', 'masses')):
+            mass_visible = (parent.checkState(0) == QtCore.Qt.Checked)
+
+        visible = set()
+        for eid, elem in (model.elements or {}).items():
+            etype = getattr(elem, 'type', None)
+            if not type_check.get(etype, True):
+                continue
+            pid = getattr(elem, 'pid', None)
+            if pid in hidden_props:
+                continue
+            visible.add(int(eid))
+        for eid, elem in (model.rigid_elements or {}).items():
+            etype = getattr(elem, 'type', None)
+            if not type_check.get(etype, True):
+                continue
+            visible.add(int(eid))
+        if mass_visible:
+            for eid in (model.masses or {}).keys():
+                visible.add(int(eid))
+        return visible
 
     def _update_plot_visibility(self):
         """Fast update of actor visibilities based on tree state. Does not rebuild actors."""

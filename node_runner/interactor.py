@@ -264,13 +264,24 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
             elif entity_type == 'Element':
                 grid = self.main_window.current_grid
-                if grid is None or 'EID' not in grid.cell_data:
-                    return
-                eids = grid.cell_data['EID']
-                centers = grid.cell_centers().points
-                screen = self._project_to_screen(centers, renderer)
-                mask = self._points_in_polygon(screen, polygon)
-                selected_ids = {int(eids[i]) for i in np.where(mask)[0]}
+                if grid is not None and 'EID' in grid.cell_data:
+                    eids = grid.cell_data['EID']
+                    centers = grid.cell_centers().points
+                    screen = self._project_to_screen(centers, renderer)
+                    mask = self._points_in_polygon(screen, polygon)
+                    selected_ids.update(
+                        int(eids[i]) for i in np.where(mask)[0])
+                # v3.3.0: also evaluate RBE2/RBE3 + CONM2 masses.
+                (rbe_pts, rbe_eids), (mass_pts, mass_eids) = (
+                    self._collect_rbe_mass_centers())
+                for pts, eids_list in (
+                        (rbe_pts, rbe_eids), (mass_pts, mass_eids)):
+                    if pts is None or len(eids_list) == 0:
+                        continue
+                    s = self._project_to_screen(pts, renderer)
+                    m = self._points_in_polygon(s, polygon)
+                    selected_ids.update(
+                        eids_list[i] for i in np.where(m)[0])
 
         except Exception as e:
             self.main_window._update_status(
@@ -320,14 +331,26 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
             elif entity_type == 'Element':
                 grid = self.main_window.current_grid
-                if grid is None or 'EID' not in grid.cell_data:
-                    return
-                eids = grid.cell_data['EID']
-                centers = grid.cell_centers().points
-                screen = self._project_to_screen(centers, renderer)
-                dists = np.linalg.norm(screen - center, axis=1)
-                mask = dists <= radius
-                selected_ids = {int(eids[i]) for i in np.where(mask)[0]}
+                if grid is not None and 'EID' in grid.cell_data:
+                    eids = grid.cell_data['EID']
+                    centers = grid.cell_centers().points
+                    screen = self._project_to_screen(centers, renderer)
+                    dists = np.linalg.norm(screen - center, axis=1)
+                    mask = dists <= radius
+                    selected_ids.update(
+                        int(eids[i]) for i in np.where(mask)[0])
+                # v3.3.0: also evaluate RBE2/RBE3 + CONM2 masses.
+                (rbe_pts, rbe_eids), (mass_pts, mass_eids) = (
+                    self._collect_rbe_mass_centers())
+                for pts, eids_list in (
+                        (rbe_pts, rbe_eids), (mass_pts, mass_eids)):
+                    if pts is None or len(eids_list) == 0:
+                        continue
+                    s = self._project_to_screen(pts, renderer)
+                    d = np.linalg.norm(s - center, axis=1)
+                    m = d <= radius
+                    selected_ids.update(
+                        eids_list[i] for i in np.where(m)[0])
 
         except Exception as e:
             self.main_window._update_status(
@@ -357,20 +380,22 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
             dialog.add_selection(selected_ids)
             verb = "Added"
         else:
-            # Respect the dialog's action mode radio (Add/Remove/Exclude)
+            # Respect the dialog's action mode radio (Add/Remove/Exclude).
+            # v3.3.0: Exclude is now a first-class bucket entry mode -
+            # route through the dialog's _append_id_set('x', ...) helper
+            # (or fall back to remove_selection if the dialog is the
+            # legacy modal class without _append_id_set).
             action_mode = getattr(dialog, 'get_action_mode', lambda: 'add')()
             if action_mode == 'remove':
                 dialog.remove_selection(selected_ids)
                 verb = "Removed"
             elif action_mode == 'exclude':
-                if hasattr(dialog, '_excluded_ids'):
-                    valid = dialog.all_entity_ids.intersection(set(selected_ids))
-                    dialog._excluded_ids.update(valid)
-                    dialog._refresh_list()
-                    dialog._show_selection()
+                if hasattr(dialog, '_append_id_set'):
+                    dialog._append_id_set('x', set(selected_ids))
+                else:
+                    dialog.remove_selection(selected_ids)
                 verb = "Excluded"
             else:  # 'add' (default)
-                dialog.selected_ids.clear()
                 dialog.add_selection(selected_ids)
                 verb = "Selected"
 
@@ -503,14 +528,27 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
             elif entity_type == 'Element':
                 grid = self.main_window.current_grid
-                if grid is None or 'EID' not in grid.cell_data:
-                    return
-                eids = grid.cell_data['EID']
-                centers = grid.cell_centers().points
-                screen = self._project_to_screen(centers, renderer)
-                mask = ((screen[:, 0] >= x0) & (screen[:, 0] <= x1)
-                        & (screen[:, 1] >= y0) & (screen[:, 1] <= y1))
-                selected_ids = {int(eids[i]) for i in np.where(mask)[0]}
+                if grid is not None and 'EID' in grid.cell_data:
+                    eids = grid.cell_data['EID']
+                    centers = grid.cell_centers().points
+                    screen = self._project_to_screen(centers, renderer)
+                    mask = ((screen[:, 0] >= x0) & (screen[:, 0] <= x1)
+                            & (screen[:, 1] >= y0) & (screen[:, 1] <= y1))
+                    selected_ids.update(int(eids[i]) for i in np.where(mask)[0])
+
+                # v3.3.0: include RBE2/RBE3 + CONM2 masses (they live
+                # on dedicated actors, not current_grid).
+                (rbe_pts, rbe_eids), (mass_pts, mass_eids) = (
+                    self._collect_rbe_mass_centers())
+                for pts, eids_list in (
+                        (rbe_pts, rbe_eids), (mass_pts, mass_eids)):
+                    if pts is None or len(eids_list) == 0:
+                        continue
+                    s = self._project_to_screen(pts, renderer)
+                    mask = ((s[:, 0] >= x0) & (s[:, 0] <= x1)
+                            & (s[:, 1] >= y0) & (s[:, 1] <= y1))
+                    selected_ids.update(
+                        eids_list[i] for i in np.where(mask)[0])
 
         except Exception as e:
             self.main_window._update_status(
@@ -519,6 +557,41 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
         self._apply_selection(dialog, selected_ids, entity_type,
                               shift_key, ctrl_key, "box")
+
+    def _collect_rbe_mass_centers(self):
+        """v3.3.0: return ((rbe_pts, rbe_eids), (mass_pts, mass_eids)).
+
+        Used by area-pick methods so RBE2/RBE3 and CONM2 masses are
+        included in box/circle/polygon selections (those elements live
+        on dedicated actors, not in current_grid).
+        """
+        model = self.main_window.current_generator.model
+        rbe_pts, rbe_eids = [], []
+        for eid, elem in (model.rigid_elements or {}).items():
+            try:
+                if elem.type == 'RBE2':
+                    center_nid = elem.gn
+                elif elem.type == 'RBE3':
+                    center_nid = elem.refgrid
+                else:
+                    continue
+                if center_nid in model.nodes:
+                    rbe_pts.append(model.nodes[center_nid].get_position())
+                    rbe_eids.append(int(eid))
+            except (AttributeError, KeyError):
+                continue
+
+        mass_pts, mass_eids = [], []
+        for eid, mass_elem in (model.masses or {}).items():
+            try:
+                nid = mass_elem.nid
+                if nid in model.nodes:
+                    mass_pts.append(model.nodes[nid].get_position())
+                    mass_eids.append(int(eid))
+            except (AttributeError, KeyError):
+                continue
+        return ((np.asarray(rbe_pts) if rbe_pts else None, rbe_eids),
+                (np.asarray(mass_pts) if mass_pts else None, mass_eids))
 
     def _project_to_screen(self, coords_3d, renderer):
         """Project 3D world coordinates to 2D display coordinates (vectorized)."""

@@ -1,4 +1,4 @@
-# Node Runner v3.2.7
+# Node Runner v3.3.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,45 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.3.0
+
+Minor release: real-deck stability fixes, faster model-tree population, picking now works on every element type, and a Femap-style selection bucket.
+
+### CORD2R safety
+On the user's `FUSE-XWFF_04A_DUL_FDC-Boost-1.dat` deck, import failed with `Post-parse handling failed: Local unit vectors haven't been set. Type='CORD2R' cid=920000 rid=200000`. The deck had a CORD2R whose `rid` referenced a coord that wasn't defined in the bulk (likely in a missing INCLUDE).
+
+`_finalize_for_viewer` is rewritten to topologically sort coords by `rid` dependency (Kahn's algorithm), assign `rid_ref` in parent-first order, and call `cs.setup()` explicitly. Dangling parents fall back to basic (cid=0) instead of leaving `rid_ref = None`, and the fallback is reported on `model._coord_resolution_warnings`. The import-summary status line now mentions `"N coord system(s) with dangling parent - treated as basic"` when this happens.
+
+### Faster model-tree population
+On a 600k-element deck, `_populate_tree` was running two full `Counter(... for e in all_elements.values())` walks just to build the `By Type` / `By Shape` group labels - ~1.2M Python attribute lookups. Those counts now piggy-back on `scene_build.build_element_arrays_vectorized`'s existing single pass over all elements: the helper returns `by_type_counts` / `by_shape_counts` dicts and `_populate_tree` reads them in constant time. The tree build is also wrapped with `setUpdatesEnabled(False)`, batched insertion via `addChildren()`, and explicit per-group expansion (no more `expandAll()` + collapse-just-coords).
+
+### Picking works on every element type
+RBE2/RBE3 spider lines and CONM2 mass glyphs were on dedicated actors with `pickable=False` and no `EID` cell_data. Both actors are now `pickable=True`, each cell carries the parent element's eid, and the area-pick paths (box / circle / polygon) also project RBE/mass center positions to screen so they're included in the selection rectangle.
+
+### Femap-style signed bucket
+The Entity Selection bucket now records each pick as a signed range entry (`mode`, `start`, `end`, `step`) and shows them as Femap-style triplets:
+
+| Action | Bucket row |
+|---|---|
+| Add range 1..10 step 2 | `1, 10, 2` |
+| Add single 12345 | `12345` |
+| Remove range 1..10 step 1 | `-1, -10, 1` |
+| Remove single 8 | `-8` |
+| Exclude range 5..7 | `x5, x7, 1` |
+
+Final selection on OK = walk entries in order, expand each range, unioning `+` entries and subtracting `-` / `x` entries. Add 1..10 then remove 8 yields {1..7, 9, 10}. Delete on a bucket row literally undoes that pick.
+
+### Layout changes
+- New `Select Visible` button in the action grid - adds every currently-visible entity (respecting tree on/off state) to the bucket as a compressed range or set of ranges.
+- Action grid reorganized:
+  - row 0: `Select All` | `Select Visible` | `Reset`
+  - row 1: `More` | `Previous` | `Delete`
+  - row 2: `Pick ▾` | `Method ▾` | `Grow ▾`
+- `Hilite` button moves out of the 3x3 grid into the bottom row, left of OK / Cancel.
+
+### Tests
+- 156 tests pass (138 prior + 3 finalize/coord + 15 bucket).
 
 ## Changelog for v3.2.7
 

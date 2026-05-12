@@ -590,6 +590,98 @@ class TestChunkedCrossRefs:
         assert not info['lod_active']
         assert display is grid
 
+    def test_finalize_for_viewer_topo_sorts_coords(self, tmp_path):
+        """v3.3.0: coords whose rid references another coord must
+        be resolved in dependency order, even when added out-of-order.
+
+        Before v3.3.0 the loop walked coords.items() in dict order and
+        could leave a child's rid_ref pointing at an un-setup parent,
+        which crashed later when pyNastran tried to compute local
+        unit vectors from the parent's transform.
+        """
+        from pyNastran.bdf.bdf import BDF
+        m = BDF(debug=False)
+        # Add cid=2 BEFORE its parent cid=1. _finalize must resolve
+        # parent first.
+        m.add_cord2r(cid=2, origin=[10, 0, 0],
+                     zaxis=[10, 0, 1], xzplane=[11, 0, 0], rid=1)
+        m.add_cord2r(cid=1, origin=[5, 0, 0],
+                     zaxis=[5, 0, 1], xzplane=[6, 0, 0], rid=0)
+        NastranModelGenerator._finalize_for_viewer(m)
+        # Both coords have their unit vectors set.
+        for cid in (1, 2):
+            cs = m.coords[cid]
+            assert cs.i is not None
+            assert cs.j is not None
+            assert cs.k is not None
+            assert np.allclose(np.linalg.norm(cs.i), 1.0)
+        # No spurious warnings.
+        assert m._coord_resolution_warnings == []
+
+    def test_finalize_for_viewer_handles_dangling_rid(self, tmp_path):
+        """v3.3.0: a coord whose rid references a coord not in the deck
+        must not raise. The user hit this on FUSE-XWFF_04A: CORD2R
+        cid=920000 rid=200000, but 200000 was never defined.
+
+        Expected: rid_ref falls back to basic, a warning is recorded
+        on model._coord_resolution_warnings, and node.get_position()
+        works on GRIDs that reference that coord.
+        """
+        from pyNastran.bdf.bdf import BDF
+        m = BDF(debug=False)
+        # rid=200000 doesn't exist in this model.
+        m.add_cord2r(cid=920000, origin=[10, 0, 0],
+                     zaxis=[10, 0, 1], xzplane=[11, 0, 0], rid=200000)
+        m.add_grid(1, [1.0, 2.0, 3.0], cp=920000)
+        # Must not raise.
+        NastranModelGenerator._finalize_for_viewer(m)
+        assert m._coord_resolution_warnings
+        assert any(w[0] == 920000 for w in m._coord_resolution_warnings)
+        # And node.get_position works on a node that references it.
+        pos = m.nodes[1].get_position()
+        assert pos is not None and len(pos) == 3
+
+    def test_vectorized_element_arrays_returns_group_counts(self, tmp_path):
+        """v3.3.0: build_element_arrays_vectorized piggy-backs the
+        By-Type / By-Shape group counts onto its existing single pass
+        over all elements so the model tree doesn't have to do its own
+        1.2M-iteration Counter loop."""
+        from node_runner.scene_build import build_element_arrays_vectorized
+        deck = (
+            "BEGIN BULK\n"
+            "GRID,1,,0.0,0.0,0.0\n"
+            "GRID,2,,1.0,0.0,0.0\n"
+            "GRID,3,,0.0,1.0,0.0\n"
+            "GRID,4,,1.0,1.0,0.0\n"
+            "GRID,5,,0.0,0.0,1.0\n"
+            "GRID,6,,1.0,0.0,1.0\n"
+            "GRID,7,,1.0,1.0,1.0\n"
+            "GRID,8,,0.0,1.0,1.0\n"
+            "PSHELL,1,1,0.1\n"
+            "PSOLID,2,1\n"
+            "MAT1,1,1.0E7,,0.3\n"
+            "CQUAD4,1,1,1,2,3,4\n"
+            "CQUAD4,2,1,1,2,3,4\n"
+            "CHEXA,3,2,1,2,3,4,5,6,7,8\n"
+            "RBE2,4,1,123,2,3\n"
+            "ENDDATA\n"
+        )
+        path = tmp_path / 'deck.bdf'
+        path.write_text(deck)
+        m, _ = NastranModelGenerator._read_bdf_robust(str(path))
+        NastranModelGenerator._finalize_for_viewer(m)
+        sorted_ids = sorted(m.nodes.keys())
+        node_map = {n: i for i, n in enumerate(sorted_ids)}
+        out = build_element_arrays_vectorized(m, sorted_ids, node_map)
+        assert 'by_type_counts' in out
+        assert 'by_shape_counts' in out
+        assert out['by_type_counts'].get('Plates') == 2
+        assert out['by_type_counts'].get('Solids') == 1
+        assert out['by_type_counts'].get('Rigid') == 1
+        assert out['by_shape_counts'].get('Quad') == 2
+        assert out['by_shape_counts'].get('Hex') == 1
+        assert out['by_shape_counts'].get('Rigid') == 1
+
     def test_finalize_for_viewer_resolves_cp_ref(self, tmp_path):
         """v3.1.5 regression: a deck whose GRIDs reference a non-basic
         coord system must be usable for get_position() even without
