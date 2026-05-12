@@ -162,3 +162,53 @@ def test_append_id_set_skips_dangling(bar):
     """IDs outside all_entity_ids never leak into the final selection."""
     bar._append_id_set('+', {50, 200, 300})  # 200, 300 are dangling
     assert bar.get_selected_ids() == [50]
+
+
+# ----------------------------------------------------------------------
+# v3.4.0 - Phase A regressions
+# ----------------------------------------------------------------------
+
+def test_single_id_more_creates_one_entry(bar):
+    """Item 3: typing one ID with To/By blank and clicking More must
+    create a single-ID bucket row, not a range or nothing."""
+    bar._id_input.setText("12345")
+    # Configure has set all_entity_ids = 1..100 by default, so 12345
+    # is out of range; widen the entity set for this test.
+    bar.all_entity_ids = set(range(1, 100001))
+    bar._on_more_clicked()
+    labels = [bar._list_widget.item(i).text()
+              for i in range(bar._list_widget.count())]
+    assert labels == ["12345"]
+    assert bar.get_selected_ids() == [12345]
+
+
+def test_single_id_more_with_stray_whitespace(bar):
+    """Whitespace around the ID should not break the single-ID path."""
+    bar._id_input.setText("  42  ")
+    bar.all_entity_ids = set(range(1, 1000))
+    bar._on_more_clicked()
+    labels = [bar._list_widget.item(i).text()
+              for i in range(bar._list_widget.count())]
+    assert labels == ["42"]
+
+
+def test_paste_via_internal_helper_into_bucket(qapp):
+    """Item 1+2: clipboard text in Femap range format gets parsed and
+    added to the bucket. This exercises the same code path that the
+    Ctrl+V QShortcut and the Pick > Paste menu trigger."""
+    from PySide6.QtWidgets import QApplication
+    from node_runner.dialogs.selection import EntitySelectionBar
+
+    bar = EntitySelectionBar()
+    bar.configure('Element', set(range(1, 1001)))
+    QApplication.clipboard().setText("1,10,2\n42\n100,110,1")
+    bar._paste_selection()
+    # Three rows should appear (one per clipboard line that parsed).
+    labels = [bar._list_widget.item(i).text()
+              for i in range(bar._list_widget.count())]
+    # The paste path collapses everything into a single id-set, then
+    # decomposes via compress_ids_to_range_tuples. So the rows may
+    # merge or split based on contiguity. We just assert the final
+    # selected ids are what we expect.
+    expected = set(range(1, 11, 2)) | {42} | set(range(100, 111, 1))
+    assert set(bar.get_selected_ids()) == expected

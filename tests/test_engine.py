@@ -746,3 +746,71 @@ class TestChunkedCrossRefs:
             f'lost DMIG entries: {len(kaax.GCi)} != {n_dmig}'
         assert len(kaax.GCj) == n_dmig
         assert len(kaax.Real) == n_dmig
+
+
+# ---------------------------------------------------------------------------
+# v3.4.0 - RBE listing + integrity
+# ---------------------------------------------------------------------------
+
+class TestRBEHandling:
+    """v3.4.0 item 5: Element Information dialog must dispatch on
+    elem.type for RBE2/RBE3/CONM2 (they don't have a uniform .nodes
+    attribute), and _create_rbe_actors must surface integrity warnings
+    when RBEs reference nodes that aren't in the model."""
+
+    def _make_model_with_rbes(self, include_dangling=False):
+        from pyNastran.bdf.bdf import BDF
+        m = BDF(debug=False)
+        for nid in (1, 2, 3, 4, 5):
+            m.add_grid(nid, [float(nid), 0.0, 0.0])
+        # RBE2: independent node 1, dependent nodes 2, 3
+        m.add_rbe2(eid=100, gn=1, cm=123456, Gmi=[2, 3])
+        # RBE3: dependent node 4, independent nodes 1, 5 (with weights)
+        m.add_rbe3(eid=200, refgrid=4, refc=123,
+                   weights=[1.0], comps=['123'], Gijs=[[1, 5]])
+        if include_dangling:
+            # cid=300 RBE2 references node 9999 (not in the model).
+            m.add_rbe2(eid=300, gn=9999, cm=123456, Gmi=[2])
+            # cid=400 RBE3 with one missing leg (5 exists, 8888 doesn't).
+            m.add_rbe3(eid=400, refgrid=4, refc=123,
+                       weights=[1.0], comps=['123'], Gijs=[[5, 8888]])
+        return m
+
+    def test_format_element_nodes_rbe2(self):
+        """RBE2 should render as 'gn -> [Gmi]'."""
+        from node_runner.mainwindow import MainWindow
+        m = self._make_model_with_rbes()
+        rbe2 = m.rigid_elements[100]
+        s = MainWindow._format_element_nodes(rbe2)
+        assert s == "1 -> [2, 3]", f"unexpected RBE2 string: {s!r}"
+
+    def test_format_element_nodes_rbe3(self):
+        """RBE3 should render as '[indep grids] -> refgrid'."""
+        from node_runner.mainwindow import MainWindow
+        m = self._make_model_with_rbes()
+        rbe3 = m.rigid_elements[200]
+        s = MainWindow._format_element_nodes(rbe3)
+        # legs are 1, 5; refgrid is 4
+        assert s == "[1, 5] -> 4", f"unexpected RBE3 string: {s!r}"
+
+    def test_format_element_nodes_falls_back_for_shells(self):
+        """Non-rigid elements still use elem.nodes."""
+        from node_runner.mainwindow import MainWindow
+        from pyNastran.bdf.bdf import BDF
+        m = BDF(debug=False)
+        for nid in (1, 2, 3, 4):
+            m.add_grid(nid, [float(nid), 0.0, 0.0])
+        m.add_pshell(1, mid1=1, t=0.1)
+        m.add_mat1(1, 1.0e7, None, 0.3)
+        m.add_cquad4(eid=10, pid=1, nids=[1, 2, 4, 3])
+        s = MainWindow._format_element_nodes(m.elements[10])
+        assert s == "1, 2, 4, 3"
+
+    def test_format_element_nodes_handles_conm2(self):
+        from node_runner.mainwindow import MainWindow
+        from pyNastran.bdf.bdf import BDF
+        m = BDF(debug=False)
+        m.add_grid(7, [0.0, 0.0, 0.0])
+        m.add_conm2(eid=1, nid=7, mass=2.5)
+        s = MainWindow._format_element_nodes(m.masses[1])
+        assert s == "7"

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QTreeWidgetItemIterator, QTableWidget, QTableWidgetItem,
     QHeaderView, QListWidget, QListWidgetItem, QTextEdit, QTabWidget, QRadioButton,
     QButtonGroup, QStackedLayout, QInputDialog, QMenu, QSlider, QSpinBox,
-    QDockWidget,
+    QDockWidget, QToolButton,
 )
 from PySide6.QtGui import (QPalette, QColor, QAction, QActionGroup, QDoubleValidator,
                            QPainter, QPen, QBrush, QPolygonF, QPixmap, QIcon)
@@ -223,7 +223,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.3.1"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.4.0"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -388,61 +388,120 @@ class MainWindow(QMainWindow):
         groups_layout = QVBoxLayout(groups_widget)
         groups_layout.setContentsMargins(4, 4, 4, 4)
         groups_layout.setSpacing(4)
-        groups_layout.addWidget(self.groups_list, 1)
 
-        # Row 1: Create / Delete / Rename
-        grp_row1 = QHBoxLayout()
-        create_grp_btn = QPushButton("Create")
-        create_grp_btn.clicked.connect(self._create_group)
-        delete_grp_btn = QPushButton("Delete")
-        delete_grp_btn.clicked.connect(self._delete_group)
-        rename_grp_btn = QPushButton("Rename")
-        rename_grp_btn.clicked.connect(self._rename_selected_group)
-        grp_row1.addWidget(create_grp_btn)
-        grp_row1.addWidget(delete_grp_btn)
-        grp_row1.addWidget(rename_grp_btn)
-        groups_layout.addLayout(grp_row1)
+        # v3.4.0 item 7: Femap-style top toolbar (two rows). All
+        # buttons that used to live below the group list move up here.
+        tb_row1 = QHBoxLayout(); tb_row1.setSpacing(3)
+        for label, slot, tip in (
+                ("New",    self._create_group,             "Create a new (empty) group"),
+                ("Delete", self._delete_group,             "Delete the highlighted group"),
+                ("Rename", self._rename_selected_group,    "Rename the highlighted group"),
+        ):
+            b = QPushButton(label); b.setToolTip(tip)
+            b.clicked.connect(slot)
+            tb_row1.addWidget(b)
+        sep1 = QFrame(); sep1.setFrameShape(QFrame.VLine); sep1.setFrameShadow(QFrame.Sunken)
+        tb_row1.addWidget(sep1)
 
-        # Row 2: Add Selected / Remove Selected / Clear
-        grp_row2 = QHBoxLayout()
-        add_sel_btn = QPushButton("Add Sel.")
-        add_sel_btn.setToolTip("Add currently selected entities to this group")
-        add_sel_btn.clicked.connect(self._add_selected_to_group)
-        remove_sel_btn = QPushButton("Rem. Sel.")
-        remove_sel_btn.setToolTip("Remove currently selected entities from this group")
-        remove_sel_btn.clicked.connect(self._remove_selected_from_group)
-        clear_grp_btn = QPushButton("Clear")
-        clear_grp_btn.setToolTip("Remove all items from this group")
-        clear_grp_btn.clicked.connect(self._clear_group)
-        grp_row2.addWidget(add_sel_btn)
-        grp_row2.addWidget(remove_sel_btn)
-        grp_row2.addWidget(clear_grp_btn)
-        groups_layout.addLayout(grp_row2)
+        # Add dropdown: rule-based + From Selection
+        self._add_to_group_btn = QToolButton()
+        self._add_to_group_btn.setText("Add ▾")
+        self._add_to_group_btn.setToolTip(
+            "Add entities to the highlighted group")
+        self._add_to_group_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._add_to_group_btn.setPopupMode(QToolButton.MenuButtonPopup)
+        add_menu = QMenu(self)
+        add_menu.addAction(
+            "From current selection", self._add_selected_to_group)
+        add_menu.addAction(
+            "From rules...", lambda: self._open_group_add_dialog('add'))
+        self._add_to_group_btn.setMenu(add_menu)
+        # Default click action: From current selection (the most-used path).
+        self._add_to_group_btn.clicked.connect(self._add_selected_to_group)
+        tb_row1.addWidget(self._add_to_group_btn)
 
-        # Row 3: Show All / Isolate / Highlight
-        grp_row3 = QHBoxLayout()
+        # Remove dropdown: mirror of Add
+        self._rem_from_group_btn = QToolButton()
+        self._rem_from_group_btn.setText("Remove ▾")
+        self._rem_from_group_btn.setToolTip(
+            "Remove entities from the highlighted group")
+        self._rem_from_group_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._rem_from_group_btn.setPopupMode(QToolButton.MenuButtonPopup)
+        rem_menu = QMenu(self)
+        rem_menu.addAction(
+            "From current selection", self._remove_selected_from_group)
+        rem_menu.addAction(
+            "From rules...",
+            lambda: self._open_group_add_dialog('remove'))
+        self._rem_from_group_btn.setMenu(rem_menu)
+        self._rem_from_group_btn.clicked.connect(self._remove_selected_from_group)
+        tb_row1.addWidget(self._rem_from_group_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip("Remove all items from the highlighted group")
+        clear_btn.clicked.connect(self._clear_group)
+        tb_row1.addWidget(clear_btn)
+        tb_row1.addStretch(1)
+        groups_layout.addLayout(tb_row1)
+
+        # Row 2: visibility + auto + boolean
+        tb_row2 = QHBoxLayout(); tb_row2.setSpacing(3)
         show_all_btn = QPushButton("Show All")
         show_all_btn.setToolTip("Show all groups (clear isolation)")
         show_all_btn.clicked.connect(self._show_all_groups)
         isolate_btn = QPushButton("Isolate")
+        isolate_btn.setToolTip("Show only the highlighted group")
         isolate_btn.clicked.connect(self._isolate_group)
         highlight_btn = QPushButton("Highlight")
         highlight_btn.setToolTip("Flash-highlight entities in this group")
         highlight_btn.clicked.connect(self._highlight_group)
-        grp_row3.addWidget(show_all_btn)
-        grp_row3.addWidget(isolate_btn)
-        grp_row3.addWidget(highlight_btn)
-        groups_layout.addLayout(grp_row3)
+        for b in (show_all_btn, isolate_btn, highlight_btn):
+            tb_row2.addWidget(b)
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
+        tb_row2.addWidget(sep2)
 
-        # Row 4: Auto-group
-        grp_row4 = QHBoxLayout()
+        # Auto: rule-based bulk group creation.
+        self._auto_btn = QToolButton()
+        self._auto_btn.setText("Auto ▾")
+        self._auto_btn.setToolTip(
+            "Auto-create groups by Property / Material / Element Type")
+        self._auto_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._auto_btn.setPopupMode(QToolButton.InstantPopup)
+        auto_menu = QMenu(self)
+        auto_menu.addAction("By Property", self._group_by_property)
+        auto_menu.addAction("By Material", self._group_by_material)
+        auto_menu.addAction("By Element Type", self._group_by_element_type)
+        self._auto_btn.setMenu(auto_menu)
+        tb_row2.addWidget(self._auto_btn)
+
+        # Boolean: set-arithmetic between two groups.
+        self._boolean_btn = QToolButton()
+        self._boolean_btn.setText("Boolean ▾")
+        self._boolean_btn.setToolTip(
+            "Union / Intersect / Difference between two groups")
+        self._boolean_btn.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+        self._boolean_btn.setPopupMode(QToolButton.InstantPopup)
+        bool_menu = QMenu(self)
+        bool_menu.addAction("Union (A + B)",
+                            lambda: self._group_boolean_op('union'))
+        bool_menu.addAction("Intersect (A ∩ B)",
+                            lambda: self._group_boolean_op('intersect'))
+        bool_menu.addAction("Difference (A - B)",
+                            lambda: self._group_boolean_op('difference'))
+        self._boolean_btn.setMenu(bool_menu)
+        tb_row2.addWidget(self._boolean_btn)
+        tb_row2.addStretch(1)
+        groups_layout.addLayout(tb_row2)
+
+        # Group list lives BELOW the toolbar (v3.4.0 - was below buttons).
+        groups_layout.addWidget(self.groups_list, 1)
+
+        # auto_group_combo kept as a hidden attribute for back-compat
+        # with any external caller; not displayed.
         self.auto_group_combo = QComboBox()
-        self.auto_group_combo.addItems(["By Property", "By Material", "By Element Type"])
-        auto_grp_btn = QPushButton("Auto Group")
-        auto_grp_btn.clicked.connect(self._auto_group)
-        grp_row4.addWidget(self.auto_group_combo, 1)
-        grp_row4.addWidget(auto_grp_btn)
-        groups_layout.addLayout(grp_row4)
+        self.auto_group_combo.addItems(
+            ["By Property", "By Material", "By Element Type"])
+        self.auto_group_combo.hide()
 
         # v3.2.4: search bar above the model tree. Search supports two
         # modes via the radio toggles:
@@ -567,6 +626,13 @@ class MainWindow(QMainWindow):
         self.color_mode_combo.addItems(["Property", "Type", "Quality", "Results"])
         self.color_mode_combo.currentIndexChanged.connect(self._on_color_mode_combo_changed)
         render_layout.addRow("Color By:", self.color_mode_combo)
+        # v3.4.0 item 8: Shading checkbox in the Display tab. Mirrors
+        # the View > Shading menu action so both stay in sync.
+        self.shading_display_check = QCheckBox()
+        self.shading_display_check.setChecked(True)
+        self.shading_display_check.toggled.connect(
+            self._on_shading_display_toggled)
+        render_layout.addRow("Shading:", self.shading_display_check)
         self.bg_preset_combo = QComboBox()
         self.bg_preset_combo.addItems(list(BACKGROUND_PRESETS.keys()))
         self.bg_preset_combo.currentTextChanged.connect(self._on_bg_preset_changed)
@@ -4326,7 +4392,10 @@ class MainWindow(QMainWindow):
         return gid
 
     def _populate_groups_list(self):
-        """Rebuild the groups tree widget from self.groups."""
+        """Rebuild the groups tree widget from self.groups.
+
+        v3.4.0: summary line now shows props/mats counts too. Legacy
+        groups (only nodes/elements) read 0 for the new fields."""
         self.groups_list.blockSignals(True)
         self.groups_list.clear()
         for name, data in sorted(self.groups.items(),
@@ -4334,15 +4403,191 @@ class MainWindow(QMainWindow):
             gid = data.get("gid", 0)
             n_e = len(data.get("elements", []))
             n_n = len(data.get("nodes", []))
+            n_p = len(data.get("properties", []) or [])
+            n_m = len(data.get("materials", []) or [])
+            n_c = len(data.get("coords", []) or [])
+            parts = [f"{n_e} elems", f"{n_n} nodes"]
+            if n_p:
+                parts.append(f"{n_p} props")
+            if n_m:
+                parts.append(f"{n_m} mats")
+            if n_c:
+                parts.append(f"{n_c} coords")
             item = QTreeWidgetItem(
                 self.groups_list,
-                [f"{gid}: {name}  ({n_e} elems, {n_n} nodes)"])
+                [f"{gid}: {name}  ({', '.join(parts)})"])
             item.setData(0, QtCore.Qt.UserRole, ("group_entry", name))
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
             item.setCheckState(
                 0, QtCore.Qt.Unchecked if name in self._hidden_groups else QtCore.Qt.Checked
             )
         self.groups_list.blockSignals(False)
+
+    def _open_group_add_dialog(self, mode='add'):
+        """v3.4.0 item 7: open the tabbed Femap-style Add/Remove dialog
+        for the currently-highlighted group."""
+        from node_runner.dialogs.group_add import GroupAddDialog
+
+        item = self.groups_list.currentItem()
+        if not item:
+            QMessageBox.information(
+                self, "No Selection",
+                "Highlight a group in the list before opening Add/Remove.")
+            return
+        item_data = item.data(0, QtCore.Qt.UserRole)
+        if not isinstance(item_data, tuple):
+            return
+        gname = item_data[1]
+        if not self.current_generator:
+            QMessageBox.information(self, "No Model", "Open a model first.")
+            return
+        model = self.current_generator.model
+        all_elements = {**model.elements, **model.rigid_elements}
+
+        # Build the context dicts the dialog uses for live previews.
+        eids_by_pid: dict[int, set[int]] = {}
+        eids_by_type: dict[str, set[int]] = {}
+        for eid, elem in all_elements.items():
+            etype = getattr(elem, 'type', None)
+            if etype is not None:
+                eids_by_type.setdefault(etype, set()).add(int(eid))
+            pid = getattr(elem, 'pid', None)
+            if pid:
+                eids_by_pid.setdefault(int(pid), set()).add(int(eid))
+
+        pids_by_mid: dict[int, set[int]] = {}
+        for pid, prop in (model.properties or {}).items():
+            for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                m_id = getattr(prop, attr, None)
+                if m_id:
+                    pids_by_mid.setdefault(int(m_id), set()).add(int(pid))
+                    break
+
+        # eids_by_mid: walk PIDs in pids_by_mid and union their elements.
+        eids_by_mid: dict[int, set[int]] = {}
+        for mid, pids in pids_by_mid.items():
+            s: set[int] = set()
+            for pid in pids:
+                s |= eids_by_pid.get(pid, set())
+            eids_by_mid[mid] = s
+
+        # nids_for_eids: for the "By connected to selected element"
+        # Node-tab selector.
+        nids_for_eids: dict[int, set[int]] = {}
+        for eid, elem in all_elements.items():
+            ns: set[int] = set()
+            t = elem.type
+            if t == 'RBE2':
+                if getattr(elem, 'gn', None):
+                    ns.add(elem.gn)
+                for n in (elem.Gmi or []):
+                    if n:
+                        ns.add(n)
+            elif t == 'RBE3':
+                if getattr(elem, 'refgrid', None):
+                    ns.add(elem.refgrid)
+                for wt in (elem.wt_cg_groups or []):
+                    for n in (wt[2] or []):
+                        if n:
+                            ns.add(n)
+            elif hasattr(elem, 'nodes'):
+                ns.update(n for n in elem.nodes if n)
+            nids_for_eids[int(eid)] = ns
+
+        ctx = {
+            'group_name': gname,
+            'mode': mode,
+            'node_ids': set(model.nodes.keys()),
+            'element_ids': set(all_elements.keys()),
+            'property_ids': set(model.properties.keys()),
+            'material_ids': set(model.materials.keys()),
+            'coord_ids': set(model.coords.keys()),
+            'eids_by_pid': eids_by_pid,
+            'eids_by_mid': eids_by_mid,
+            'eids_by_type': eids_by_type,
+            'pids_by_mid': pids_by_mid,
+            'nids_for_eids': nids_for_eids,
+            'groups': self.groups,
+            'current_selection_nids': set(
+                getattr(self, '_current_selection_nids', []) or []),
+            'current_selection_eids': set(
+                getattr(self, '_current_selection_eids', []) or []),
+            'current_selection_pids': set(),
+            'current_selection_mids': set(),
+            'current_selection_cids': set(),
+        }
+        dlg = GroupAddDialog(ctx, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        result = dlg.ids_by_entity()
+        grp = self.groups[gname]
+        # Ensure modern shape (legacy groups missing new fields).
+        for key in ('nodes', 'elements', 'properties', 'materials', 'coords'):
+            grp.setdefault(key, [])
+        verb = 'Added' if mode == 'add' else 'Removed'
+        total = 0
+        for key in ('nodes', 'elements', 'properties', 'materials', 'coords'):
+            picked = result.get(key) or set()
+            if not picked:
+                continue
+            cur = set(grp.get(key, []) or [])
+            if mode == 'add':
+                cur |= picked
+            else:
+                cur -= picked
+            grp[key] = sorted(cur)
+            total += len(picked)
+        self._populate_groups_list()
+        self._update_plot_visibility()
+        self._update_status(
+            f"{verb} {total} entit{'ies' if total != 1 else 'y'} "
+            f"{'to' if mode == 'add' else 'from'} group '{gname}'.")
+
+    def _group_boolean_op(self, op: str):
+        """v3.4.0 item 7: Boolean ops (union / intersect / difference)
+        between two existing groups. Opens a small dialog to pick A
+        and B, writes the result into a new group A_op_B."""
+        if len(self.groups) < 2:
+            QMessageBox.information(
+                self, "Need 2 groups",
+                "At least two groups required for a Boolean operation.")
+            return
+        names = sorted(self.groups.keys(),
+                       key=lambda n: self.groups[n].get('gid', 0))
+        # Two-step QInputDialog: pick A then B.
+        a, ok = QInputDialog.getItem(
+            self, f"Boolean: {op}", "Group A:", names, 0, False)
+        if not ok:
+            return
+        b, ok = QInputDialog.getItem(
+            self, f"Boolean: {op}", "Group B:", names, 0, False)
+        if not ok:
+            return
+        if a == b:
+            QMessageBox.warning(self, "Same group",
+                                "Choose two different groups.")
+            return
+        ga, gb = self.groups[a], self.groups[b]
+        new_data = self._make_group_data(self._next_gid())
+        for key in ('nodes', 'elements', 'properties', 'materials', 'coords'):
+            sa = set(ga.get(key, []) or [])
+            sb = set(gb.get(key, []) or [])
+            if op == 'union':
+                new_data[key] = sorted(sa | sb)
+            elif op == 'intersect':
+                new_data[key] = sorted(sa & sb)
+            else:  # difference
+                new_data[key] = sorted(sa - sb)
+        op_symbol = {'union': '+', 'intersect': '&', 'difference': '-'}[op]
+        new_name = f"{a} {op_symbol} {b}"
+        # Avoid name collisions.
+        base = new_name; suffix = 1
+        while new_name in self.groups:
+            suffix += 1
+            new_name = f"{base} ({suffix})"
+        self.groups[new_name] = new_data
+        self._populate_groups_list()
+        self._update_status(f"Created group '{new_name}'.")
 
     def _create_group(self):
         name, ok = QInputDialog.getText(self, "Create Group", "Group name:")
@@ -4434,24 +4679,30 @@ class MainWindow(QMainWindow):
         self._update_status(f"Isolated group '{name}'.")
 
     def _group_by_property(self):
+        """v3.4.0 item 4: auto-create one group per PID. Walks both
+        model.elements AND model.rigid_elements (rigids typically have
+        no PID and won't end up in any PID group, but the iteration is
+        symmetric for safety)."""
         if not self.current_generator:
             return
         model = self.current_generator.model
         # Remove existing auto-generated PID groups
         for name in [n for n in self.groups if n.startswith("PID ")]:
             self.groups.pop(name)
+        all_elements = {**model.elements, **model.rigid_elements}
         for pid in sorted(model.properties.keys()):
             eids = [
-                eid for eid, elem in model.elements.items()
+                eid for eid, elem in all_elements.items()
                 if hasattr(elem, "pid") and elem.pid == pid
             ]
             nids: set[int] = set()
             for eid in eids:
-                elem = model.elements[eid]
+                elem = all_elements[eid]
                 if hasattr(elem, "nodes"):
                     nids.update(n for n in elem.nodes if n)
             gid = self._next_gid()
-            self.groups[f"PID {pid}"] = {"nodes": list(nids), "elements": eids, "gid": gid}
+            self.groups[f"PID {pid}"] = self._make_group_data(
+                gid, nodes=list(nids), elements=eids, properties=[pid])
         self._populate_groups_list()
         self._update_status(f"Created {len(model.properties)} property groups.")
 
@@ -4671,11 +4922,17 @@ class MainWindow(QMainWindow):
             self._group_by_element_type()
 
     def _group_by_material(self):
+        """v3.4.0 (item 4): auto-create one group per material, with
+        every element whose property's material matches. Walks both
+        model.elements AND model.rigid_elements so rigid bodies are
+        considered (though they typically have no PID and won't end up
+        in a MAT group)."""
         if not self.current_generator:
             return
         model = self.current_generator.model
         for name in [n for n in self.groups if n.startswith("MAT ")]:
             self.groups.pop(name)
+        all_elements = {**model.elements, **model.rigid_elements}
         for mid in sorted(model.materials.keys()):
             pids_for_mid = set()
             for pid, prop in model.properties.items():
@@ -4683,37 +4940,81 @@ class MainWindow(QMainWindow):
                     if getattr(prop, attr, None) == mid:
                         pids_for_mid.add(pid)
                         break
-            eids = [eid for eid, elem in model.elements.items()
+            eids = [eid for eid, elem in all_elements.items()
                     if hasattr(elem, "pid") and elem.pid in pids_for_mid]
             nids: set[int] = set()
             for eid in eids:
-                elem = model.elements[eid]
+                elem = all_elements[eid]
                 if hasattr(elem, "nodes"):
                     nids.update(n for n in elem.nodes if n)
             gid = self._next_gid()
-            self.groups[f"MAT {mid}"] = {"nodes": list(nids), "elements": eids, "gid": gid}
+            self.groups[f"MAT {mid}"] = self._make_group_data(
+                gid, nodes=list(nids), elements=eids, materials=[mid])
         self._populate_groups_list()
         self._update_status(f"Created {len(model.materials)} material groups.")
 
     def _group_by_element_type(self):
+        """v3.4.0 (item 4): auto-create one group per element type.
+        Walks both model.elements AND model.rigid_elements - previously
+        RBE2/RBE3 were ignored because the loop only saw
+        model.elements, so 'TYPE RBE2' / 'TYPE RBE3' groups never
+        appeared."""
         if not self.current_generator:
             return
         model = self.current_generator.model
         for name in [n for n in self.groups if n.startswith("TYPE ")]:
             self.groups.pop(name)
         type_groups: dict[str, dict] = {}
-        for eid, elem in model.elements.items():
+        all_elements = {**model.elements, **model.rigid_elements}
+        for eid, elem in all_elements.items():
             etype = elem.type
             if etype not in type_groups:
                 type_groups[etype] = {"nodes": set(), "elements": []}
             type_groups[etype]["elements"].append(eid)
-            if hasattr(elem, "nodes"):
-                type_groups[etype]["nodes"].update(n for n in elem.nodes if n)
+            # RBE2: nodes live on .gn + .Gmi. RBE3: .refgrid + flatten
+            # of wt_cg_groups[*][2]. Everything else exposes .nodes.
+            if etype == 'RBE2':
+                if getattr(elem, 'gn', None):
+                    type_groups[etype]["nodes"].add(elem.gn)
+                for g in (getattr(elem, 'Gmi', None) or []):
+                    if g:
+                        type_groups[etype]["nodes"].add(g)
+            elif etype == 'RBE3':
+                if getattr(elem, 'refgrid', None):
+                    type_groups[etype]["nodes"].add(elem.refgrid)
+                for wt in (getattr(elem, 'wt_cg_groups', None) or []):
+                    for g in (wt[2] or []):
+                        if g:
+                            type_groups[etype]["nodes"].add(g)
+            elif hasattr(elem, "nodes"):
+                type_groups[etype]["nodes"].update(
+                    n for n in elem.nodes if n)
         for etype, data in sorted(type_groups.items()):
             gid = self._next_gid()
-            self.groups[f"TYPE {etype}"] = {"nodes": list(data["nodes"]), "elements": data["elements"], "gid": gid}
+            self.groups[f"TYPE {etype}"] = self._make_group_data(
+                gid, nodes=list(data["nodes"]),
+                elements=data["elements"])
         self._populate_groups_list()
         self._update_status(f"Created {len(type_groups)} element type groups.")
+
+    @staticmethod
+    def _make_group_data(gid, nodes=None, elements=None,
+                         properties=None, materials=None, coords=None):
+        """v3.4.0 item 7: factory for the extended group dict shape.
+
+        Pre-v3.4.0 groups were ``{gid, nodes, elements}``. We now also
+        track properties / materials / coords so a group can express
+        Femap-style multi-entity membership. Older code paths that read
+        only nodes/elements still work because the new fields default
+        to empty lists."""
+        return {
+            "gid": int(gid),
+            "nodes": list(nodes or []),
+            "elements": list(elements or []),
+            "properties": list(properties or []),
+            "materials": list(materials or []),
+            "coords": list(coords or []),
+        }
 
     def _select_group_in_viewport(self, name):
         group_data = self.groups.get(name, {})
@@ -5266,20 +5567,51 @@ class MainWindow(QMainWindow):
         else: self.plotter.remove_actor('origin_actor')
 
     def _toggle_shading(self, state):
-        for actor in self.plotter.renderer.actors.values():
-            if hasattr(actor, 'prop') and actor.prop is not None:
-                if state:
-                    actor.prop.lighting = True
-                    actor.prop.interpolation = 'phong'
-                    actor.prop.ambient = 0.0
-                    actor.prop.diffuse = 1.0
-                else:
-                    actor.prop.lighting = False
-                    actor.prop.ambient = 1.0
-                    actor.prop.diffuse = 0.0
+        """v3.4.0 item 8: flip between phong (lit) and a flat unlit
+        look that's obviously different to the eye.
 
-        self._update_status(f"Shading {'ON' if state else 'OFF'}.")
+        Before v3.4.0 the toggle changed ambient/diffuse but kept the
+        same interpolation, so on a coloured-by-property deck with
+        edges drawn the visible difference was tiny. Now:
+          - ON  : lit phong, low ambient + high diffuse (3D shaded)
+          - OFF : unlit flat, full ambient, no diffuse (flat colours,
+                  no gradients across faces)
+        """
+        for actor in self.plotter.renderer.actors.values():
+            if not hasattr(actor, 'prop') or actor.prop is None:
+                continue
+            if state:
+                actor.prop.lighting = True
+                actor.prop.interpolation = 'phong'
+                actor.prop.ambient = 0.15
+                actor.prop.diffuse = 0.85
+                actor.prop.specular = 0.0
+            else:
+                actor.prop.lighting = False
+                actor.prop.interpolation = 'flat'
+                actor.prop.ambient = 1.0
+                actor.prop.diffuse = 0.0
+                actor.prop.specular = 0.0
+
+        # Keep both UI surfaces in sync (View menu + Display tab).
+        try:
+            self.shading_action.blockSignals(True)
+            self.shading_action.setChecked(state)
+        finally:
+            self.shading_action.blockSignals(False)
+        try:
+            self.shading_display_check.blockSignals(True)
+            self.shading_display_check.setChecked(state)
+        finally:
+            self.shading_display_check.blockSignals(False)
+
+        self._update_status(f"Shading: {'phong (lit)' if state else 'flat (unlit)'}.")
         self.plotter.render()
+
+    def _on_shading_display_toggled(self, state):
+        """Bridge: Display-tab checkbox -> _toggle_shading (which also
+        keeps the View menu action in sync)."""
+        self._toggle_shading(state)
         
     def _zoom_to_model(self):
         if self.current_grid: self.plotter.reset_camera(bounds=self.current_grid.bounds)
@@ -6101,7 +6433,9 @@ class MainWindow(QMainWindow):
         selected_ids = self.selection_bar.get_selected_ids()
         if selected_ids:
             from node_runner.dialogs.info import NodeElementInfoDialog
-            all_elements = {**self.current_generator.model.elements, **self.current_generator.model.rigid_elements}
+            model = self.current_generator.model
+            all_elements = {**model.elements, **model.rigid_elements,
+                            **getattr(model, 'masses', {})}
             columns = ['EID', 'Type', 'PID', 'MID', 'Nodes']
             tooltips = {
                 'EID': 'Element ID - unique identifier for this element',
@@ -6111,25 +6445,60 @@ class MainWindow(QMainWindow):
                 'Nodes': 'Grid point IDs defining this element\'s connectivity',
             }
             rows = []
-            model = self.current_generator.model
             for eid in selected_ids:
-                if eid in all_elements:
-                    elem = all_elements[eid]
-                    pid = getattr(elem, 'pid', '')
-                    mid = ''
-                    if pid and pid in model.properties:
-                        prop = model.properties[pid]
-                        mid = getattr(prop, 'mid', None) or getattr(prop, 'mid1', None) or ''
-                    nodes_str = ', '.join(str(n) for n in elem.nodes) if hasattr(elem, 'nodes') else ''
-                    rows.append({
-                        'EID': elem.eid, 'Type': elem.type,
-                        'PID': pid, 'MID': mid, 'Nodes': nodes_str,
-                    })
+                if eid not in all_elements:
+                    continue
+                elem = all_elements[eid]
+                t = elem.type
+                pid_disp = '-'
+                mid_disp = '-'
+                # v3.4.0 item 5: type-dispatched PID + MID derivation.
+                pid_raw = getattr(elem, 'pid', None)
+                if t not in ('RBE2', 'RBE3', 'CONM2') and pid_raw:
+                    pid_disp = pid_raw
+                    if pid_raw in model.properties:
+                        prop = model.properties[pid_raw]
+                        m_id = (getattr(prop, 'mid', None)
+                                or getattr(prop, 'mid1', None))
+                        if m_id:
+                            mid_disp = m_id
+                # v3.4.0 item 5: type-dispatched node-string. RBE2/RBE3
+                # don't expose elem.nodes; CONM2 has a single nid.
+                nodes_str = self._format_element_nodes(elem)
+                rows.append({
+                    'EID': elem.eid, 'Type': t,
+                    'PID': pid_disp, 'MID': mid_disp, 'Nodes': nodes_str,
+                })
             title = f"Element Information ({len(rows)} element{'s' if len(rows) != 1 else ''})"
             info_dialog = NodeElementInfoDialog(title, rows, columns, self, column_tooltips=tooltips)
             info_dialog.exec()
 
         self._end_selection_mode()
+
+    @staticmethod
+    def _format_element_nodes(elem):
+        """v3.4.0 item 5: type-dispatched node-string for the Element
+        Information dialog. RBE2 / RBE3 / CONM2 don't have a uniform
+        `.nodes` attribute, so reading it blindly (the v3.3.x bug)
+        produced empty Nodes columns for the most common rigid-body
+        constraints in any aerospace deck."""
+        t = getattr(elem, 'type', None)
+        try:
+            if t == 'RBE2':
+                legs = ', '.join(str(n) for n in (elem.Gmi or []) if n)
+                return f"{elem.gn} -> [{legs}]"
+            if t == 'RBE3':
+                legs = ', '.join(
+                    str(n) for wt in (elem.wt_cg_groups or [])
+                    for n in (wt[2] or []) if n)
+                return f"[{legs}] -> {elem.refgrid}"
+            if t == 'CONM2':
+                return str(getattr(elem, 'nid', ''))
+            if hasattr(elem, 'nodes'):
+                return ', '.join(str(n) for n in elem.nodes if n)
+        except Exception:
+            return ''
+        return ''
 
     def _on_move_nodes_accept(self):
         """Handle node move: open transform dialog after selection."""
@@ -6686,15 +7055,15 @@ class MainWindow(QMainWindow):
             self.tree_widget.addTopLevelItem(item)
             return item
 
-        # ---- Coordinate Systems (high cardinality - batch insert) ----
-        coords_top = None
+        # ---- Coordinate Systems (always shown; v3.4.0 item 6) ----
+        # Group defaults to UNCHECKED + COLLAPSED. Always created so
+        # the user sees N=0 explicitly when there are no coord systems
+        # (rather than the branch silently disappearing).
+        n_coords = len(model.coords or {})
+        coords_top = add_top(
+            f"Coordinate Systems ({n_coords})",
+            data=('group', 'coords'), checked=False)
         if model.coords:
-            # Group defaults to UNCHECKED + COLLAPSED. Big aerospace
-            # decks have dozens of CORD2R systems and they clutter the
-            # tree on first open.
-            coords_top = add_top(
-                "Coordinate Systems",
-                data=('group', 'coords'), checked=False)
             coord_children = []
             for cid in sorted(model.coords.keys()):
                 if cid == 0:
@@ -6718,9 +7087,11 @@ class MainWindow(QMainWindow):
                     data=('coord', cid), checked=False))
             coords_top.addChildren(coord_children)
 
-        # ---- Materials (batch insert) ----
+        # ---- Materials (always shown; v3.4.0 item 6) ----
+        n_materials = len(model.materials or {})
+        mats_item = add_top(
+            f"Materials ({n_materials})", data=('group', 'materials'))
         if model.materials:
-            mats_item = add_top("Materials", data=('group', 'materials'))
             mat_children = [
                 _make_item(
                     f"{mid}: {self._get_entity_title_from_comment(m.comment, 'Material', mid)}",
@@ -6792,9 +7163,11 @@ class MainWindow(QMainWindow):
             plotels_item.addChildren(plotel_children)
             plotels_item.setExpanded(True)
 
-        # ---- Properties (batch insert) ----
+        # ---- Properties (always shown; v3.4.0 item 6) ----
+        n_props = len(model.properties or {})
+        props_item = add_top(
+            f"Properties ({n_props})", data=('group', 'properties'))
         if model.properties:
-            props_item = add_top("Properties", data=('group', 'properties'))
             prop_children = [
                 _make_item(
                     f"{pid}: {self._get_entity_title_from_comment(p.comment, p.type, pid)}",
@@ -7641,6 +8014,37 @@ class MainWindow(QMainWindow):
                     advanced.append(
                         f"{len(coord_warnings)} coord system(s) with "
                         f"dangling parent - treated as basic")
+                # v3.4.0 item 6: always show the model summary so the
+                # user can spot when an entity class came back empty
+                # (e.g. materials in a missing INCLUDE).
+                n_nodes = len(getattr(m, 'nodes', {}) or {})
+                n_elems = (len(getattr(m, 'elements', {}) or {})
+                           + len(getattr(m, 'rigid_elements', {}) or {}))
+                n_props = len(getattr(m, 'properties', {}) or {})
+                n_mats = len(getattr(m, 'materials', {}) or {})
+                n_coords = len(getattr(m, 'coords', {}) or {})
+                advanced.insert(0,
+                    f"{n_nodes:,} nodes, {n_elems:,} elements, "
+                    f"{n_props:,} properties, {n_mats:,} materials, "
+                    f"{n_coords:,} coord systems")
+                # v3.4.0 item 5: RBE integrity warnings (populated by
+                # _create_rbe_actors during scene-build).
+                rbe_warnings = getattr(
+                    m, '_rbe_integrity_warnings', None) or {}
+                if rbe_warnings:
+                    parts = []
+                    if rbe_warnings.get('center_missing'):
+                        parts.append(
+                            f"{rbe_warnings['center_missing']} missing center")
+                    if rbe_warnings.get('partial_legs'):
+                        parts.append(
+                            f"{rbe_warnings['partial_legs']} with partial legs")
+                    if rbe_warnings.get('empty'):
+                        parts.append(
+                            f"{rbe_warnings['empty']} with no valid legs")
+                    if parts:
+                        advanced.append(
+                            "rigid integrity: " + ", ".join(parts))
                 advanced_suffix = ""
                 if advanced:
                     advanced_suffix = " - includes " + ", ".join(advanced)
@@ -9006,33 +9410,48 @@ class MainWindow(QMainWindow):
         colors = []
         line_eids = []  # v3.3.0: one entry per emitted spoke (= one cell)
         pt_idx = 0
+        # v3.4.0 item 5: track per-RBE integrity issues so the import
+        # summary can flag decks with dangling references.
+        integrity = {
+            'center_missing': 0,
+            'partial_legs': 0,
+            'empty': 0,
+            'sample_eids': [],
+        }
 
         for eid, elem in model.rigid_elements.items():
             try:
                 if elem.type == 'RBE2':
                     # RBE2: independent node (gn) is the center, dependent nodes (Gmi) are the legs
                     center_nid = elem.gn
-                    leg_nids = list(elem.Gmi)
+                    leg_nids = list(elem.Gmi or [])
                     color = self.type_color_map.get('RBE2', '#ff3131')
                 elif elem.type == 'RBE3':
                     # RBE3: dependent node (refgrid) is the center, independent nodes are the legs
                     center_nid = elem.refgrid
                     # Extract all grid IDs from weight/component/grid groups
                     leg_nids = []
-                    for wt_cg in elem.wt_cg_groups:
+                    for wt_cg in (elem.wt_cg_groups or []):
                         # wt_cg is (weight, components, grids_list)
-                        leg_nids.extend(wt_cg[2])
+                        leg_nids.extend(wt_cg[2] or [])
                     color = self.type_color_map.get('RBE3', '#ffd700')
                 else:
                     continue
 
-                if center_nid not in model.nodes:
+                if center_nid is None or center_nid not in model.nodes:
+                    integrity['center_missing'] += 1
+                    if len(integrity['sample_eids']) < 50:
+                        integrity['sample_eids'].append(int(eid))
                     continue
 
                 center_pos = model.nodes[center_nid].get_position()
 
+                # Track partial / empty legs.
+                valid_legs = 0
+                missing_legs = 0
                 for leg_nid in leg_nids:
-                    if leg_nid not in model.nodes:
+                    if leg_nid is None or leg_nid not in model.nodes:
+                        missing_legs += 1
                         continue
                     leg_pos = model.nodes[leg_nid].get_position()
                     points.append(center_pos)
@@ -9041,9 +9460,24 @@ class MainWindow(QMainWindow):
                     colors.append(color)
                     line_eids.append(int(eid))
                     pt_idx += 2
+                    valid_legs += 1
+                if valid_legs == 0:
+                    integrity['empty'] += 1
+                    if len(integrity['sample_eids']) < 50:
+                        integrity['sample_eids'].append(int(eid))
+                elif missing_legs > 0:
+                    integrity['partial_legs'] += 1
+                    if len(integrity['sample_eids']) < 50:
+                        integrity['sample_eids'].append(int(eid))
             except (AttributeError, KeyError, IndexError) as e:
                 print(f"Warning: Skipping RBE {eid} visualization: {e}")
                 continue
+
+        # Surface the integrity report so the import-summary can show it.
+        try:
+            model._rbe_integrity_warnings = integrity
+        except Exception:
+            pass
 
         if not points:
             return
@@ -9640,10 +10074,38 @@ class MainWindow(QMainWindow):
             plotel_items = self._find_tree_items(('group', 'plotels'))
             plotel_actor.SetVisibility(not plotel_items or plotel_items[0].checkState(0) == QtCore.Qt.Checked)
 
-        # --- Phase 8: Group visibility ---
+        # --- Phase 8 / v3.4.0: Group visibility ---
+        # v3.4.0 (item 7): a group's effective element set is the union
+        # of its explicit elements + any element whose PID is in
+        # group['properties'] + any element whose material (via PID) is
+        # in group['materials']. That way a group can be defined purely
+        # by "every shell using PID 100" or "every element using MAT 2"
+        # and isolation works as expected.
+        def _effective_eids(grp):
+            eids = set(grp.get("elements", []) or [])
+            grp_pids = set(grp.get("properties", []) or [])
+            grp_mids = set(grp.get("materials", []) or [])
+            if grp_pids or grp_mids:
+                # Build pid -> eids and mid -> pids maps once.
+                if grp_mids:
+                    pid_for_mid: set[int] = set()
+                    for pid, prop in (model.properties or {}).items():
+                        for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                            if getattr(prop, attr, None) in grp_mids:
+                                pid_for_mid.add(pid)
+                                break
+                    grp_pids |= pid_for_mid
+                if grp_pids:
+                    all_e = {**model.elements, **model.rigid_elements}
+                    for eid, elem in all_e.items():
+                        pid = getattr(elem, 'pid', None)
+                        if pid and pid in grp_pids:
+                            eids.add(int(eid))
+            return eids
+
         if self._isolate_mode:
             group_data = self.groups.get(self._isolate_mode, {})
-            group_eids = set(group_data.get("elements", []))
+            group_eids = _effective_eids(group_data)
             if group_eids:
                 visibility_mask &= np.isin(self.current_grid.cell_data['EID'], list(group_eids))
             else:
@@ -9652,7 +10114,7 @@ class MainWindow(QMainWindow):
             hidden_eids: set[int] = set()
             for grp_name in self._hidden_groups:
                 grp = self.groups.get(grp_name, {})
-                hidden_eids.update(grp.get("elements", []))
+                hidden_eids |= _effective_eids(grp)
             if hidden_eids:
                 visibility_mask[np.isin(self.current_grid.cell_data['EID'], list(hidden_eids))] = False
                 # Phase 4.2: ghost-mode overlay - render hidden groups as a

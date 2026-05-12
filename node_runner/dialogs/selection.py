@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QMenu, QPlainTextEdit, QApplication, QGridLayout,
     QAbstractItemView,
 )
-from PySide6.QtGui import QAction, QActionGroup, QFont
+from PySide6.QtGui import QAction, QActionGroup, QFont, QShortcut, QKeySequence
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +381,14 @@ class EntitySelectionBar(QDialog):
         # OK / Cancel
         self._ok_btn.clicked.connect(self._on_ok)
         self._cancel_btn.clicked.connect(self._on_cancel)
+
+        # v3.4.0 (item 1): Ctrl+V anywhere in the dialog pastes clipboard
+        # IDs into the bucket via the same _paste_selection path that
+        # the Pick > Paste menu uses. Works regardless of which child
+        # widget has focus.
+        self._paste_shortcut = QShortcut(
+            QKeySequence.Paste, self, activated=self._paste_selection)
+        self._paste_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
 
     # ------------------------------------------------------------------
     # Pick menu builder

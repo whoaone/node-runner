@@ -1,4 +1,4 @@
-# Node Runner v3.3.1
+# Node Runner v3.4.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,96 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.4.0
+
+Feature release covering nine items from end-user testing on
+`Fuse_BFEM_Complete.bdf` (1.28M elements).
+
+### Entity selection
+- **Ctrl+V into the bucket** - the EntitySelectionBar now has a
+  Qt-standard paste shortcut. Pastes Femap-style range tuples
+  (`1,10,2`), single IDs (`12345`), and multi-line lists; the IDs
+  land in the bucket as signed range rows respecting the current
+  Add/Remove/Exclude radio.
+- **Pick > Paste** menu confirmed to work end-to-end; smoke test added.
+- **Single-ID + More** - typing one ID and clicking More with To/By
+  blank now reliably produces a `12345` bucket row (whitespace-tolerant
+  parser + pytest regression).
+
+### Model tree
+- **Materials / Properties / Coordinate Systems branches always shown**
+  even when empty - the count `(0)` makes absence visible at a glance
+  instead of the branch silently disappearing.
+- **Model summary in the import status** - new line
+  `"N nodes, N elements, N properties, N materials, N coord systems"`
+  so missing entity classes (typically in a missing INCLUDE) are
+  obvious.
+
+### List > Element Information
+- **Type-dispatched node extraction** - RBE2 rows show
+  `gn -> [Gmi]`, RBE3 rows show `[indep nodes] -> refgrid`, CONM2
+  rows show `nid`. Before v3.4.0 the dialog blindly read `elem.nodes`,
+  which doesn't exist on rigid elements - so RBE2/RBE3 rows had an
+  empty Nodes column. PID/MID columns now show `-` for rigid/mass
+  elements that have no PID.
+
+### RBE integrity
+- `_create_rbe_actors` tracks counts of RBEs whose center or any leg
+  isn't in `model.nodes`. The import summary now appends a
+  `"rigid integrity: N missing center, N with partial legs, ..."`
+  line, so the "spider goes to random places" case can be
+  attributed to dangling references in the deck vs the renderer.
+
+### Auto Group fix (RBE2 vs RBE3 distinction)
+- `_group_by_element_type`, `_group_by_property`, `_group_by_material`
+  now walk both `model.elements` AND `model.rigid_elements`. Auto
+  Group "By Element Type" produces distinct `TYPE RBE2` and
+  `TYPE RBE3` groups - previously rigids were skipped entirely
+  because the loops only saw `model.elements`.
+
+### Shading
+- Added a Shading checkbox to the Display tab (next to Style / Color
+  By). Toggles in sync with the existing View menu action.
+- The lit/unlit difference is now obviously visible: `flat`
+  interpolation + full ambient (off) vs `phong` interpolation with
+  high diffuse (on). Status line shows `"Shading: flat (unlit)"` /
+  `"Shading: phong (lit)"` so the user knows it took effect.
+
+### Groups - Femap-style redesign
+- Bottom button grid replaced by a **top toolbar**:
+  ```
+  [New] [Delete] [Rename] | [Add ▾] [Remove ▾] [Clear]
+  [Show All] [Isolate] [Highlight] | [Auto ▾] [Boolean ▾]
+  ```
+- Groups now carry **5 entity types**: `nodes`, `elements`,
+  `properties`, `materials`, `coords`. Group rows in the list now
+  show `(N elems, N nodes, N props, N mats)` when non-empty.
+- New **`GroupAddDialog`** (Femap-style tabbed dialog) with one tab
+  per entity type and rule-based selectors:
+  - Node: By ID range / By connected to selected element /
+    From selection / By group
+  - Element: By ID range / By Property / By Material / By Type /
+    From selection / By group
+  - Property: By ID range / By Material / From selection / By group
+  - Material: By ID range / From selection / By group
+  - Coord: By ID range / From selection / By group
+  Live count refreshes as the user changes selectors.
+- New **Boolean** menu: Union / Intersect / Difference between two
+  existing groups, applied across all 5 entity-type lists. Result
+  goes into a new auto-named group `A + B`, `A & B`, `A - B`.
+- **Isolate / hide** filters now honor `properties` and `materials`
+  too - a group of `materials=[1]` automatically isolates every
+  element whose property's material is 1.
+
+### Sketch-first workflow followed
+- `.claude/sketch_groups_v3_4_0.py` renders the new Groups tab AND
+  the Add-to-Group dialog before the production code lands. Real
+  widgets re-rendered after edits and compared against the sketches.
+
+### Tests
+- 156 pre-existing + 4 new RBE listing tests + 3 new bucket
+  regression tests + 7 new Groups tests = 170 total, all green.
 
 ## Changelog for v3.3.1
 
