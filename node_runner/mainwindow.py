@@ -223,7 +223,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.3.0"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v3.3.1"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -9048,9 +9048,17 @@ class MainWindow(QMainWindow):
         if not points:
             return
 
-        poly = pv.PolyData(np.array(points))
-        flat_lines = [val for line in lines for val in line]
-        poly.lines = np.array(flat_lines)
+        # v3.3.0 bugfix (3.3.1): construct PolyData with `lines=` on the
+        # ctor so it doesn't auto-generate a vertex cell per point.
+        # Previously `pv.PolyData(np.array(points))` produced N point
+        # cells + L line cells = 3L total cells (2 endpoints per spoke +
+        # 1 line per spoke), which made cell_data['EID']'s length-L array
+        # disagree with the dataset's cell count and crash with
+        # "Invalid array shape. Array 'EID' has length (L) but a length
+        # of (3L) was expected" the moment we tried to attach it.
+        flat_lines = np.asarray(
+            [val for line in lines for val in line], dtype=np.int64)
+        poly = pv.PolyData(np.array(points), lines=flat_lines)
 
         # Convert hex colors to per-point RGB (2 points per line segment)
         from PySide6.QtGui import QColor

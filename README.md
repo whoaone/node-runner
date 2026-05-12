@@ -1,4 +1,4 @@
-# Node Runner v3.3.0
+# Node Runner v3.3.1
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,17 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.3.1
+
+Hotfix for a v3.3.0 regression on decks with RBE elements.
+
+### `Invalid array shape. Array 'EID' has length (L) but a length of (3L) was expected`
+Symptom: importing a deck with RBE2/RBE3 elements (e.g. `Fuse_BFEM_Complete.bdf`) failed with the popup above. Pre-v3.3.0, RBE actors were `pickable=False` so this code path didn't exist.
+
+Root cause: `_create_rbe_actors` built the PolyData as `pv.PolyData(np.array(points))` then assigned `.lines = ...`. The first call auto-generates one VERTEX cell per point, so a polydata with 2L endpoints + L lines ends up with 3L cells — and the L-entry `cell_data['EID']` array length didn't match. PyVista's array-shape validator raised, the exception bubbled to the post-parse popup.
+
+Fix: construct PolyData with the lines on the ctor (`pv.PolyData(points, lines=flat_lines)`) so no auto-vertices are generated. RBE picking still works (the line cells carry the EID array as before), and the cell count finally matches the EID array length.
 
 ## Changelog for v3.3.0
 
