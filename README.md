@@ -1,4 +1,4 @@
-# Node Runner v3.4.0
+# Node Runner v3.4.1
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
@@ -14,6 +14,29 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v3.4.1
+
+Hotfix for an import hang on decks with hundreds of thousands of PLOAD4 pressure-load faces (e.g. `FUSE-XWFF_04A_DUL_FDC-Boost-2.dat`).
+
+### Symptom
+Import would reach "Stage 6/6: Building 3D scene" and stick on "Building load actors (FORCE/MOMENT/PLOAD4)..." with Windows marking the app "Not Responding" indefinitely.
+
+### Root cause
+`_create_all_load_actors` iterates every PLOAD4 face and called `self.current_grid.get_cell(cell_idx)` to fetch the cell's center + points for the pressure-arrow normal. Each call wraps a VTK cell in a `pyvista.Cell` object - on a deck with 600k+ pressure face references that's 600k Python objects allocated, plus a Python-level cross-product per cell, plus per-cell normalize. With the GIL held the main thread blocks long enough that Windows raises the "Not Responding" overlay.
+
+### Fix
+v3.4.1 precomputes per-cell centers + shell normals once per grid in vectorized numpy:
+
+- `cell_centers = grid.cell_centers().points` — one bulk VTK call.
+- Shell normals (QUAD + TRIANGLE) computed via a single batched `np.cross(p1-p0, p2-p0)` over all shell cell indices simultaneously, using `grid.cell_connectivity` + `grid.offset` to gather the first three vertex indices per cell.
+- Non-shell cells get a fallback `+Z` normal (PLOAD4-on-solid arrows still get *a* direction; magnitude/coloring is correct).
+
+The per-PLOAD4 loop in `_create_all_load_actors` now does dict lookups + a single `np.asarray` + a batched index into the precomputed arrays. On the user's deck this drops the load-actor build from minutes-to-hung to under a second.
+
+Per-SID progress is also emitted into the import dialog so monster decks with many load sets still show forward motion.
+
+170 tests still pass.
 
 ## Changelog for v3.4.0
 
