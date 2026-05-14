@@ -405,20 +405,31 @@ def apply_display_lod(grid, threshold=500_000, target_shells=200_000):
 
     keep_cells = []
 
+    # v4.0.1 (Stage 1): instrument the two suspect VTK ops.
+    from node_runner.profiling import perf_stage, perf_event
+
     # Stride-sample shells.
     shell_idxs = np.where(shell_mask)[0]
     if shell_idxs.size:
-        stride = max(1, int(np.ceil(shell_idxs.size / target_shells)))
-        keep_cells.append(shell_idxs[::stride])
+        with perf_stage('lod', 'shell_stride_sample',
+                        n_shells=int(shell_idxs.size),
+                        target=int(target_shells)):
+            stride = max(1, int(np.ceil(shell_idxs.size / target_shells)))
+            keep_cells.append(shell_idxs[::stride])
 
     # For solids: extract outer surface via a sub-grid.
     solid_idxs = np.where(solid_mask)[0]
     solid_surface = None
     if solid_idxs.size:
         try:
-            solid_grid = grid.extract_cells(solid_idxs)
-            solid_surface = solid_grid.extract_surface()
-        except Exception:
+            with perf_stage('lod', 'solid_extract_cells',
+                            n_solids=int(solid_idxs.size)):
+                solid_grid = grid.extract_cells(solid_idxs)
+            with perf_stage('lod', 'solid_extract_surface',
+                            n_solids=int(solid_idxs.size)):
+                solid_surface = solid_grid.extract_surface()
+        except Exception as exc:
+            perf_event('lod', 'solid_extract_failed', exc=str(exc)[:120])
             # Fallback: stride-sample the solids too.
             stride = max(1, int(np.ceil(solid_idxs.size / target_shells)))
             keep_cells.append(solid_idxs[::stride])
@@ -430,7 +441,9 @@ def apply_display_lod(grid, threshold=500_000, target_shells=200_000):
 
     if keep_cells:
         keep_arr = np.concatenate(keep_cells)
-        partial = grid.extract_cells(keep_arr)
+        with perf_stage('lod', 'extract_keep_cells',
+                        n_keep=int(keep_arr.size)):
+            partial = grid.extract_cells(keep_arr)
     else:
         partial = None
 
@@ -438,7 +451,8 @@ def apply_display_lod(grid, threshold=500_000, target_shells=200_000):
         # Append the solid surface onto the cell-extracted partial.
         # Both should be UnstructuredGrids (or compatible).
         try:
-            display = partial.merge(solid_surface)
+            with perf_stage('lod', 'merge_partial_and_solid_surface'):
+                display = partial.merge(solid_surface)
         except Exception:
             display = partial
     elif solid_surface is not None:

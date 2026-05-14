@@ -436,7 +436,31 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
             j = i
         return inside
 
+    # v4.0.3 (Stage N): only these actors carry valid node positions.
+    # The node-picker fallback ignores hits on rigid-element spider
+    # lines, mass-glyph cubes, glyph fields, etc. — those don't have
+    # ``vtkOriginalPointIds`` and trying to map a click on them to a
+    # node ID always misses.
+    _NODE_PICK_ALLOWED_ACTORS = frozenset({
+        'shells', 'beams', 'nodes_actor', 'free_edges_actor',
+    })
+
+    def _resolve_actor_name(self, actor):
+        """Best-effort name lookup for a picked actor (PyVista keeps
+        a name index in `plotter.actors`)."""
+        if actor is None:
+            return None
+        try:
+            for k, v in self.main_window.plotter.actors.items():
+                if v is actor:
+                    return k
+        except Exception:
+            pass
+        return None
+
     def perform_pick(self, click_pos):
+        from node_runner.profiling import perf_event
+        import numpy as np
         if not (renderer := self.main_window.plotter.renderer): return
 
         entity_type = self.main_window.current_selection_type
@@ -445,30 +469,129 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
         try:
             entity_id = -1
+            # v4.0.2 (Stage F): instrument picker outcome so we can
+            # diagnose "No node found at location". Records what the
+            # picker actually returned at each stage of the fallback
+            # chain.
+            diag = {'entity_type': entity_type, 'cx': click_pos[0], 'cy': click_pos[1]}
             if entity_type == 'Node':
                 picker = vtk.vtkPointPicker()
+                # v4.0.2 (Stage F): widen tolerance for big decks.
+                # Default tolerance is 0.025 in normalized display
+                # coords (~25 pixels on a 1000px viewport). On dense
+                # meshes that's actually fine, but if the mesh has
+                # been LOD'd (display grid != full grid), the point
+                # picker can miss because the rendered points are
+                # sparser than the underlying nodes.
+                picker.SetTolerance(0.02)
                 picker.Pick(click_pos[0], click_pos[1], 0, renderer)
 
                 point_id_local = picker.GetPointId()
                 picked_actor = picker.GetActor()
+                actor_name = self._resolve_actor_name(picked_actor)
+                diag['point_id_local'] = int(point_id_local)
+                diag['picked_actor'] = (picked_actor is not None)
+                diag['actor_name'] = actor_name
 
-                if picked_actor and point_id_local != -1:
+                # v4.0.3 (Stage N): reject hits on non-mesh actors so
+                # the fallback chain has a fair shot.
+                actor_is_allowed = (
+                    actor_name is None  # unnamed: assume mesh
+                    or actor_name in self._NODE_PICK_ALLOWED_ACTORS
+                )
+                if picked_actor and not actor_is_allowed:
+                    perf_event('pick', 'rejected_actor',
+                               actor_name=actor_name, phase='point_pick')
+
+                if (picked_actor and point_id_local != -1
+                        and actor_is_allowed):
                     dataset = picked_actor.GetMapper().GetInput()
-                    if dataset and 'vtkOriginalPointIds' in dataset.point_data:
+                    has_orig_ids = bool(dataset and 'vtkOriginalPointIds' in dataset.point_data)
+                    diag['has_vtkOriginalPointIds'] = has_orig_ids
+                    if has_orig_ids:
                         original_point_id = int(dataset.point_data['vtkOriginalPointIds'][point_id_local])
+                        diag['original_point_id'] = original_point_id
                         if 0 <= original_point_id < len(self.main_window.current_node_ids_sorted):
                             entity_id = self.main_window.current_node_ids_sorted[original_point_id]
 
+                # v4.0.2 (Stage F): cell-fallback. v4.0.3 (Stage N)
+                # also restricts the cell fallback to allowed actors.
+                if entity_id == -1:
+                    cp = vtk.vtkCellPicker()
+                    cp.SetTolerance(0.005)
+                    cp.Pick(click_pos[0], click_pos[1], 0, renderer)
+                    cell_id = cp.GetCellId()
+                    cp_actor = cp.GetActor()
+                    cp_actor_name = self._resolve_actor_name(cp_actor)
+                    cp_allowed = (
+                        cp_actor_name is None
+                        or cp_actor_name in self._NODE_PICK_ALLOWED_ACTORS
+                    )
+                    diag['cell_fallback_cell_id'] = int(cell_id)
+                    diag['cell_fallback_actor'] = (cp_actor is not None)
+                    diag['cell_fallback_actor_name'] = cp_actor_name
+                    if cp_actor and not cp_allowed:
+                        perf_event('pick', 'rejected_actor',
+                                   actor_name=cp_actor_name,
+                                   phase='cell_fallback')
+                    if cp_actor and cell_id != -1 and cp_allowed:
+                        ds = cp_actor.GetMapper().GetInput()
+                        if ds and 'vtkOriginalPointIds' in ds.point_data:
+                            # Snap to closest of the cell's vertices.
+                            cell = ds.GetCell(cell_id)
+                            pid = cell.GetPointIds()
+                            pick_xyz = cp.GetPickPosition()
+                            best = None
+                            best_d = float('inf')
+                            for i in range(pid.GetNumberOfIds()):
+                                lid = pid.GetId(i)
+                                xyz = ds.GetPoint(lid)
+                                d = (xyz[0]-pick_xyz[0])**2 + (xyz[1]-pick_xyz[1])**2 + (xyz[2]-pick_xyz[2])**2
+                                if d < best_d:
+                                    best_d = d
+                                    best = lid
+                            if best is not None:
+                                orig = int(ds.point_data['vtkOriginalPointIds'][best])
+                                if 0 <= orig < len(self.main_window.current_node_ids_sorted):
+                                    entity_id = self.main_window.current_node_ids_sorted[orig]
+                                    diag['cell_fallback_hit_nid'] = entity_id
+
+                # v4.0.3 (Stage N): if both pickers either missed or
+                # hit a rejected actor, fall back to a direct
+                # closest-point search against the current_grid
+                # points. This always reaches a valid node ID on
+                # whatever mesh point is nearest the click ray.
+                if entity_id == -1:
+                    grid = getattr(self.main_window, 'current_grid', None)
+                    if grid is not None and grid.n_points > 0:
+                        # World ray at the click position.
+                        world_picker = vtk.vtkWorldPointPicker()
+                        world_picker.Pick(click_pos[0], click_pos[1], 0, renderer)
+                        wx, wy, wz = world_picker.GetPickPosition()
+                        pts = np.asarray(grid.points)
+                        diff = pts - np.array([wx, wy, wz])
+                        idx = int(np.argmin(np.einsum('ij,ij->i', diff, diff)))
+                        if 0 <= idx < len(self.main_window.current_node_ids_sorted):
+                            entity_id = self.main_window.current_node_ids_sorted[idx]
+                            diag['grid_closest_point_idx'] = idx
+                            diag['grid_closest_hit_nid'] = entity_id
+
             elif entity_type == 'Element':
                 picker = vtk.vtkCellPicker()
+                picker.SetTolerance(0.005)
                 picker.Pick(click_pos[0], click_pos[1], 0, renderer)
                 cell_id_local = picker.GetCellId()
                 picked_actor = picker.GetActor()
+                diag['cell_id_local'] = int(cell_id_local)
+                diag['picked_actor'] = (picked_actor is not None)
 
                 if picked_actor and cell_id_local != -1:
                     dataset = picked_actor.GetMapper().GetInput()
                     if dataset and 'EID' in dataset.cell_data:
                         entity_id = int(dataset.cell_data["EID"][cell_id_local])
+
+            diag['entity_id'] = int(entity_id)
+            perf_event('pick', 'attempt', **diag)
 
             if entity_id == -1:
                  self.main_window._update_status(f"No {entity_type.lower()} found at this location.")

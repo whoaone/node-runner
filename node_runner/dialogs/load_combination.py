@@ -18,8 +18,11 @@ This dialog mirrors that UI:
     - Restore / OK / Cancel
 
 Modes: 'create' / 'edit' / 'copy'. Storage roundtrips through
-``model.load_combinations[sid]`` (a dict with keys ``scale``,
-``scale_factors``, ``load_ids``).
+``model.load_combinations[sid]``. After a real ``read_bdf`` parse this
+slot is ``list[LOAD]`` (one card object per overlapping SID); in-session
+edits write back as a dict ``{scale, scale_factors, load_ids, title}``.
+The ``read_combo_payload`` adapter below normalizes both shapes so the
+rest of the UI can stay dict-shaped.
 """
 
 from __future__ import annotations
@@ -32,6 +35,32 @@ from PySide6.QtWidgets import (
     QLineEdit, QDoubleSpinBox, QSpinBox, QFrame, QTableWidget, QHeaderView,
     QTableWidgetItem, QComboBox, QMessageBox, QAbstractItemView,
 )
+
+
+def read_combo_payload(combo_data) -> dict:
+    """Normalize ``model.load_combinations[sid]`` to dict shape.
+
+    After ``read_bdf`` the value is ``list[LOAD]`` (one pyNastran LOAD
+    card per overlapping SID). In-session edits write back a dict. This
+    adapter returns ``{scale, scale_factors, load_ids, title}`` for both.
+    """
+    if isinstance(combo_data, list) and combo_data:
+        L = combo_data[0]
+        comment = getattr(L, 'comment', '') or ''
+        return {
+            'scale': float(getattr(L, 'scale', 1.0)),
+            'scale_factors': [float(s) for s in getattr(L, 'scale_factors', [])],
+            'load_ids': [int(i) for i in getattr(L, 'load_ids', [])],
+            'title': comment.strip(),
+        }
+    if isinstance(combo_data, dict):
+        return {
+            'scale': float(combo_data.get('scale', 1.0)),
+            'scale_factors': [float(s) for s in combo_data.get('scale_factors', [])],
+            'load_ids': [int(i) for i in combo_data.get('load_ids', [])],
+            'title': str(combo_data.get('title', '') or ''),
+        }
+    return {'scale': 1.0, 'scale_factors': [], 'load_ids': [], 'title': ''}
 
 
 def _summarize_load_set(model, sid) -> str:
@@ -76,32 +105,32 @@ class LoadCombinationDialog(QDialog):
         all_load_sids = sorted((model.loads or {}).keys()) if model else []
         self._available_load_sids = all_load_sids
 
-        # Compute initial state from mode.
+        # Compute initial state from mode. read_combo_payload handles
+        # both list[LOAD] (real parse) and dict (in-session) shapes.
         if mode == self.MODE_EDIT and combo_sid in (model.load_combinations or {}):
-            init_data = model.load_combinations[combo_sid]
+            init_data = read_combo_payload(model.load_combinations[combo_sid])
             self._initial_sid = combo_sid
             self._sid_editable = False
             title = f"Edit Load Combination: SID {combo_sid}"
         elif mode == self.MODE_COPY and combo_sid in (model.load_combinations or {}):
-            init_data = dict(model.load_combinations[combo_sid])
+            init_data = read_combo_payload(model.load_combinations[combo_sid])
             self._initial_sid = self._next_sid(all_combo_sids | set(all_load_sids))
             self._sid_editable = True
             title = f"Copy Load Combination (from SID {combo_sid})"
         else:
-            init_data = {'scale': 1.0, 'scale_factors': [],
-                         'load_ids': []}
+            init_data = read_combo_payload(None)
             self._initial_sid = self._next_sid(all_combo_sids | set(all_load_sids))
             self._sid_editable = True
             title = "New Load Combination"
 
         self._initial_payload = {
-            'scale': float(init_data.get('scale', 1.0)),
-            'scale_factors': list(init_data.get('scale_factors', [])),
-            'load_ids': list(init_data.get('load_ids', [])),
+            'scale': init_data['scale'],
+            'scale_factors': list(init_data['scale_factors']),
+            'load_ids': list(init_data['load_ids']),
         }
         # Title text is not part of the Nastran LOAD card; we keep it
         # only for the dialog's display and a comment annotation.
-        self._initial_title = init_data.get('title', '')
+        self._initial_title = init_data['title']
 
         self.setWindowTitle(title)
         self.setMinimumWidth(620)

@@ -38,9 +38,11 @@ def main_window(qapp, qtbot):
 
 class TestMainWindow:
 
-    def test_window_title_says_v3(self, main_window):
-        # Match the v3.x family; specific minor/patch version stamped elsewhere.
-        assert "v3." in main_window.windowTitle()
+    def test_window_title_has_version(self, main_window):
+        # Match any vN.X family (v3.x through v4.x and beyond); specific
+        # minor/patch version is stamped in node_runner/__init__.py.
+        import re
+        assert re.search(r"v\d+\.", main_window.windowTitle())
 
     def test_status_widgets_exist(self, main_window):
         assert hasattr(main_window, "_status_model_lbl")

@@ -398,9 +398,24 @@ class _BdfImportThread(QThread):
                     source_file='Counting files + sizes...',
                     fraction=0.0,
                 ))
-                model, lenient_result = (
-                    NastranModelGenerator._read_bdf_streaming(
-                        self._filepath, progress=_bridge))
+                # v4.0.0 (Phase D): for big multi-INCLUDE decks, route to
+                # the per-INCLUDE ProcessPoolExecutor parser. Falls back
+                # to streaming on any failure (worker exception, DMIG /
+                # superelement deck, merge collision).
+                model, lenient_result = (None, None)
+                try:
+                    from node_runner.parallel_parse import (
+                        should_use_parallel, parse_bdf_parallel)
+                    if should_use_parallel(self._filepath):
+                        model, lenient_result = parse_bdf_parallel(
+                            self._filepath, progress=_bridge)
+                except Exception:
+                    model, lenient_result = (None, None)
+                if model is None:
+                    # Either parallel was skipped (small deck) or failed.
+                    model, lenient_result = (
+                        NastranModelGenerator._read_bdf_streaming(
+                            self._filepath, progress=_bridge))
             else:
                 self.progress.emit(ImportProgress(
                     stage='parse',

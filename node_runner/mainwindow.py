@@ -4,6 +4,7 @@ import json
 import math
 import random
 import re
+import time
 import numpy as np
 import pyvista as pv
 import vtk
@@ -80,6 +81,60 @@ from node_runner.dialogs import (
     CreateGeometryArcDialog, CreateGeometryCircleDialog,
     CreateGeometrySurfaceDialog, MeshCurveDialog, MeshSurfaceDialog,
 )
+
+
+# v4.0.11 (Fix C): module-level Nastran-type ↔ category lookup tables.
+# Pre-built per-category actors at viewer-build time are named
+# `cat_<NTYPE>` and toggled via these mappings.
+#
+# Source of truth: the inline `type_to_nastran_map` and
+# `shape_to_nastran_map` in `_update_plot_visibility` (which we leave
+# alone to keep the legacy path intact). The forward maps below
+# duplicate that data; the inverse maps are pre-computed so the fast
+# path can resolve compound visibility (type ∧ shape) in O(1) per
+# ntype.
+
+_TYPE_CATEGORY_TO_NTYPES: dict[str, list[str]] = {
+    'Beams': ['CBEAM'],
+    'Bars': ['CBAR'],
+    'Rods': ['CROD'],
+    'Bushes': ['CBUSH'],
+    'Plates': ['CQUAD4', 'CMEMBRAN', 'CTRIA3'],
+    'Rigid': ['RBE2', 'RBE3'],
+    'Solids': ['CHEXA', 'CHEXA8', 'CHEXA20',
+               'CTETRA', 'CTETRA4', 'CTETRA10',
+               'CPENTA', 'CPENTA6', 'CPENTA15'],
+    'Shear': ['CSHEAR'],
+    'Gap': ['CGAP'],
+}
+_SHAPE_CATEGORY_TO_NTYPES: dict[str, list[str]] = {
+    'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'],
+    'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'],
+    'Tria': ['CTRIA3'],
+    'Rigid': ['RBE2', 'RBE3'],
+    'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'],
+    'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'],
+    'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'],
+}
+_NTYPE_TO_TYPE_CATEGORY: dict[str, str] = {
+    ntype: cat
+    for cat, ntypes in _TYPE_CATEGORY_TO_NTYPES.items()
+    for ntype in ntypes
+}
+_NTYPE_TO_SHAPE_CATEGORY: dict[str, str] = {
+    ntype: cat
+    for cat, ntypes in _SHAPE_CATEGORY_TO_NTYPES.items()
+    for ntype in ntypes
+}
+
+# v4.0.15: color modes the pre-built per-Nastran-type actors can
+# render at build time. Adding a new mode? If the data lives on
+# cell_data and a colormap is per-cell (like PID), add the name
+# here AND a branch in `_build_pre_built_category_actors`'s color-
+# computation block. Otherwise the legacy `_rebuild_plot` path
+# handles it (e.g., 'quality' / 'results' which depend on external
+# data flow).
+_PRE_BUILT_SUPPORTED_COLOR_MODES: frozenset = frozenset({'type', 'property'})
 
 
 class SelectionOverlay:
@@ -224,7 +279,7 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v3.5.0"); self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("Node Runner v4.0.7"); self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -252,8 +307,10 @@ class MainWindow(QMainWindow):
                 'highlight_color', DEFAULT_HIGHLIGHT_COLOR)
             sizes = prefs.get('sizes') or {}
             # Mass glyph scale: stored as percent, used as fraction.
+            # v4.0.7: default lowered from 1.5% to 0.75% (cubes were
+            # too prominent on dense models).
             self.mass_glyph_scale = float(
-                sizes.get('mass_glyph_scale_pct', 1.5)) / 100.0
+                sizes.get('mass_glyph_scale_pct', 0.75)) / 100.0
             self.node_size = int(sizes.get('node_size', self.node_size))
             self.beam_width = int(sizes.get('beam_width', self.beam_width))
             self.edge_width = int(sizes.get('edge_width', self.edge_width))
@@ -264,7 +321,7 @@ class MainWindow(QMainWindow):
         except Exception:
             from node_runner.theme import SELECTION_ACCENT
             self.highlight_color = SELECTION_ACCENT
-            self.mass_glyph_scale = 0.015
+            self.mass_glyph_scale = 0.0075  # v4.0.7: half of pre-v4.0.7 default
             self.rbe_line_width = 3
             self.free_edge_width = 4
             self.highlight_outline_width = 5
@@ -295,6 +352,28 @@ class MainWindow(QMainWindow):
         self._lazy_load_normals = None
         self._lazy_load_eid_to_idx = None
         self._lazy_load_built_sids: set = set()
+        # v4.0.10: maintained sets of currently-visible load / SPC SIDs.
+        # Updated by _fast_path_sid_toggle (O(1)) and refreshed from
+        # tree state at every full visibility cycle entry
+        # (defensive). The load_sid_loop / spc_sid_loop iterate
+        # ONLY these sets instead of all model.loads.keys() / spcs.keys(),
+        # collapsing the 1,962-iteration cost to N (whatever the user
+        # has checked).
+        self._visible_load_sids: set = set()
+        self._visible_spc_sids: set = set()
+        # v4.0.14 (Fix C v2): pre-built per-Nastran-type actors,
+        # redesigned after v4.0.11 was reverted. Built from the FULL
+        # `current_grid` (not the LOD'd `current_display_grid` —
+        # that was the v4.0.11 visual regression: ~10% of plates
+        # showed because the LOD shell-stride sampler reduces shells
+        # to 200k and drops RBE2/RBE3 entirely). With current_grid:
+        # full-density visual matches legacy; RBE2/RBE3 actors are
+        # built. Category toggles become SetVisibility calls.
+        # PID/MID/isolate/hidden_groups force fall-through to legacy
+        # _rebuild_plot via `_using_legacy_mesh`.
+        self._category_actors: dict = {}
+        self._category_visible_ntypes: set = set()
+        self._using_legacy_mesh: bool = False
 
         # --- Measurement tools state ---
         self._measurement_picks = []
@@ -672,7 +751,8 @@ class MainWindow(QMainWindow):
         # v3.4.0 item 8: Shading checkbox in the Display tab. Mirrors
         # the View > Shading menu action so both stay in sync.
         self.shading_display_check = QCheckBox()
-        self.shading_display_check.setChecked(True)
+        # v4.0.1: default OFF to match the View > Shading action.
+        self.shading_display_check.setChecked(False)
         self.shading_display_check.toggled.connect(
             self._on_shading_display_toggled)
         render_layout.addRow("Shading:", self.shading_display_check)
@@ -851,6 +931,15 @@ class MainWindow(QMainWindow):
         self.anim_speed_slider.valueChanged.connect(self._on_anim_speed_changed)
         self.anim_export_gif_btn.clicked.connect(self._export_results_gif)
 
+        # v4.0.0 (E3): "Show All Entities" button - one-click recovery
+        # from accidentally hiding everything. Re-checks every tree
+        # checkbox + re-evaluates plot visibility.
+        self.show_all_btn = QPushButton("Show All Entities")
+        self.show_all_btn.setToolTip(
+            "Re-enable visibility for every entity in the Model tree.")
+        self.show_all_btn.clicked.connect(self._show_all_entities)
+        display_tab_layout.addWidget(self.show_all_btn)
+
         display_tab_layout.addStretch()
         display_scroll.setWidget(display_inner)
         self.sidebar_tabs.addTab(display_scroll, "Display")
@@ -858,6 +947,53 @@ class MainWindow(QMainWindow):
         self.plotter = QtInteractor(self)
         self.plotter.set_background('#1e1e2e')
         self.plotter.installEventFilter(self)  # Catch ESC for presentation mode
+
+        # v4.0.1 (Stage 1): register the profiling status sink so
+        # `with perf_stage(..., status_msg=...)` calls land in the
+        # import dialog / status bar.
+        try:
+            from node_runner.profiling import set_status_callback
+            set_status_callback(self._emit_render_progress)
+        except Exception:
+            pass
+
+        # v4.0.0 (A2): install a 3-light rig so phong shading produces
+        # a visible delta vs flat. PyVista's default is a single
+        # headlight, which on edge-overlaid meshes gives a near-flat
+        # appearance regardless of interpolation mode.
+        self._install_light_rig()
+
+        # v4.0.0 (A2): wrap plotter.add_mesh so every new actor inherits
+        # the user's current shading state. Pre-v4.0.0, actors created
+        # after a Shading toggle kept the default phong state and looked
+        # out of sync with the rest of the scene.
+        _orig_add_mesh = self.plotter.add_mesh
+
+        def _add_mesh_with_shading(*args, **kw):
+            actor = _orig_add_mesh(*args, **kw)
+            try:
+                self._apply_shading_to_actor(actor)
+            except Exception:
+                pass
+            return actor
+
+        self.plotter.add_mesh = _add_mesh_with_shading
+
+        # v4.0.9: wrap plotter.render() so every frame-present cost is
+        # observable. Separates VTK render time from our Python work so
+        # we can tell whether per-click latency is GPU-bound or CPU-bound.
+        # Gated by the perf_stage emit logic on NR_PROFILE=1.
+        _orig_render = self.plotter.render
+
+        def _render_with_timing(*args, **kw):
+            try:
+                from node_runner.profiling import perf_stage
+                with perf_stage('render', 'present'):
+                    return _orig_render(*args, **kw)
+            except Exception:
+                return _orig_render(*args, **kw)
+
+        self.plotter.render = _render_with_timing
 
         # Phase 2.3: Render debouncer. _request_render() coalesces a burst
         # of render() calls into one frame on a 16ms timer. Existing direct
@@ -982,7 +1118,110 @@ class MainWindow(QMainWindow):
         self.selection_bar.rejected.connect(self._on_selection_bar_rejected)
 
         self.theme_button.clicked.connect(self._toggle_theme)
-        self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+        # v4.0.4 (Stage R): use Qt.UniqueConnection so a duplicate
+        # connect attempt RAISES instead of silently creating a
+        # second connection (which would mute the first slot in
+        # some Qt versions). Wrap in try/except so we don't crash if
+        # something already connected this slot earlier.
+        try:
+            self.tree_widget.itemChanged.connect(
+                self._handle_tree_item_changed, QtCore.Qt.UniqueConnection)
+        except Exception as _exc:
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('tree', 'unique_connect_failed',
+                           signal='itemChanged',
+                           exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            except Exception:
+                pass
+            # Fall back to a normal connect (may silently double-bind).
+            self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+        # v4.0.10 hotfix: wire the loads-tab tree's itemChanged signal.
+        # Pre-v4.0.10 this connection didn't exist, so clicking a
+        # load_set / constraint_set checkbox visually toggled the
+        # checkbox but fired NO Python handler — no visibility update.
+        # Confirmed via v4.0.9 profile log
+        # (profile_20260513_135348.log): zero fast_path.load_set_toggle
+        # events despite the user clicking load_sets. v4.0.5's
+        # default-OFF flip surfaced the bug; v4.0.9's fast path made
+        # it loud.
+        try:
+            self.loads_tab_tree.itemChanged.connect(
+                self._handle_tree_item_changed, QtCore.Qt.UniqueConnection)
+        except Exception as _exc:
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('tree', 'unique_connect_failed',
+                           signal='loads_tab.itemChanged',
+                           exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            except Exception:
+                pass
+            self.loads_tab_tree.itemChanged.connect(self._handle_tree_item_changed)
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('tree', 'signal_connected',
+                       model_tree_itemChanged=True,
+                       loads_tab_itemChanged=True)
+        except Exception:
+            pass
+        # v4.0.2 (Stage E): also wire itemClicked. This fires for EVERY
+        # click on the tree regardless of whether the checkbox state
+        # changed. Gives us:
+        #   1. A diagnostic event in the profile log (we can tell
+        #      whether a "I clicked but nothing happened" is a tree-
+        #      handler issue vs. a click-on-row-text-not-checkbox issue).
+        #   2. The chance to auto-toggle the checkbox when the user
+        #      clicks anywhere on a category row.
+        try:
+            self.tree_widget.itemClicked.connect(
+                self._handle_tree_item_clicked, QtCore.Qt.UniqueConnection)
+        except Exception as _exc:
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('tree', 'unique_connect_failed',
+                           signal='itemClicked',
+                           exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            except Exception:
+                pass
+            self.tree_widget.itemClicked.connect(self._handle_tree_item_clicked)
+
+        # v4.0.4 (Stage R): alternative signal connections. If the
+        # signal pipeline is partly broken, ONE of these might still
+        # fire and tell us where the break is. Each handler just emits
+        # a perf_event.
+        try:
+            self.tree_widget.itemPressed.connect(
+                self._handle_tree_item_pressed)
+            self.tree_widget.itemSelectionChanged.connect(
+                self._handle_tree_selection_changed)
+        except Exception:
+            pass
+
+        # v4.0.3 (Stage K) / v4.0.5 (Stage V): event filter on
+        # tree_widget only. Pre-v4.0.5 we ALSO installed it on the
+        # viewport. The v4.0.4 log showed Qt's `itemPressed` /
+        # `itemClicked` / `itemChanged` signals all dead while
+        # `itemSelectionChanged` worked — a known PySide6 pattern
+        # for "event filter on QAbstractItemView's viewport breaks
+        # the view's mousePressEvent dispatch". v4.0.5 bisects by
+        # removing the viewport filter.
+        # Gated on NR_PROFILE=1; zero overhead in normal runs.
+        try:
+            from node_runner.profiling import enabled as _profile_on, perf_event
+            if _profile_on():
+                self.tree_widget.installEventFilter(self)
+                # v4.0.5 (Stage V): viewport filter intentionally
+                # NOT installed. If tree item signals fire after this
+                # change, the viewport filter was the cause.
+                perf_event('tree', 'viewport_filter_disabled',
+                           reason='v4.0.5_bisect_test')
+                perf_event('tree', 'signal_connected',
+                           itemChanged=True,
+                           itemClicked=True,
+                           event_filter_installed=True,
+                           viewport_filtered=False)
+        except Exception:
+            pass
         self.show_node_labels_check.toggled.connect(self._toggle_node_labels)
         self.show_elem_labels_check.toggled.connect(self._toggle_element_labels)
 
@@ -1526,7 +1765,8 @@ class MainWindow(QMainWindow):
         self.show_origin_action = QAction("Show Origin", self, checkable=True)
         self.show_origin_action.toggled.connect(self._toggle_origin)
         view_menu.addAction(self.show_origin_action)
-        self.shading_action = QAction("Shading", self, checkable=True, checked=True)
+        # v4.0.1: default OFF (user preference; matches typical FEA preprocessors).
+        self.shading_action = QAction("Shading", self, checkable=True, checked=False)
         self.shading_action.toggled.connect(self._toggle_shading)
         view_menu.addAction(self.shading_action)
         view_menu.addSeparator()
@@ -1725,6 +1965,7 @@ class MainWindow(QMainWindow):
             point_size=self.node_size,
             render_points_as_spheres=False,
             name=name,
+            reset_camera=False,  # v4.0.13: was missing
         )
 
         if decimated:
@@ -1804,19 +2045,25 @@ class MainWindow(QMainWindow):
         bar = self.statusBar()
         self._status_model_lbl = QLabel("Model: Untitled")
         self._status_nodes_lbl = QLabel("Nodes: 0")
+        # v4.1.0: element count alongside node count.
+        self._status_elements_lbl = QLabel("Elements: 0")
         self._status_format_lbl = QLabel(f"Export: {self._export_format.title()}")
         self._status_units_lbl = QLabel(
             f"Units: {self._units}" if self._units else ""
         )
         for lbl in (self._status_model_lbl, self._status_nodes_lbl,
+                    self._status_elements_lbl,
                     self._status_format_lbl, self._status_units_lbl):
             lbl.setStyleSheet("padding: 0 8px;")
         sep1 = QFrame(); sep1.setFrameShape(QFrame.VLine); sep1.setFrameShadow(QFrame.Sunken)
+        sep_el = QFrame(); sep_el.setFrameShape(QFrame.VLine); sep_el.setFrameShadow(QFrame.Sunken)
         sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
         sep3 = QFrame(); sep3.setFrameShape(QFrame.VLine); sep3.setFrameShadow(QFrame.Sunken)
         bar.addPermanentWidget(self._status_model_lbl)
         bar.addPermanentWidget(sep1)
         bar.addPermanentWidget(self._status_nodes_lbl)
+        bar.addPermanentWidget(sep_el)
+        bar.addPermanentWidget(self._status_elements_lbl)
         bar.addPermanentWidget(sep2)
         bar.addPermanentWidget(self._status_format_lbl)
         bar.addPermanentWidget(sep3)
@@ -1832,12 +2079,21 @@ class MainWindow(QMainWindow):
             name = "Untitled"
         self._status_model_lbl.setText(f"Model: {name}")
         node_count = 0
+        element_count = 0
         if self.current_generator is not None and self.current_generator.model is not None:
             try:
                 node_count = len(self.current_generator.model.nodes)
             except Exception:
                 node_count = 0
+            # v4.1.0: element count matches the tree's "Elements (N)" total
+            # (elements + rigid_elements).
+            try:
+                m = self.current_generator.model
+                element_count = len(m.elements) + len(m.rigid_elements)
+            except Exception:
+                element_count = 0
         self._status_nodes_lbl.setText(f"Nodes: {node_count:,}")
+        self._status_elements_lbl.setText(f"Elements: {element_count:,}")
         self._status_format_lbl.setText(f"Export: {self._export_format.title()}")
         self._status_units_lbl.setText(
             f"Units: {self._units}" if self._units else ""
@@ -1855,6 +2111,10 @@ class MainWindow(QMainWindow):
         if detected_format in ("short", "long", "free"):
             self._export_format = detected_format
         self._refresh_status_widgets()
+        # v4.0.1: removed v4.0.0's cross-session hidden-groups restore.
+        # `_hidden_groups` stays empty on a fresh open so the user
+        # always sees the full model on load. In-session toggles are
+        # still remembered via the plain `self._hidden_groups` set.
 
     # --- Phase 1: Settings menu handlers ---
     def _open_export_defaults_dialog(self):
@@ -2207,7 +2467,7 @@ class MainWindow(QMainWindow):
             if mmax < 1e-30:
                 return
             arr_vecs = arr_vecs * (length / mmax)
-            self.plotter.add_arrows(arr_pts, arr_vecs, color='#89b4fa', name=actor_name)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#89b4fa', name=actor_name, reset_camera=False)
         elif key == 'reac':
             spcf = sc.get('spc_forces', {}) or {}
             if not spcf:
@@ -2227,7 +2487,7 @@ class MainWindow(QMainWindow):
             if mmax < 1e-30:
                 return
             arr_vecs = arr_vecs * (length / mmax)
-            self.plotter.add_arrows(arr_pts, arr_vecs, color='#fab387', name=actor_name)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#fab387', name=actor_name, reset_camera=False)
         elif key == 'prin':
             stresses = sc.get('stresses', {}) or {}
             if not stresses or self.current_grid is None:
@@ -2287,7 +2547,7 @@ class MainWindow(QMainWindow):
             if mmax < 1e-30:
                 return
             arr_vecs = arr_vecs * (length / mmax)
-            self.plotter.add_arrows(arr_pts, arr_vecs, color='#f38ba8', name=actor_name)
+            self.plotter.add_arrows(arr_pts, arr_vecs, color='#f38ba8', name=actor_name, reset_camera=False)
         self._request_render()
 
     def _on_vector_overlay_scale(self, _new_scale):
@@ -3302,10 +3562,12 @@ class MainWindow(QMainWindow):
             self._update_status(f"Pick mode: {mode.capitalize()}")
 
     def _on_previous_selection(self, entity_type):
-        """Supply previous selection to the active selection dialog."""
-        dialog = self.active_selection_dialog
-        if not dialog:
-            return
+        """v4.0.1: supply the previous selection to whichever surface
+        is active. Pre-v4.0.1 this only handled the modal selection
+        dialog (``self.active_selection_dialog``) and silently no-op'd
+        when the user clicked Previous on the persistent selection bar
+        (``self.selection_bar``). Now both surfaces are covered.
+        """
         if entity_type == 'Node':
             prev = self._previous_node_selection
         elif entity_type == 'Element':
@@ -3316,7 +3578,17 @@ class MainWindow(QMainWindow):
         if not prev:
             self._update_status("No previous selection available.")
             return
-        dialog.add_selection(prev)
+
+        # Prefer the modal dialog when it's open; fall back to the bar.
+        sink = self.active_selection_dialog
+        if sink is None:
+            bar = getattr(self, 'selection_bar', None)
+            if bar is not None and bar.isVisible():
+                sink = bar
+        if sink is None:
+            self._update_status("No selection surface is active.")
+            return
+        sink.add_selection(prev)
         self._update_status(f"Restored {len(prev)} previous {entity_type.lower()}(s)")
 
     # --- Model Check handlers ---
@@ -4837,6 +5109,10 @@ class MainWindow(QMainWindow):
             self._hidden_groups.discard(name)
         else:
             self._hidden_groups.add(name)
+        # v4.0.1: removed cross-session QSettings persistence. The user
+        # asked for in-session memory only; reopening the deck should
+        # show all groups. ``self._hidden_groups`` is a plain set that
+        # gets cleared when the model is reloaded.
         self._update_plot_visibility()
 
     def _rename_selected_group(self):
@@ -5557,30 +5833,45 @@ class MainWindow(QMainWindow):
         vlr  = QPointF(cx + w, cy + h)
         vbot = QPointF(cx, cy + 2 * h)
 
+        # 3 visible cube faces (back-top-right corner is at vctr).
         top_face   = QPolygonF([vtop, vur, vctr, vul])
-        left_face  = QPolygonF([vul, vctr, vbot, vll])
-        right_face = QPolygonF([vur, vlr, vbot, vctr])
+        left_face  = QPolygonF([vul, vctr, vbot, vll])    # Y+ face → "right" view
+        right_face = QPolygonF([vur, vlr, vbot, vctr])    # X+ face → "front" view
 
-        # Which projected face corresponds to each real-world view
-        # (standard isometric from +X, +Y, +Z octant):
-        #   top diamond  → Z+ (top)      / Z- (bottom)
-        #   right quad   → X+ (front)    / X- (back)
-        #   left quad    → Y+ (right)    / Y- (left)
-        face_key = {
-            'top': 'top', 'bottom': 'top',
-            'front': 'right', 'back': 'right',
-            'right': 'left', 'left': 'left',
+        # v4.0.1: 3 hidden cube faces — opposite each visible face, all
+        # meeting at the front-bottom-left cube corner (which projects
+        # to the same screen point as the back-top-right: vctr). These
+        # are rendered with a dashed outline + lower alpha so the user
+        # sees the negative-direction face "through" the cube.
+        bottom_face_h = QPolygonF([vctr, vlr, vbot, vll])  # Z- → "bottom"
+        back_face_h   = QPolygonF([vctr, vll, vul, vtop])  # X- → "back"
+        leftv_face_h  = QPolygonF([vctr, vlr, vur, vtop])  # Y- → "left" view
+
+        is_neg = view_name in ('bottom', 'back', 'left')
+        hidden_for_neg = {
+            'bottom': bottom_face_h,
+            'back':   back_face_h,
+            'left':   leftv_face_h,
+        }
+
+        # Map positive-direction views to which visible face highlights.
+        face_key_pos = {
+            'top': 'top',
+            'front': 'right',
+            'right': 'left',
             'iso': 'all',
         }
-        active = face_key.get(view_name, 'all')
-        is_neg = view_name in ('bottom', 'back', 'left')
+        active = face_key_pos.get(view_name, None)
+        # Negative views: no visible face is highlighted; the hidden
+        # face does the work.
+        if is_neg:
+            active = None
 
-        # Highlight colour per direction
+        # Highlight colour
         hi_blue   = QColor(100, 165, 255, 215)
-        hi_orange = QColor(248, 163, 76, 215)
-        hi = hi_orange if is_neg else hi_blue
+        hi_orange = QColor(248, 163, 76, 230)
 
-        # Dim face shades (top lightest, right mid, left darkest)
+        # Dim face shades (visible faces)
         dim_top   = QColor(78, 83, 112, 175)
         dim_right = QColor(62, 67, 97, 165)
         dim_left  = QColor(50, 55, 82, 155)
@@ -5592,22 +5883,49 @@ class MainWindow(QMainWindow):
 
         if active == 'all':
             colors = {'top': iso_top, 'right': iso_right, 'left': iso_left}
+        elif active is None:
+            # Negative view: visible faces are dim + reduced alpha so the
+            # hidden orange face shows through.
+            colors = {
+                'top':   QColor(dim_top.red(),   dim_top.green(),   dim_top.blue(),   90),
+                'right': QColor(dim_right.red(), dim_right.green(), dim_right.blue(), 85),
+                'left':  QColor(dim_left.red(),  dim_left.green(),  dim_left.blue(),  80),
+            }
         else:
             colors = {
-                'top':   hi if active == 'top'   else dim_top,
-                'right': hi if active == 'right' else dim_right,
-                'left':  hi if active == 'left'  else dim_left,
+                'top':   hi_blue if active == 'top'   else dim_top,
+                'right': hi_blue if active == 'right' else dim_right,
+                'left':  hi_blue if active == 'left'  else dim_left,
             }
 
-        edge_pen = QPen(QColor(170, 190, 230, 195), 1.0)
+        solid_pen = QPen(QColor(170, 190, 230, 195), 1.0)
+        # v4.0.1: dashed/hidden-line pen for the negative-direction face.
+        dashed_pen = QPen(QColor(255, 200, 130, 240), 1.2, QtCore.Qt.DashLine)
 
-        # Draw faces back-to-front: left, right, top
+        # v4.0.1: for negative views, paint the hidden face FIRST so
+        # the visible faces (drawn next with reduced alpha) sit on top.
+        # The hidden face's edges then poke through as a dashed outline.
+        if is_neg:
+            hidden_poly = hidden_for_neg[view_name]
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QBrush(hi_orange))
+            p.drawPolygon(hidden_poly)
+
+        # Draw the 3 visible cube faces back-to-front: left, right, top
         for fname, poly in [('left', left_face),
                             ('right', right_face),
                             ('top', top_face)]:
-            p.setPen(edge_pen)
+            p.setPen(solid_pen)
             p.setBrush(QBrush(colors[fname]))
             p.drawPolygon(poly)
+
+        # v4.0.1: overlay the hidden-face outline as dashed lines so
+        # the orange face reads as a "hidden line" peek-through.
+        if is_neg:
+            hidden_poly = hidden_for_neg[view_name]
+            p.setPen(dashed_pen)
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawPolygon(hidden_poly)
 
         p.end()
         return QIcon(pixmap)
@@ -5626,22 +5944,118 @@ class MainWindow(QMainWindow):
           - ON  : lit phong, low ambient + high diffuse (3D shaded)
           - OFF : unlit flat, full ambient, no diffuse (flat colours,
                   no gradients across faces)
+
+        v4.0.0 (A2): the per-actor state-set is split into
+        ``_apply_shading_to_actor`` so that actors created later by
+        ``add_mesh`` can inherit the current state without waiting for
+        the next user toggle.
         """
-        for actor in self.plotter.renderer.actors.values():
-            if not hasattr(actor, 'prop') or actor.prop is None:
-                continue
-            if state:
-                actor.prop.lighting = True
-                actor.prop.interpolation = 'phong'
-                actor.prop.ambient = 0.15
-                actor.prop.diffuse = 0.85
-                actor.prop.specular = 0.0
-            else:
-                actor.prop.lighting = False
-                actor.prop.interpolation = 'flat'
-                actor.prop.ambient = 1.0
-                actor.prop.diffuse = 0.0
-                actor.prop.specular = 0.0
+        from node_runner.profiling import perf_event, perf_stage, enabled as _profile_on
+        import os
+        debug = os.environ.get('NR_DEBUG_SHADING') == '1' or _profile_on()
+
+        # v4.0.1 (Stage 4 diagnostic): inspect BOTH actor containers.
+        # plotter.renderer.actors is the legacy ctor-time iteration;
+        # plotter.actors is what the rest of the codebase reads (see
+        # `plotter.actors.get('rbe_actors')` for the working precedent).
+        renderer_actors = list(self.plotter.renderer.actors.values())
+        plotter_actors_dict = dict(self.plotter.actors)
+
+        if debug:
+            perf_event('shading', 'container_counts',
+                       toggle_state=state,
+                       renderer_actors=len(renderer_actors),
+                       plotter_actors=len(plotter_actors_dict),
+                       plotter_keys=','.join(sorted(plotter_actors_dict.keys())))
+            # v4.0.8: light_count catcher. plotter.clear() in
+            # _update_viewer removes lights as well as actors; if the
+            # rig is missing, lighting=True/False render identically
+            # and the shading toggle has no visible effect. n_lights=0
+            # here is the smoking gun for that case.
+            try:
+                _lights = list(self.plotter.renderer.lights)
+                perf_event('shading', 'light_count',
+                           n_lights=len(_lights),
+                           n_lights_switched_on=sum(
+                               1 for l in _lights
+                               if hasattr(l, 'GetSwitch') and l.GetSwitch()))
+            except Exception as _exc:
+                perf_event('shading', 'light_count_failed',
+                           exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            # v4.0.3 (Stage L): per-actor `_log_shading_actor` calls
+            # are now wrapped in try/except. v4.0.2 had this loop
+            # raising silently on vtkActor2D HUD entries which killed
+            # the rest of `_toggle_shading` (including the status bar
+            # update). Now we keep going on any single-actor failure
+            # and emit a perf_event so we know which actor blew up.
+            for name, actor in plotter_actors_dict.items():
+                # Skip HUD / 2D actors that don't participate in
+                # shading (orientation marker, scalar bar, axes text).
+                if isinstance(name, str) and (
+                        name.startswith('vtkActor2D')
+                        or name.startswith('vtkScalarBarActor')
+                        or name.startswith('vtkAxisActor2D')
+                        or name.startswith('vtkOrientationMarker')):
+                    continue
+                try:
+                    if hasattr(actor, 'prop') and actor.prop is not None:
+                        self._log_shading_actor("BEFORE", actor, actor_name=name)
+                except Exception as _exc:
+                    perf_event('shading', 'log_actor_failed',
+                               name=name,
+                               phase='BEFORE',
+                               exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            print(f"[shading] toggle -> {state!r}, "
+                  f"renderer_actors={len(renderer_actors)}, "
+                  f"plotter_actors={len(plotter_actors_dict)}", flush=True)
+
+        # v4.0.1: iterate the plotter.actors dict (which contains the
+        # named mesh actors), not just renderer.actors. The union
+        # captures both code paths so we don't miss any actor regardless
+        # of which container PyVista actually populated.
+        seen = set()
+        applied = 0
+        failed = 0
+        with perf_stage('shading', 'apply_to_all_actors',
+                        n_renderer=len(renderer_actors),
+                        n_plotter=len(plotter_actors_dict)):
+            for actor in list(plotter_actors_dict.values()) + renderer_actors:
+                key = id(actor)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # v4.0.3 (Stage L): never let a single actor's prop
+                # accessor kill the whole toggle. vtkActor2D and other
+                # HUD actors don't have .prop as a PyVista wrapper;
+                # the access raises and used to propagate out before
+                # the status-bar update.
+                try:
+                    self._apply_shading_to_actor(actor, enabled=state)
+                    applied += 1
+                except Exception as _exc:
+                    failed += 1
+                    perf_event('shading', 'apply_failed',
+                               actor_class=type(actor).__name__,
+                               exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+        perf_event('shading', 'apply_summary',
+                   applied=applied, failed=failed, total_seen=len(seen))
+
+        if debug and plotter_actors_dict:
+            for name, actor in plotter_actors_dict.items():
+                if isinstance(name, str) and (
+                        name.startswith('vtkActor2D')
+                        or name.startswith('vtkScalarBarActor')
+                        or name.startswith('vtkAxisActor2D')
+                        or name.startswith('vtkOrientationMarker')):
+                    continue
+                try:
+                    if hasattr(actor, 'prop') and actor.prop is not None:
+                        self._log_shading_actor("AFTER ", actor, actor_name=name)
+                except Exception as _exc:
+                    perf_event('shading', 'log_actor_failed',
+                               name=name,
+                               phase='AFTER',
+                               exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
 
         # Keep both UI surfaces in sync (View menu + Display tab).
         try:
@@ -5657,6 +6071,361 @@ class MainWindow(QMainWindow):
 
         self._update_status(f"Shading: {'phong (lit)' if state else 'flat (unlit)'}.")
         self.plotter.render()
+
+    def _apply_shading_to_actor(self, actor, enabled=None):
+        """Apply current shading state to a single actor.
+
+        Called by ``_toggle_shading`` (in a loop) and by ``add_mesh``
+        sites after they create a new actor so new actors inherit the
+        user's current shading preference. ``enabled=None`` reads the
+        live state from the View-menu action.
+        """
+        if actor is None or not hasattr(actor, 'prop') or actor.prop is None:
+            return
+        if enabled is None:
+            try:
+                enabled = self.shading_action.isChecked()
+            except AttributeError:
+                # v4.0.1: default to flat/unlit. This is the user's
+                # preferred default; matches the View > Shading action.
+                enabled = False
+        if enabled:
+            # v4.0.0 (A2): bump ambient from 0.15 -> 0.35. The main grid
+            # is an UnstructuredGrid without computed point normals; the
+            # 0.15 baseline was leaving the model "dark" (user report)
+            # because the diffuse term collapses with no normal data.
+            # 0.35 ambient keeps the model visible even without normals
+            # while preserving a clear visual delta versus flat below.
+            actor.prop.lighting = True
+            actor.prop.interpolation = 'phong'
+            actor.prop.ambient = 0.35
+            actor.prop.diffuse = 0.65
+            actor.prop.specular = 0.0
+        else:
+            actor.prop.lighting = False
+            actor.prop.interpolation = 'flat'
+            actor.prop.ambient = 1.0
+            actor.prop.diffuse = 0.0
+            actor.prop.specular = 0.0
+
+    def _install_light_rig(self):
+        """v4.0.0 (A2): replace PyVista's default single headlight with
+        a warm key + cool fill + dim back rim. Makes the phong vs flat
+        toggle clearly visible and gives the viewport a premium look.
+        Failures are swallowed: rendering with the default light setup
+        is still acceptable.
+        """
+        try:
+            import pyvista as pv
+            renderer = self.plotter.renderer
+            renderer.remove_all_lights()
+
+            key = pv.Light(
+                position=(1.0, 1.0, 1.0),
+                light_type='scene light',
+                color=(1.0, 0.96, 0.90),  # warm
+                intensity=0.85,
+            )
+            fill = pv.Light(
+                position=(-1.0, -0.5, 1.0),
+                light_type='scene light',
+                color=(0.85, 0.90, 1.0),  # cool
+                intensity=0.45,
+            )
+            rim = pv.Light(
+                position=(0.0, -1.0, -0.5),
+                light_type='scene light',
+                color=(1.0, 1.0, 1.0),
+                intensity=0.25,
+            )
+            head = pv.Light(light_type='headlight', intensity=0.35)
+
+            for lt in (key, fill, rim, head):
+                renderer.add_light(lt)
+        except Exception:
+            pass
+        # v4.0.8: emit count so profile log proves the rig is present
+        # at every install. plotter.clear() in _update_viewer wipes
+        # lights along with actors; without this catcher the
+        # "no visible shading delta" symptom looked identical to the
+        # "lights installed but shader doesn't honour them" case.
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('lights', 'rig_installed',
+                       n_lights=len(self.plotter.renderer.lights))
+        except Exception:
+            pass
+
+    def _emit_mem_event(self, where):
+        """v4.0.9: emit a memory snapshot to the profile log. Zero-dep
+        on Windows via ctypes + GetProcessMemoryInfo. Failure is
+        swallowed so this never blocks the calling path. The
+        ``where`` field tags the snapshot location (e.g.
+        ``viewer.total``, ``visibility.cycle``).
+
+        Establishes the "Lightweight" pillar baseline before
+        pre-built per-category actors permanently retain mesh
+        polydatas in memory. v4.1.0 acts on the data this emits.
+        """
+        try:
+            from node_runner.profiling import perf_event
+            rss_mb = None
+            try:
+                import psutil  # pragma: no cover - optional dep
+                rss_mb = psutil.Process().memory_info().rss / (1024 ** 2)
+            except Exception:
+                pass
+            if rss_mb is None:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    class _PMC(ctypes.Structure):
+                        _fields_ = [
+                            ('cb', wintypes.DWORD),
+                            ('PageFaultCount', wintypes.DWORD),
+                            ('PeakWorkingSetSize', ctypes.c_size_t),
+                            ('WorkingSetSize', ctypes.c_size_t),
+                            ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                            ('PagefileUsage', ctypes.c_size_t),
+                            ('PeakPagefileUsage', ctypes.c_size_t),
+                        ]
+
+                    pmc = _PMC()
+                    pmc.cb = ctypes.sizeof(_PMC)
+                    handle = ctypes.windll.kernel32.GetCurrentProcess()
+                    ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+                        handle, ctypes.byref(pmc), pmc.cb)
+                    if ok:
+                        rss_mb = pmc.WorkingSetSize / (1024 ** 2)
+                except Exception:
+                    rss_mb = None
+            if rss_mb is not None:
+                perf_event('mem', 'rss_mb',
+                           where=where, mb=round(rss_mb, 1))
+        except Exception:
+            pass
+
+    def _attach_per_cell_rgb_for_property_mode(self, grid):
+        """v4.0.17: vectorized per-cell RGB lookup for
+        ``color_mode='property'``. Writes a ``'cell_rgb'`` uint8
+        ``(N, 3)`` array onto ``grid.cell_data`` so
+        ``add_mesh(scalars='cell_rgb', rgb=True)`` renders each
+        cell with its own ``pid_color_map[PID]`` color, bypassing
+        the LUT entirely.
+
+        Replaces the v4.0.5-era
+        ``scalars='PID' + cmap + categories=True`` pattern. That
+        pattern rendered the same PID with DIFFERENT colors
+        across actors with different unique-PID sets — PyVista's
+        categorical LUT appears to do range-normalized
+        positional mapping rather than value-keyed lookup, so PID
+        1234 in pids=[100..1234] mapped to the LAST cmap slot
+        while PID 1234 in pids=[1234, 5000] mapped to the FIRST
+        slot.
+
+        Per-cell RGB sidesteps the LUT entirely. Same PID, same
+        color, every render, every actor.
+
+        Cost: O(n_unique_pids) Python work + numpy fan-out
+        (~10 ms on MEGA's 2.4M cells). Memory: 3 bytes/cell extra
+        (uint8 × 3) vs the int32 PID array → +7 MB per actor on
+        MEGA. Acceptable.
+        """
+        if 'PID' not in grid.cell_data:
+            return None
+        from node_runner.profiling import perf_event
+        pids_arr = np.asarray(grid.cell_data['PID'])
+        unique_pids, inverse = np.unique(pids_arr, return_inverse=True)
+        # Defensive populate-on-demand. After v4.0.16's reorder
+        # pid_color_map is always fully populated before any
+        # build runs, but this guarantees correctness regardless
+        # of future call-order changes.
+        n_populated = 0
+        for p in unique_pids:
+            pkey = int(p)
+            if pkey not in self.pid_color_map:
+                self.pid_color_map[pkey] = QColor(
+                    random.randint(50, 220),
+                    random.randint(50, 220),
+                    random.randint(50, 220)).name()
+                n_populated += 1
+        if n_populated:
+            perf_event('rgb_lookup', 'pid_populated_on_demand',
+                       n_populated=n_populated)
+
+        def _hex_to_rgb(h):
+            h = h.lstrip('#')
+            return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+        unique_rgb = np.array(
+            [_hex_to_rgb(self.pid_color_map.get(int(p), "#FFFFFF"))
+             for p in unique_pids],
+            dtype=np.uint8)
+        cell_rgb = unique_rgb[inverse]
+        grid.cell_data['cell_rgb'] = cell_rgb
+        return cell_rgb
+
+    def _get_moment_glyph_geom(self):
+        """v4.0.13: physics-textbook double-tipped moment glyph.
+
+        A moment vector is drawn as a single arrow shaft with a
+        DOUBLE arrowhead at one end (▶▶) to distinguish it from a
+        force vector (single arrowhead ▶). The shaft direction is
+        the right-hand-rule thumb direction; the moment rotates
+        with fingers curling around the shaft.
+
+        Geometry: pv.Arrow (shaft + tip cone) merged with a second
+        pv.Cone behind the first tip. Both are pure-triangle
+        PolyDatas — no tube() filter (which caused the v4.0.11/12
+        SEGFAULTs in vtkGlyph3D). The merge of two pure-triangle
+        PolyDatas reliably produces a clean PolyData.
+
+        History:
+        - v4.0.5: `fwd.merge(back)` symmetric ←→ double-arrow. Right-
+          hand rule was ambiguous (axis encoded but not direction).
+        - v4.0.11/12: composite (arrow + 270° tube-arc curl + tangent
+          cone). Crashed in vtkGlyph3D — `tube()` produces cells
+          the glyph filter can't reliably handle.
+        - v4.0.13 (this): arrow + second cone at +X end. Simplest
+          possible composite that's directional and visually distinct
+          from force arrows.
+        """
+        from node_runner.profiling import perf_event
+        cached = getattr(self, '_moment_glyph_geom_cache', None)
+        if cached is not None:
+            self._moment_glyph_cache_hits = getattr(
+                self, '_moment_glyph_cache_hits', 0) + 1
+            if self._moment_glyph_cache_hits <= 5:
+                perf_event('glyph', 'moment_double_tip_cache_hit',
+                           hits=self._moment_glyph_cache_hits)
+            return cached
+        try:
+            import pyvista as pv
+            # Main arrow: shaft along +X with single tip at x=1.0.
+            # Tip cone occupies x ∈ [0.8, 1.0].
+            arrow = pv.Arrow(
+                start=(0.0, 0.0, 0.0),
+                direction=(1.0, 0.0, 0.0),
+                tip_length=0.2, tip_radius=0.08,
+                shaft_radius=0.03,
+            )
+            # Second tip cone behind the first. pv.Cone places its
+            # base at `center - direction*height/2` and tip at
+            # `center + direction*height/2`. With center=(0.65,0,0)
+            # and direction=+X, height=0.2: base at x=0.55, tip at
+            # x=0.75. This sits just behind the arrow's tip cone
+            # (base at x=0.8, tip at x=1.0). Visually: "▶▶" stack
+            # at the +X end with a small gap between bases.
+            second_cone = pv.Cone(
+                center=(0.65, 0.0, 0.0),
+                direction=(1.0, 0.0, 0.0),
+                height=0.2, radius=0.08,
+            )
+            composite_raw = arrow.merge(second_cone)
+            if isinstance(composite_raw, pv.PolyData):
+                composite = composite_raw
+            else:
+                composite = composite_raw.extract_surface()
+                perf_event('glyph', 'moment_double_tip_extract_surface',
+                           raw_type=type(composite_raw).__name__)
+            self._moment_glyph_geom_cache = composite
+            perf_event('glyph', 'moment_double_tip_built',
+                       n_points=int(composite.n_points),
+                       n_cells=int(composite.n_cells))
+            return composite
+        except Exception as _exc:
+            perf_event('glyph', 'moment_double_tip_fallback',
+                       exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            try:
+                import pyvista as pv
+                fallback = pv.Arrow(
+                    start=(0.0, 0.0, 0.0),
+                    direction=(1.0, 0.0, 0.0),
+                    tip_length=0.2, tip_radius=0.08,
+                    shaft_radius=0.03,
+                )
+                self._moment_glyph_geom_cache = fallback
+                return fallback
+            except Exception:
+                return None
+
+    @staticmethod
+    def _log_shading_actor(tag, actor, actor_name=''):
+        """v4.0.1 / v4.0.2: emit actor prop + mapper state to BOTH
+        stdout and the profile log so we can diagnose why the
+        toggle doesn't change visual appearance.
+
+        Fields logged:
+          - lighting (bool: VTK lighting on/off)
+          - interpolation (str: 'phong'/'flat'/'gouraud')
+          - interp_int (int: VTK enum 0=flat, 1=gouraud, 2=phong)
+          - ambient / diffuse / specular (float: material coefficients)
+          - normals (str: which arrays carry 'Normals')
+          - scalar_visibility (bool: True means the mapper is
+            coloring by scalars - lighting/material color is then
+            largely cosmetic)
+          - color_mode (int: VTK ScalarMode)
+        """
+        from node_runner.profiling import perf_event
+        p = actor.prop
+        normals = "n/a"
+        scalar_vis = None
+        scalar_mode = None
+        try:
+            mapper = actor.mapper if hasattr(actor, 'mapper') else None
+            if mapper is None and hasattr(actor, 'GetMapper'):
+                mapper = actor.GetMapper()
+            if mapper is not None:
+                try:
+                    scalar_vis = bool(mapper.GetScalarVisibility())
+                except Exception:
+                    pass
+                try:
+                    scalar_mode = int(mapper.GetScalarMode())
+                except Exception:
+                    pass
+                ds = getattr(mapper, 'dataset', None)
+                if ds is None and hasattr(mapper, 'GetInput'):
+                    try:
+                        ds = mapper.GetInput()
+                    except Exception:
+                        ds = None
+                if ds is not None:
+                    try:
+                        pt_keys = list(ds.point_data.keys()) if hasattr(ds, 'point_data') else []
+                        cell_keys = list(ds.cell_data.keys()) if hasattr(ds, 'cell_data') else []
+                    except Exception:
+                        pt_keys, cell_keys = [], []
+                    normals = f"pt={'Normals' in pt_keys} cell={'Normals' in cell_keys}"
+        except Exception:
+            pass
+        try:
+            interp_int = int(p.GetInterpolation()) if hasattr(p, 'GetInterpolation') else None
+        except Exception:
+            interp_int = None
+        line = (
+            f"[shading] {tag} name={actor_name!r} lighting={p.lighting} "
+            f"interp={p.interpolation} interp_int={interp_int} "
+            f"ambient={p.ambient:.2f} diffuse={p.diffuse:.2f} "
+            f"specular={p.specular:.2f} normals=[{normals}] "
+            f"scalar_vis={scalar_vis} scalar_mode={scalar_mode}"
+        )
+        print(line, flush=True)
+        perf_event('shading', tag.strip().lower(),
+                   name=actor_name,
+                   lighting=p.lighting,
+                   interp=p.interpolation,
+                   interp_int=interp_int,
+                   ambient=f"{p.ambient:.2f}",
+                   diffuse=f"{p.diffuse:.2f}",
+                   specular=f"{p.specular:.2f}",
+                   normals=normals,
+                   scalar_vis=scalar_vis,
+                   scalar_mode=scalar_mode)
 
     def _on_shading_display_toggled(self, state):
         """Bridge: Display-tab checkbox -> _toggle_shading (which also
@@ -6065,8 +6834,9 @@ class MainWindow(QMainWindow):
         self.highlight_color = payload.get(
             'highlight_color', getattr(self, 'highlight_color', '#fab387'))
         sizes = payload.get('sizes') or {}
+        # v4.0.7: default percent lowered from 1.5% to 0.75%.
         self.mass_glyph_scale = float(
-            sizes.get('mass_glyph_scale_pct', 1.5)) / 100.0
+            sizes.get('mass_glyph_scale_pct', 0.75)) / 100.0
         self.node_size = int(sizes.get('node_size', self.node_size))
         self.beam_width = int(sizes.get('beam_width', self.beam_width))
         self.edge_width = int(sizes.get('edge_width', self.edge_width))
@@ -6893,11 +7663,29 @@ class MainWindow(QMainWindow):
 
 # START: Corrected replacement for _update_viewer method in main.py
     def _update_viewer(self, generator, reset_camera=True):
-        self.quality_results = None
-        self.plotter.clear()
-        self.plotter.add_axes()
-        self.axes_actor = self.plotter.renderer.axes_actor
-        self._set_axes_label_color((0.804, 0.839, 0.957) if self.is_dark_theme else (0, 0, 0))
+        # v4.0.1 (Stage 1): perf instrumentation. Imports the lightweight
+        # profiling helper; gated on NR_PROFILE=1.
+        from node_runner.profiling import perf_stage, perf_event, log_deck_header
+        _t_total = time.perf_counter()
+
+        with perf_stage('viewer', 'clear_and_axes'):
+            self.quality_results = None
+            self.plotter.clear()
+            self.plotter.add_axes()
+            # v4.0.8: plotter.clear() above removes all renderer lights
+            # along with actors. Without this re-install the scene
+            # has zero lights after every model load and the shading
+            # toggle (lighting=True/False) renders identically. The
+            # rig in __init__ is no longer sufficient on its own.
+            self._install_light_rig()
+            # v4.0.14 (Fix C v2): plotter.clear() also dropped the
+            # pre-built per-category actor handles. Invalidate the
+            # dict so the build site below starts fresh.
+            self._category_actors = {}
+            self._category_visible_ntypes = set()
+            self._using_legacy_mesh = False
+            self.axes_actor = self.plotter.renderer.axes_actor
+            self._set_axes_label_color((0.804, 0.839, 0.957) if self.is_dark_theme else (0, 0, 0))
 
         self.current_generator, self.current_grid = generator, None
         model = generator.model
@@ -6927,11 +7715,18 @@ class MainWindow(QMainWindow):
             build_element_arrays_vectorized,
         )
         n_nodes = len(self.current_node_ids_sorted)
+        n_elems_total = len(model.elements) + len(model.rigid_elements)
+        log_deck_header(
+            getattr(self, '_loaded_filepath', '') or '',
+            n_nodes=n_nodes,
+            n_elements=n_elems_total,
+        )
         if n_nodes > 50_000:
             self._update_status(f"Loading {n_nodes:,} nodes (vectorized)...")
             QApplication.processEvents()
-        node_coords = build_node_coords_vectorized(
-            model, self.current_node_ids_sorted)
+        with perf_stage('viewer', 'build_node_coords', n_nodes=n_nodes):
+            node_coords = build_node_coords_vectorized(
+                model, self.current_node_ids_sorted)
         if n_nodes > 50_000:
             QApplication.processEvents()
 
@@ -6955,12 +7750,13 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
         try:
-            elem_arrays = build_element_arrays_vectorized(
-                model,
-                self.current_node_ids_sorted,
-                node_map,
-                progress=(_scene_build_progress if n_elems > 50_000 else None),
-            )
+            with perf_stage('viewer', 'build_element_arrays', n_elems=n_elems):
+                elem_arrays = build_element_arrays_vectorized(
+                    model,
+                    self.current_node_ids_sorted,
+                    node_map,
+                    progress=(_scene_build_progress if n_elems > 50_000 else None),
+                )
         finally:
             if n_elems > 50_000:
                 QApplication.restoreOverrideCursor()
@@ -7008,21 +7804,23 @@ class MainWindow(QMainWindow):
             cells = main_cells
             cell_types = main_cell_types
 
-        if cells.size == 0 and node_coords.size > 0:
-            # No elements, no free-node vertices yet - render all nodes
-            # as vertex cells so something appears.
-            num_nodes = node_coords.shape[0]
-            cells = np.empty(num_nodes * 2, dtype=np.int64)
-            cells[0::2] = 1
-            cells[1::2] = np.arange(num_nodes, dtype=np.int64)
-            cell_types = np.full(num_nodes, pv.CellType.VERTEX, dtype=np.uint8)
-            self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
-        elif cells.size > 0:
-            self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
-        else:
-            self.current_grid = pv.UnstructuredGrid()
+        with perf_stage('viewer', 'assemble_unstructured_grid',
+                        n_cells=int(cell_types.size if cell_types is not None else 0)):
+            if cells.size == 0 and node_coords.size > 0:
+                # No elements, no free-node vertices yet - render all nodes
+                # as vertex cells so something appears.
+                num_nodes = node_coords.shape[0]
+                cells = np.empty(num_nodes * 2, dtype=np.int64)
+                cells[0::2] = 1
+                cells[1::2] = np.arange(num_nodes, dtype=np.int64)
+                cell_types = np.full(num_nodes, pv.CellType.VERTEX, dtype=np.uint8)
+                self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+            elif cells.size > 0:
+                self.current_grid = pv.UnstructuredGrid(cells, cell_types, node_coords)
+            else:
+                self.current_grid = pv.UnstructuredGrid()
 
-        self.current_grid.point_data['vtkOriginalPointIds'] = np.arange(self.current_grid.n_points)
+            self.current_grid.point_data['vtkOriginalPointIds'] = np.arange(self.current_grid.n_points)
 
         # Attach per-cell metadata. We had main element cells + free-node
         # vertex cells; pad vertex cells with -1 EID / -1 PID / VTK_VERTEX.
@@ -7056,13 +7854,21 @@ class MainWindow(QMainWindow):
         # every cell for picking and queries.
         try:
             from node_runner.scene_build import apply_display_lod
-            display_grid, lod_info = apply_display_lod(
-                self.current_grid,
-                threshold=self._elem_lod_threshold,
-                target_shells=200_000,
-            )
+            with perf_stage('viewer', 'apply_display_lod',
+                            status_msg='Building display LOD...',
+                            status=True,
+                            n_input_cells=int(self.current_grid.n_cells)):
+                display_grid, lod_info = apply_display_lod(
+                    self.current_grid,
+                    threshold=self._elem_lod_threshold,
+                    target_shells=200_000,
+                )
             self.current_display_grid = display_grid
             self._lod_info = lod_info
+            perf_event('viewer', 'lod_result',
+                       active=lod_info.get('lod_active'),
+                       displayed=lod_info.get('displayed_cells'),
+                       total=lod_info.get('total_cells'))
             if lod_info.get('lod_active'):
                 self._update_status(
                     f"LOD active: showing {lod_info['displayed_cells']:,} "
@@ -7073,42 +7879,260 @@ class MainWindow(QMainWindow):
             # Fail-safe: render the full grid.
             self.current_display_grid = self.current_grid
             self._lod_info = {'lod_active': False}
+            perf_event('viewer', 'lod_exception', exc=str(_lod_exc)[:120])
 
+        # v4.0.16 (reorder): populate pid_color_map BEFORE building
+        # pre-built per-category actors. The build site reads
+        # self.pid_color_map to compute its categorical cmap; if a
+        # PID is missing, the cmap entry falls back to "#FFFFFF"
+        # (white). Pre-v4.0.16 the build ran first → fresh-load
+        # PIDs had no entries → user saw a mostly-white mesh on
+        # first open. v4.0.15's _set_coloring_mode rebuild
+        # accidentally hid this by rebuilding the actors AFTER the
+        # map was populated; re-clicking "Color by Property ID"
+        # appeared to "fix" the colors when really it was just
+        # rebuilding with the now-populated map.
         for pid in model.properties.keys():
             if pid not in self.pid_color_map:
                 self.pid_color_map[pid] = QColor(random.randint(50, 220), random.randint(50, 220), random.randint(50, 220)).name()
 
+        # v4.0.14 (Fix C v2): build pre-built per-Nastran-type actors
+        # from the FULL current_grid. Category toggles (Plates,
+        # Beams, Solids, etc.) then become SetVisibility calls in
+        # the fast-path router. PID/MID/isolate filtering still
+        # routes through legacy _rebuild_plot via _has_active_cell_filter.
+        try:
+            self._build_pre_built_category_actors()
+        except Exception as _exc:
+            perf_event('actors', 'build_per_category_failed',
+                       exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+
         self._emit_render_progress("Populating model tree...")
-        self.tree_widget.blockSignals(True)
-        self._populate_tree()
-        self.tree_widget.blockSignals(False)
+        with perf_stage('viewer', 'populate_tree',
+                        status_msg='Populating model tree...', status=True):
+            self.tree_widget.blockSignals(True)
+            self._populate_tree()
+            self.tree_widget.blockSignals(False)
 
         # Coord actors are created centrally via _refresh_coord_actors (called by _update_plot_visibility)
         # Each of these can iterate the full bulk (e.g. 268k PLOAD4s);
         # show a status hint between each so the user sees motion.
         self._emit_render_progress("Building load actors (FORCE/MOMENT/PLOAD4)...")
-        self._create_all_load_actors()
+        with perf_stage('viewer', 'create_load_actors',
+                        status_msg='Building load actors (FORCE/MOMENT/PLOAD4)...',
+                        status=True,
+                        n_load_sids=len(model.loads)):
+            self._create_all_load_actors()
         self._emit_render_progress("Building constraint actors (SPC/SPC1)...")
-        self._create_all_constraint_actors()
+        with perf_stage('viewer', 'create_constraint_actors',
+                        status_msg='Building constraint actors (SPC/SPC1)...',
+                        status=True,
+                        n_spc_sids=len(model.spcs)):
+            self._create_all_constraint_actors()
         self._emit_render_progress("Building rigid-element actors (RBE/RBAR)...")
-        self._create_rbe_actors()
+        with perf_stage('viewer', 'create_rbe_actors',
+                        status_msg='Building rigid-element actors (RBE/RBAR)...',
+                        status=True,
+                        n_rigid=len(model.rigid_elements)):
+            self._create_rbe_actors()
         self._emit_render_progress("Building mass actors (CONM2)...")
-        self._create_mass_actors()
+        with perf_stage('viewer', 'create_mass_actors',
+                        status_msg='Building mass actors (CONM2)...',
+                        status=True,
+                        n_mass=len(model.masses)):
+            self._create_mass_actors()
         self._emit_render_progress("Building plot-element actors (PLOTEL)...")
-        self._create_plotel_actors()
+        with perf_stage('viewer', 'create_plotel_actors',
+                        status_msg='Building plot-element actors (PLOTEL)...',
+                        status=True,
+                        n_plotel=len(model.plotels)):
+            self._create_plotel_actors()
         self._emit_render_progress("Final render...")
-        self._update_plot_visibility()
+        with perf_stage('viewer', 'first_update_plot_visibility',
+                        status_msg='Initial visibility update...', status=True):
+            self._update_plot_visibility()
 
-        if reset_camera and self.current_grid and self.current_grid.n_points > 0:
-            self.plotter.reset_camera()
-            self.plotter.view_isometric()
-        else:
-            self.plotter.render()
+        with perf_stage('viewer', 'reset_camera_and_render'):
+            if reset_camera and self.current_grid and self.current_grid.n_points > 0:
+                self.plotter.reset_camera()
+                self.plotter.view_isometric()
+            else:
+                self.plotter.render()
+        perf_event('viewer', 'total', wall_s=f"{time.perf_counter()-_t_total:.3f}")
+        self._emit_mem_event('viewer.total')
 # END: Corrected replacement for _update_viewer method in main.py
 
 
+    # v4.0.4 (Stage Q): UserRole-tuple key prefixes that belong to the
+    # Loads tab tree (loads_tab_tree), NOT the Model tree (tree_widget).
+    # `_find_tree_items` routes lookups for these prefixes to the
+    # loads_tab index. Pre-v4.0.4 they all queried tree_widget and
+    # always returned [] -> load actors were never visible.
+    _LOADS_TAB_KEY_PREFIXES = frozenset({
+        'load_set', 'constraint_set',
+        'load_set_placeholder', 'constraint_set_placeholder',
+        'load_entry', 'constraint_entry',
+        'tempd_entry',
+        'loads_root', 'constraints_root', 'combos_root',
+        'load_combo',
+    })
+
     def _find_tree_items(self, data_tuple):
-        return [it.value() for it in QTreeWidgetItemIterator(self.tree_widget) if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
+        # v4.0.3 (Stage J) / v4.0.4 (Stage Q): O(1) lookup via the
+        # pre-built tree index. Now ROUTES based on key prefix:
+        # load_set / constraint_set / etc. → loads_tab index; the
+        # rest → model_tree index. The pre-v4.0.4 path always
+        # queried tree_widget regardless of key, so all load_set /
+        # constraint_set lookups returned [] (the wrong-tree bug
+        # the tree_index.miss logger exposed).
+        self._find_tree_calls_total = getattr(self, '_find_tree_calls_total', 0) + 1
+        # Normalize the lookup key the same way the index was built:
+        # list/tuple inputs get hashed as tuples.
+        try:
+            key = tuple(data_tuple) if isinstance(data_tuple, (list, tuple)) else data_tuple
+        except TypeError:
+            key = data_tuple
+
+        # v4.0.4 (Stage Q): route by prefix.
+        prefix = key[0] if isinstance(key, tuple) and key else None
+        if prefix in self._LOADS_TAB_KEY_PREFIXES:
+            index = getattr(self, '_loads_tab_item_index', None)
+            index_name = 'loads_tab_index'
+            tree = getattr(self, 'loads_tab_tree', None)
+        else:
+            index = getattr(self, '_tree_item_index', None)
+            index_name = 'tree_index'
+            tree = getattr(self, 'tree_widget', None)
+
+        if index is None:
+            from node_runner.profiling import perf_event
+            perf_event(index_name, 'fallback_walk',
+                       reason='no_index_yet', key=str(key)[:80])
+            if tree is None:
+                return []
+            return [it.value() for it in QTreeWidgetItemIterator(tree)
+                    if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
+        hits = index.get(key)
+        if hits is None:
+            # Real miss — key isn't in the index. Could indicate a
+            # caller asking for an item that doesn't exist (normal)
+            # OR a stale index (bug). Log a sample so we can spot
+            # patterns.
+            counter_attr = (
+                '_loads_tab_index_misses' if prefix in self._LOADS_TAB_KEY_PREFIXES
+                else '_tree_index_misses')
+            cur = getattr(self, counter_attr, 0) + 1
+            setattr(self, counter_attr, cur)
+            # v4.0.9: gate elem_by_type_group / elem_shape_group misses
+            # to types/shapes that ARE present in this deck. Callers
+            # iterate a fixed list of known categories on every
+            # visibility cycle, so misses for absent categories are
+            # expected noise (e.g. Shear/Gap/Tet/Wedge on a deck that
+            # only has plates+solids). Real surprises (stale index,
+            # genuine bug) still emit through the `unexpected_miss`
+            # path below.
+            expected_absent = False
+            counts = getattr(self, '_cached_element_group_counts', None) or {}
+            if (isinstance(key, tuple) and len(key) == 2
+                    and key[0] == 'elem_by_type_group'):
+                expected_absent = key[1] not in (counts.get('by_type') or {})
+            elif (isinstance(key, tuple) and len(key) == 2
+                    and key[0] == 'elem_shape_group'):
+                expected_absent = key[1] not in (counts.get('by_shape') or {})
+            if cur <= 25:  # cap log spam
+                from node_runner.profiling import perf_event
+                if expected_absent:
+                    # Quieter signal kept so we still see it if we
+                    # need to debug "why didn't this match?".
+                    perf_event(index_name, 'expected_miss',
+                               key=str(key)[:80], total_misses=cur)
+                else:
+                    perf_event(index_name, 'miss', key=str(key)[:80],
+                               total_misses=cur)
+            return []
+        # Filter out items that have been deleted (Qt can leave dangling
+        # pointers in the index after partial tree mutations). Skip on
+        # any access exception.
+        live = []
+        for it in hits:
+            try:
+                _ = it.text(0)  # access fails on a deleted item
+                live.append(it)
+            except RuntimeError:
+                continue
+        return live
+
+    def _build_tree_item_index(self):
+        """v4.0.3 (Stage J): walk the model tree once and bucket every
+        item by its UserRole tuple. Called from ``_populate_tree``
+        after the rebuild completes.
+
+        Index shape: ``{key: [QTreeWidgetItem, ...]}``. Keys are
+        normalized via ``tuple(...)`` so list/tuple equality works.
+        Items with no UserRole are skipped (no way to look them up).
+        """
+        from node_runner.profiling import perf_event
+        import time as _time
+        _t0 = _time.perf_counter()
+        index = {}
+        n_entries = 0
+        it = QTreeWidgetItemIterator(self.tree_widget)
+        while it.value():
+            item = it.value()
+            try:
+                data = item.data(0, QtCore.Qt.UserRole)
+            except Exception:
+                data = None
+            if data is not None:
+                try:
+                    key = tuple(data) if isinstance(data, (list, tuple)) else data
+                    index.setdefault(key, []).append(item)
+                    n_entries += 1
+                except TypeError:
+                    pass  # unhashable; skip
+            it += 1
+        self._tree_item_index = index
+        self._tree_index_misses = 0
+        perf_event('tree_index', 'build',
+                   n_entries=n_entries,
+                   n_keys=len(index),
+                   wall_s=f"{_time.perf_counter()-_t0:.3f}")
+
+    def _build_loads_tab_item_index(self):
+        """v4.0.4 (Stage Q): mirror of ``_build_tree_item_index`` but
+        for the LOADS tab tree (``loads_tab_tree``). Required because
+        all ``load_set`` / ``constraint_set`` UserRole keys live in
+        that tree, not the model tree — pre-v4.0.4 we were querying
+        the wrong tree and getting [] for every lookup.
+        """
+        from node_runner.profiling import perf_event
+        import time as _time
+        _t0 = _time.perf_counter()
+        index = {}
+        n_entries = 0
+        tree = getattr(self, 'loads_tab_tree', None)
+        if tree is not None:
+            it = QTreeWidgetItemIterator(tree)
+            while it.value():
+                item = it.value()
+                try:
+                    data = item.data(0, QtCore.Qt.UserRole)
+                except Exception:
+                    data = None
+                if data is not None:
+                    try:
+                        key = tuple(data) if isinstance(data, (list, tuple)) else data
+                        index.setdefault(key, []).append(item)
+                        n_entries += 1
+                    except TypeError:
+                        pass
+                it += 1
+        self._loads_tab_item_index = index
+        self._loads_tab_index_misses = 0
+        perf_event('loads_tab_index', 'build',
+                   n_entries=n_entries,
+                   n_keys=len(index),
+                   wall_s=f"{_time.perf_counter()-_t0:.3f}")
 
     def _build_select_by_data(self):
         """Build property/material/type lookup dicts for element selection.
@@ -7194,6 +8218,362 @@ class MainWindow(QMainWindow):
         if dialog.exec(): self._update_status("Materials updated.")
 
 
+    def _show_all_entities(self):
+        """v4.0.0 (E3): re-check every checkable item in the Model tree
+        and the Loads tab tree, then refresh visibility. The user's
+        recovery path when they've hidden things and want to start
+        clean without rebuilding the model.
+        """
+        from PySide6 import QtCore as _QtCore
+
+        def _walk_check(parent):
+            for i in range(parent.childCount()):
+                c = parent.child(i)
+                if c.flags() & _QtCore.Qt.ItemIsUserCheckable:
+                    c.setCheckState(0, _QtCore.Qt.Checked)
+                _walk_check(c)
+
+        for tw_name in ('tree_widget', 'loads_tab_tree'):
+            tw = getattr(self, tw_name, None)
+            if tw is None:
+                continue
+            tw.blockSignals(True)
+            try:
+                _walk_check(tw.invisibleRootItem())
+            finally:
+                tw.blockSignals(False)
+
+        # Also clear any hidden_groups flags so groups come back on.
+        try:
+            self._hidden_groups.clear()
+            self._populate_groups_list()
+        except Exception:
+            pass
+
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+        self._update_status("Show All: every entity is visible.")
+
+    def _dispatch_refresh(self, hint):
+        """v4.0.0 (B2): map a ``RefreshHint`` to the matching narrow
+        refresh helper. Callers can opt in:
+
+            self.command_manager.execute(cmd, model)
+            self._dispatch_refresh(cmd.refresh_hint)
+
+        Falls back to ``_update_viewer`` for FULL (the pre-v4.0.0
+        default) so unmigrated commands keep working unchanged.
+        """
+        from node_runner.commands import RefreshHint
+        if hint == RefreshHint.NONE:
+            return
+        if hint == RefreshHint.CONSTRAINTS:
+            self._refresh_constraints()
+            return
+        if hint == RefreshHint.LOADS:
+            self._refresh_loads()
+            return
+        if hint == RefreshHint.GRID_COLOR:
+            self._refresh_grid_color_data()
+            return
+        if hint == RefreshHint.COORDS:
+            self._refresh_coord_actors()
+            return
+        if hint == RefreshHint.GROUPS:
+            self._refresh_groups()
+            return
+        # FULL or any unknown hint → blanket refresh (pre-v4.0.0 default).
+        self._update_viewer()
+
+    def _refresh_constraints(self):
+        """v4.0.0 (B2): narrow refresh after a constraint add/remove.
+        Rebuilds only the constraint actors + the Loads-tab tree
+        (preserving check state via B1 snapshot/restore). The main
+        Model tree's "Boundary Conditions" count may show as stale by
+        one until the next full _update_viewer; that's acceptable for
+        the user-visible interactive flow.
+        """
+        try:
+            self._populate_loads_tab()
+        except Exception:
+            pass
+        try:
+            self._create_all_constraint_actors()
+        except Exception:
+            pass
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+
+    def _refresh_loads(self):
+        """v4.0.0 (B2): narrow refresh after a load add/remove."""
+        try:
+            self._populate_loads_tab()
+        except Exception:
+            pass
+        try:
+            self._create_all_load_actors()
+        except Exception:
+            pass
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+
+    def _refresh_grid_color_data(self):
+        """v4.0.0 (B2): refresh grid coloring after material/property
+        edits. Currently a thin wrapper around _update_plot_visibility
+        which rebuilds the colored mesh actors; the grid geometry is
+        unchanged so no full _update_viewer is needed.
+        """
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+
+    def _refresh_coord_actors(self):
+        """v4.0.0 (B2): refresh coord-system axis arrows after a
+        coord add/edit/delete. Falls back to _update_viewer for now
+        (axis arrows are created inline with _update_viewer). A future
+        pass can extract a dedicated _create_all_coord_actors helper.
+        """
+        self._update_viewer()
+
+    def _refresh_groups(self):
+        """v4.0.0 (B2): refresh groups list + visibility after a
+        group create/modify/rename. Skips the full model rebuild.
+        """
+        try:
+            self._populate_groups_list()
+        except Exception:
+            pass
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _snapshot_tree_state(tree, tree_id='?'):
+        """v4.0.0 (B1) / v4.0.3 (Stage O): walk a QTreeWidget and
+        capture per-item state keyed by the item's UserRole data tuple.
+
+        v4.0.3 adds a diagnostic perf_event with the snapshot size
+        and a few sample keys so we can verify the restore side picks
+        the right matches (debug for the constraint-set uncheck bug).
+
+        Returns ``{key: {'checked': CheckState, 'expanded': bool}}``.
+        Keys come from ``item.data(0, UserRole)`` set when the item was
+        created. Items without a UserRole key are skipped (no way to
+        match them on rebuild).
+        """
+        from PySide6 import QtCore as _QtCore
+        out = {}
+        # v4.0.3 (Stage O): also capture the per-item state for any
+        # constraint_set keys so we can correlate snapshot↔restore.
+        constraint_snapshot = {}
+
+        def walk(parent):
+            n = parent.childCount()
+            for i in range(n):
+                child = parent.child(i)
+                key = child.data(0, _QtCore.Qt.UserRole)
+                if key is not None:
+                    try:
+                        hashable = tuple(key) if isinstance(key, (list, tuple)) else key
+                        out[hashable] = {
+                            'checked': child.checkState(0),
+                            'expanded': child.isExpanded(),
+                        }
+                        if (isinstance(hashable, tuple)
+                                and len(hashable) >= 1
+                                and hashable[0] == 'constraint_set'):
+                            # v4.0.5b: int(CheckState) fails on
+                            # PySide6 strict enums. Use safe fallback
+                            # so the snapshot diagnostic doesn't lose
+                            # data via the outer TypeError except.
+                            _cs = child.checkState(0)
+                            try:
+                                _cs_int = int(_cs)
+                            except Exception:
+                                try:
+                                    _cs_int = int(_cs.value)
+                                except Exception:
+                                    _cs_int = repr(_cs)
+                            constraint_snapshot[hashable] = _cs_int
+                    except TypeError:
+                        pass  # unhashable key; skip
+                walk(child)
+
+        root = tree.invisibleRootItem()
+        walk(root)
+
+        try:
+            from node_runner.profiling import perf_event
+            sample_keys = list(out.keys())[:8]
+            perf_event('tree_snapshot', 'capture',
+                       tree_id=tree_id,
+                       n_items=len(out),
+                       sample_keys=','.join(str(k)[:30] for k in sample_keys),
+                       constraint_sets=str(constraint_snapshot)[:200])
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _restore_tree_state(tree, snapshot, tree_id='?'):
+        """v4.0.0 (B1) / v4.0.3 (Stage O): apply a snapshot from
+        ``_snapshot_tree_state`` back onto the rebuilt tree.
+
+        Items added since snapshot use whatever default the build set;
+        items removed since snapshot are silently dropped. Signals must
+        be blocked by the caller during clear/rebuild — restore itself
+        sets check state via ``setCheckState`` which can fire
+        ``itemChanged``; callers that care should block.
+
+        v4.0.3 adds match/miss counters so we can see whether the
+        constraint_set checkbox uncheck symptom is a snapshot-side
+        problem (missing key) or a restore-side problem (key present
+        but ignored).
+        """
+        from PySide6 import QtCore as _QtCore
+        if not snapshot:
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('tree_snapshot', 'restore_skip_empty',
+                           tree_id=tree_id)
+            except Exception:
+                pass
+            return
+
+        # v4.0.3 (Stage O) counters.
+        matched = 0
+        skipped_not_in_snap = 0
+        constraint_restore = {}
+
+        # v4.0.5 (Stage W): keys we care about specifically for the
+        # top-level-row checkbox regression diagnostic.
+        TOP_ROW_KEYS = {
+            ('loads_root',),
+            ('constraints_root',),
+            ('combos_root',),
+        }
+
+        def walk(parent):
+            nonlocal matched, skipped_not_in_snap
+            n = parent.childCount()
+            for i in range(n):
+                child = parent.child(i)
+                key = child.data(0, _QtCore.Qt.UserRole)
+                if key is not None:
+                    try:
+                        hashable = tuple(key) if isinstance(key, (list, tuple)) else key
+                        saved = snapshot.get(hashable)
+                        # v4.0.5 (Stage W): log top-level row state
+                        # before/after restore touches them.
+                        if hashable in TOP_ROW_KEYS:
+                            try:
+                                from node_runner.profiling import perf_event as _w2_perf_event
+                                # v4.0.5b: int(ItemFlag) raises on
+                                # PySide6 6.x strict enums. Fall back
+                                # to .value / repr safely.
+                                try:
+                                    _flags_int = int(child.flags())
+                                except Exception:
+                                    try:
+                                        _flags_int = int(child.flags().value)
+                                    except Exception:
+                                        _flags_int = repr(child.flags())
+                                try:
+                                    _checkable_before = bool(
+                                        child.flags() & _QtCore.Qt.ItemIsUserCheckable)
+                                except Exception:
+                                    _checkable_before = None
+                                try:
+                                    _saved_checked = (int(saved['checked'])
+                                                      if saved else None)
+                                except Exception:
+                                    _saved_checked = None
+                                _w2_perf_event(
+                                    'top_row_flags', 'restore_before',
+                                    key=str(hashable),
+                                    flags=_flags_int,
+                                    checkable_before=_checkable_before,
+                                    saved_present=(saved is not None),
+                                    saved_checked=_saved_checked,
+                                )
+                            except Exception:
+                                pass
+                        if saved is not None:
+                            if child.flags() & _QtCore.Qt.ItemIsUserCheckable:
+                                child.setCheckState(0, saved['checked'])
+                            child.setExpanded(saved['expanded'])
+                            matched += 1
+                            if (isinstance(hashable, tuple)
+                                    and len(hashable) >= 1
+                                    and hashable[0] == 'constraint_set'):
+                                # v4.0.5b: safe int conversion for
+                                # CheckState (strict-enum compat).
+                                def _ck_int(v):
+                                    try:
+                                        return int(v)
+                                    except Exception:
+                                        try:
+                                            return int(v.value)
+                                        except Exception:
+                                            return repr(v)
+                                constraint_restore[hashable] = (
+                                    _ck_int(saved['checked']),
+                                    _ck_int(child.checkState(0)),
+                                )
+                        else:
+                            skipped_not_in_snap += 1
+                        if hashable in TOP_ROW_KEYS:
+                            try:
+                                from node_runner.profiling import perf_event as _w3_perf_event
+                                # v4.0.5b: safe int conversion (see
+                                # restore_before block above).
+                                try:
+                                    _flags_int = int(child.flags())
+                                except Exception:
+                                    try:
+                                        _flags_int = int(child.flags().value)
+                                    except Exception:
+                                        _flags_int = repr(child.flags())
+                                try:
+                                    _checkable_after = bool(
+                                        child.flags() & _QtCore.Qt.ItemIsUserCheckable)
+                                except Exception:
+                                    _checkable_after = None
+                                _w3_perf_event(
+                                    'top_row_flags', 'restore_after',
+                                    key=str(hashable),
+                                    flags=_flags_int,
+                                    checkable_after=_checkable_after,
+                                )
+                            except Exception:
+                                pass
+                    except TypeError:
+                        pass
+                walk(child)
+
+        root = tree.invisibleRootItem()
+        walk(root)
+
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('tree_snapshot', 'restore_match',
+                       tree_id=tree_id,
+                       n_snapshot=len(snapshot),
+                       matched=matched,
+                       skipped_not_in_snap=skipped_not_in_snap,
+                       missed=max(0, len(snapshot) - matched),
+                       constraint_restore=str(constraint_restore)[:200])
+        except Exception:
+            pass
+
     def _populate_tree(self):
         """Populate the model tree.
 
@@ -7207,14 +8587,30 @@ class MainWindow(QMainWindow):
         high-cardinality parent, (d) replacing ``expandAll()`` + collapse
         with explicit per-group expand so the coord group never gets
         the full layout treatment.
+
+        v4.0.0 (B1): snapshot tree state before clear, restore after
+        build. Without this, small edits (add SPC, edit material) that
+        end with a tree refresh would wipe the user's checkbox
+        visibility selections.
         """
+        from node_runner.profiling import perf_stage
+        # v4.0.3 (Stage J): invalidate the lookup index before the
+        # rebuild so any in-flight `_find_tree_items` call falls back
+        # to a legacy walk rather than reading stale pointers.
+        self._tree_item_index = None
+        with perf_stage('tree', 'snapshot_state'):
+            snapshot = self._snapshot_tree_state(self.tree_widget, tree_id='model_tree')
         try:
             self.tree_widget.itemChanged.disconnect(self._handle_tree_item_changed)
         except (RuntimeError, TypeError): pass
-        self.tree_widget.clear()
+        with perf_stage('tree', 'clear_widget'):
+            self.tree_widget.clear()
 
         if not self.current_generator:
             self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
+            # v4.0.3 (Stage J): empty tree gets an empty index so
+            # callers don't fall back to the legacy walk forever.
+            self._tree_item_index = {}
             return
 
         model = self.current_generator.model
@@ -7222,13 +8618,24 @@ class MainWindow(QMainWindow):
         # v3.3.0: batch all the work between setUpdatesEnabled toggles.
         self.tree_widget.setUpdatesEnabled(False)
         try:
-            self._build_tree_contents(model)
+            with perf_stage('tree', 'build_contents',
+                            n_props=len(model.properties),
+                            n_mats=len(model.materials)):
+                self._build_tree_contents(model)
+            with perf_stage('tree', 'restore_state'):
+                self._restore_tree_state(self.tree_widget, snapshot, tree_id='model_tree')
+            # v4.0.3 (Stage J): rebuild the lookup index now that the
+            # tree contents are final.
+            with perf_stage('tree', 'build_item_index'):
+                self._build_tree_item_index()
         finally:
             self.tree_widget.setUpdatesEnabled(True)
 
         self.tree_widget.itemChanged.connect(self._handle_tree_item_changed)
-        self._populate_loads_tab()
-        self._populate_analysis_tab()
+        with perf_stage('tree', 'populate_loads_tab'):
+            self._populate_loads_tab()
+        with perf_stage('tree', 'populate_analysis_tab'):
+            self._populate_analysis_tab()
 
     def _build_tree_contents(self, model):
         """Actual tree-population body. Called with updates disabled."""
@@ -7566,21 +8973,222 @@ class MainWindow(QMainWindow):
                 # Auto-expand so matches are visible.
                 item.setExpanded(True)
 
+    def _handle_tree_item_clicked(self, item, column):
+        """v4.0.2 (Stage E): fires on every tree click regardless of
+        check-state delta. Two roles:
+
+        1. Diagnostic: emit a perf_event so the profile log records
+           that the click reached the tree, even if itemChanged
+           never fires (e.g. user clicked the row text not the
+           checkbox).
+        2. UX: if the user clicked on a category row with a
+           checkbox (anything with UserRole data starting with
+           'elem_by_type_group' / 'elem_shape_group' / 'group'),
+           auto-toggle the checkbox. Cuts the "miss-the-checkbox"
+           frustration.
+        """
+        from node_runner.profiling import perf_event
+        try:
+            data = item.data(0, QtCore.Qt.UserRole)
+            label = item.text(0)
+            cur_state = item.checkState(0)
+        except Exception:
+            return
+        # v4.0.5b: safe int conversion (PySide6 strict-enum compat).
+        try:
+            _sb = int(cur_state)
+        except Exception:
+            try:
+                _sb = int(cur_state.value)
+            except Exception:
+                _sb = repr(cur_state)
+        perf_event('tree', 'item_clicked',
+                   label=label,
+                   data=str(data)[:80],
+                   state_before=_sb,
+                   checkable=bool(item.flags() & QtCore.Qt.ItemIsUserCheckable))
+        # v4.0.6 (auto-toggle disabled): the v4.0.2 Stage E auto-toggle
+        # caused a double-fire when the user clicked the checkbox
+        # itself — Qt emits itemChanged (toggling once), THEN emits
+        # itemClicked which entered this branch and toggled again,
+        # leaving the visual state unchanged but firing TWO visibility
+        # updates. The fix is to leave the click alone: itemChanged
+        # fires natively on checkbox clicks (now that v4.0.5 removed
+        # the viewport eventFilter that was blocking it). The
+        # "click-on-label-doesn't-toggle" UX issue is acceptable for
+        # now — the user can click the checkbox directly. Diagnostic
+        # logging stays so we can still see clicks in the log.
+
+    def _handle_tree_item_pressed(self, item, column):
+        """v4.0.4 (Stage R): diagnostic-only handler for `itemPressed`.
+        Fires before `itemClicked` for any mouse press on an item.
+        If this fires but `itemClicked`/`itemChanged` don't, the bug
+        is later in the Qt signal pipeline.
+        """
+        try:
+            from node_runner.profiling import perf_event
+            data = item.data(0, QtCore.Qt.UserRole) if item else None
+            label = item.text(0) if item else ''
+            perf_event('tree', 'item_pressed',
+                       label=label,
+                       data=str(data)[:80],
+                       column=column)
+        except Exception:
+            pass
+
+    def _handle_tree_selection_changed(self):
+        """v4.0.4 (Stage R): diagnostic-only handler for
+        `itemSelectionChanged`. Fires every time the tree selection
+        changes (independent of itemClicked/itemChanged). Gives us a
+        third probe point in the signal pipeline.
+        """
+        try:
+            from node_runner.profiling import perf_event
+            selected = self.tree_widget.selectedItems()
+            sample = selected[0] if selected else None
+            label = sample.text(0) if sample else ''
+            data = sample.data(0, QtCore.Qt.UserRole) if sample else None
+            perf_event('tree', 'selection_changed',
+                       n_selected=len(selected),
+                       sample_label=label,
+                       sample_data=str(data)[:80])
+        except Exception:
+            pass
+
     def _handle_tree_item_changed(self, item, column):
-        self.tree_widget.blockSignals(True)
-        def set_child_states(parent_item):
-            if parent_item.checkState(0) == QtCore.Qt.PartiallyChecked: return
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i); child.setCheckState(0, parent_item.checkState(0)); set_child_states(child)
-        set_child_states(item)
-        parent = item.parent()
-        while parent:
-            child_states = [parent.child(i).checkState(0) for i in range(parent.childCount())]
-            if all(s == QtCore.Qt.Checked for s in child_states): parent.setCheckState(0, QtCore.Qt.Checked)
-            elif all(s == QtCore.Qt.Unchecked for s in child_states): parent.setCheckState(0, QtCore.Qt.Unchecked)
-            else: parent.setCheckState(0, QtCore.Qt.PartiallyChecked)
-            parent = parent.parent()
-        self.tree_widget.blockSignals(False); self._update_plot_visibility()
+        # v4.0.4 (Stage R): stdout sentinel — fires unconditionally so
+        # we know whether Qt is dispatching the slot at all, even when
+        # NR_PROFILE is unset. Visible in dev runs via `python -u run.py`
+        # or in a console-attached build.
+        print('[slot-fire] item_changed entered', flush=True)
+        from node_runner.profiling import perf_stage, perf_event
+        # Identify what the user clicked so the perf log is readable.
+        try:
+            data = item.data(0, QtCore.Qt.UserRole)
+            label = item.text(0)
+        except Exception:
+            data, label = None, ''
+        # v4.0.5b: int(CheckState) raises on PySide6 strict enums.
+        try:
+            _state = int(item.checkState(0))
+        except Exception:
+            try:
+                _state = int(item.checkState(0).value)
+            except Exception:
+                _state = repr(item.checkState(0))
+        perf_event('tree', 'item_changed', label=label,
+                   data=str(data)[:60],
+                   state=_state)
+        with perf_stage('tree', 'handle_item_changed',
+                        status_msg=f'Updating visibility for: {label}…',
+                        status=True, label=label):
+            # v4.0.10: source-tree-aware blockSignals. Pre-v4.0.10 this
+            # only ever blocked the model tree, but with the loads_tab
+            # connection now wired the same handler runs for both trees.
+            # Block the tree that actually fired so the cascade
+            # setCheckState calls below don't re-enter this handler.
+            try:
+                src_tree = item.treeWidget()
+            except Exception:
+                src_tree = None
+            if src_tree is None:
+                src_tree = self.tree_widget
+            src_tree.blockSignals(True)
+            try:
+                def set_child_states(parent_item):
+                    if parent_item.checkState(0) == QtCore.Qt.PartiallyChecked: return
+                    for i in range(parent_item.childCount()):
+                        child = parent_item.child(i); child.setCheckState(0, parent_item.checkState(0)); set_child_states(child)
+                set_child_states(item)
+                parent = item.parent()
+                while parent:
+                    child_states = [parent.child(i).checkState(0) for i in range(parent.childCount())]
+                    if all(s == QtCore.Qt.Checked for s in child_states): parent.setCheckState(0, QtCore.Qt.Checked)
+                    elif all(s == QtCore.Qt.Unchecked for s in child_states): parent.setCheckState(0, QtCore.Qt.Unchecked)
+                    else: parent.setCheckState(0, QtCore.Qt.PartiallyChecked)
+                    parent = parent.parent()
+            finally:
+                src_tree.blockSignals(False)
+            # v4.0.9: fast path for toggles that affect a single named
+            # actor. The full _update_plot_visibility cycle costs ~4-5 s
+            # on MEGA; if the click only toggles one independent actor
+            # we skip the rebuild_plot / shells_compute_normals / SID
+            # loops entirely. The router returns False on any
+            # unexpected condition so we fall through safely.
+            try:
+                if self._route_fast_path_visibility(data, item.checkState(0)):
+                    return
+            except Exception as _exc:
+                perf_event('fast_path', 'router_failed',
+                           data=str(data)[:60],
+                           exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            self._update_plot_visibility()
+
+    def _route_fast_path_visibility(self, data, check_state):
+        """v4.0.9: dispatch a tree-checkbox change to the right
+        targeted handler when one exists. Returns True if the handler
+        completed; False to let the caller fall through to
+        _update_plot_visibility.
+
+        Covered cases (each affects exactly one named actor):
+          - ('load_set', sid)           → fast_path_sid_toggle
+          - ('constraint_set', sid)     → fast_path_sid_toggle
+          - ('elem_by_type_group', 'Rigid')  → rbe_actors.SetVisibility
+          - ('group', 'masses')         → mass_actors.SetVisibility
+          - ('group', 'plotels')        → plotel_actors.SetVisibility
+          - ('group', 'coords')         → _refresh_coord_actors()
+          - ('coord', cid)              → _refresh_coord_actors()
+        """
+        from node_runner.profiling import perf_event
+        if not isinstance(data, tuple) or not data:
+            return False
+        is_checked = (check_state == QtCore.Qt.Checked)
+        # Per-SID fast paths (load + constraint glyphs).
+        if len(data) == 2 and data[0] in ('load_set', 'constraint_set'):
+            return self._fast_path_sid_toggle(data[0], data[1], check_state)
+        # Single-actor visibility toggles.
+        # v4.0.14: the Rigid special case is again subsumed by
+        # _fast_path_category_toggle below. v4.0.11 had this bug
+        # because the LOD path dropped RBE2/RBE3; v4.0.14 builds
+        # pre-built actors from current_grid (full mesh) so RBE2/
+        # RBE3 ARE included. Plus the fast path now derives
+        # rbe_actors visibility from the Rigid checkbox state
+        # directly (not via target_states.get), so the v4.0.11
+        # failure mode is defensively guarded against.
+        if data == ('group', 'masses'):
+            actor = self.plotter.actors.get('mass_actors')
+            if actor is None:
+                return False
+            actor.SetVisibility(is_checked)
+            perf_event('fast_path', 'masses_toggle',
+                       checked=is_checked)
+            self.plotter.render()
+            return True
+        if data == ('group', 'plotels'):
+            actor = self.plotter.actors.get('plotel_actors')
+            if actor is None:
+                return False
+            actor.SetVisibility(is_checked)
+            perf_event('fast_path', 'plotels_toggle',
+                       checked=is_checked)
+            self.plotter.render()
+            return True
+        # Coord-system toggles only affect the coord arrows + labels,
+        # nothing else in the scene. Refresh the coord actors directly.
+        if data == ('group', 'coords') or (
+                len(data) == 2 and data[0] == 'coord'):
+            self._refresh_coord_actors(render=True)
+            perf_event('fast_path', 'coords_toggle',
+                       data=str(data)[:40])
+            return True
+        # v4.0.14 (Fix C v2): category toggles map to pre-built
+        # per-Nastran-type actors built from full current_grid. The
+        # handler returns False when PID/MID/isolate/hidden filter
+        # is active, falling through to legacy _rebuild_plot.
+        if (len(data) == 2
+                and data[0] in ('elem_by_type_group', 'elem_shape_group')):
+            return self._fast_path_category_toggle(data[0], data[1])
+        return False
 
     # --- Loads Tab Methods ---
 
@@ -7604,15 +9212,40 @@ class MainWindow(QMainWindow):
             return str(card.type) if hasattr(card, 'type') else "Unknown"
 
     def _format_spc_entry(self, spc_card, node_id) -> str:
-        """Format an SPC entry for a specific node."""
+        """Format an SPC entry for a specific node.
+
+        v4.0.6: SPC1 cards store a SINGLE components string that
+        applies to ALL nodes in the card (Nastran semantics). The
+        v3.5.0 code indexed ``spc_card.components`` by node index,
+        which only happened to work when components had as many chars
+        as nodes (e.g. a 3-node card with ``components='123'`` would
+        show TX/TY/TZ for nodes 0/1/2). For a card with 7 nodes
+        and ``components='123'``, nodes 3-6 raised IndexError and
+        showed without a DOF label.
+
+        Correct: use the whole components string for every node.
+        """
         try:
             dof_names = {1: 'TX', 2: 'TY', 3: 'TZ', 4: 'RX', 5: 'RY', 6: 'RZ'}
-            # Get the components for this node from the SPC card
-            idx = list(spc_card.nodes).index(node_id)
-            components = spc_card.components[idx] if hasattr(spc_card, 'components') else str(spc_card.components[idx])
-            comp_str = str(components)
+            comp_raw = getattr(spc_card, 'components', None)
+            if comp_raw is None:
+                return f"Node {node_id}"
+            # SPC1: components is typically a single str shared by all
+            # nodes. SPC: components may be per-node (list/tuple). Try
+            # per-node indexing only if components looks indexable AND
+            # has at least as many entries as the node count.
+            if isinstance(comp_raw, (list, tuple)):
+                try:
+                    idx = list(spc_card.nodes).index(node_id)
+                    comp_for_node = comp_raw[idx]
+                except (ValueError, IndexError):
+                    comp_for_node = comp_raw[0] if comp_raw else ''
+            else:
+                # Single string applies to all nodes.
+                comp_for_node = comp_raw
+            comp_str = str(comp_for_node)
             dofs = " ".join(dof_names.get(int(c), c) for c in comp_str if c.isdigit())
-            return f"Node {node_id}: {dofs}"
+            return f"Node {node_id}: {dofs}" if dofs else f"Node {node_id}"
         except Exception:
             return f"Node {node_id}"
 
@@ -7625,26 +9258,55 @@ class MainWindow(QMainWindow):
         expand via _on_load_tab_item_expanded. On the MEGA-XWFF deck
         (512k load entries) this drops Loads-tab populate from 5-30s
         to <100ms.
+
+        v4.0.0 (B1): preserve per-item check + expansion state across
+        the clear/rebuild so unrelated edits don't wipe the user's
+        visibility selections.
         """
         tree = self.loads_tab_tree
+        # v4.0.4 (Stage Q): invalidate the loads-tab index before
+        # the rebuild so any in-flight `_find_tree_items` lookup
+        # falls back to the legacy walk (correct, just slower) rather
+        # than reading stale pointers.
+        self._loads_tab_item_index = None
+        snapshot = self._snapshot_tree_state(tree, tree_id='loads_tab')
         # Disconnect itemExpanded to avoid firing during the clear/rebuild
         try:
             tree.itemExpanded.disconnect(self._on_load_tab_item_expanded)
         except (RuntimeError, TypeError):
             pass
-
+        # v4.0.10: also block itemChanged. Since v4.0.10 wired this
+        # signal at __init__ time, setCheckState calls inside the
+        # rebuild (especially _restore_tree_state) would fire a
+        # _handle_tree_item_changed cascade for every restored
+        # checkbox state. blockSignals on the tree suppresses these
+        # without disturbing the connection itself.
+        tree.blockSignals(True)
         tree.setUpdatesEnabled(False)
         try:
             tree.clear()
             self._build_loads_tab_contents()
+            self._restore_tree_state(tree, snapshot, tree_id='loads_tab')
+            # v4.0.4 (Stage Q): rebuild the loads-tab lookup index
+            # now that the tree contents are final.
+            self._build_loads_tab_item_index()
         finally:
             tree.setUpdatesEnabled(True)
+            tree.blockSignals(False)
 
         # Reconnect lazy-expand hook after the tree is rebuilt.
         tree.itemExpanded.connect(self._on_load_tab_item_expanded)
+        # v4.0.10: snapshot restore re-set checkstates while signals
+        # were blocked, so the fast-path-maintained sets are stale.
+        # Refresh from tree truth now.
+        try:
+            self._refresh_visible_sid_sets()
+        except Exception:
+            pass
 
     def _build_loads_tab_contents(self):
         """Actual tree-population body. Called with updates disabled."""
+        from node_runner.dialogs.load_combination import read_combo_payload
         tree = self.loads_tab_tree
         gen = getattr(self, 'current_generator', None)
         model = gen.model if gen else None
@@ -7653,10 +9315,47 @@ class MainWindow(QMainWindow):
 
         # --- Load Sets (combine model.loads and model.tempds) ---
         all_load_sids = set(model.loads.keys()) | set(model.tempds.keys())
+        # v4.0.5 (Stage W): log flags of top-level rows so we can see
+        # which step (if any) adds ItemIsUserCheckable to them.
+        from node_runner.profiling import perf_event as _w_perf_event
+
+        # v4.0.5b (hotfix): PySide6 6.x with strict enums raises
+        # "int() argument must be ... not 'ItemFlag'" when you call
+        # int(item.flags()) directly. Use this safe helper so the
+        # diagnostic doesn't crash the post-parse handler.
+        def _flag_int(flags):
+            try:
+                return int(flags)
+            except Exception:
+                try:
+                    return int(flags.value)
+                except Exception:
+                    try:
+                        return repr(flags)
+                    except Exception:
+                        return '?'
+
+        def _is_checkable(flags):
+            try:
+                return bool(flags & QtCore.Qt.ItemIsUserCheckable)
+            except Exception:
+                # As a fallback, render the bitwise-AND string.
+                try:
+                    return ('ItemIsUserCheckable' in repr(flags))
+                except Exception:
+                    return None
+
         if all_load_sids:
             n_loads = sum(len(v) for v in model.loads.values()) + len(model.tempds)
             loads_root = QTreeWidgetItem(tree, [f"Load Sets ({n_loads} entries)"])
             loads_root.setData(0, QtCore.Qt.UserRole, ('loads_root',))
+            # v4.0.9: PySide6 6.x default flags include ItemIsUserCheckable
+            # (flags=61). The header rows shouldn't be checkable — clear the
+            # bit so they look like proper section headers.
+            loads_root.setFlags(loads_root.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+            _w_perf_event('top_row_flags', 'after_loads_root_create',
+                          flags=_flag_int(loads_root.flags()),
+                          checkable=_is_checkable(loads_root.flags()))
             # Build all Load Set headers without children first (batched).
             set_items = []
             for sid in sorted(all_load_sids):
@@ -7673,7 +9372,18 @@ class MainWindow(QMainWindow):
                     [f"SID {sid}: {summary}"])
                 set_item.setFlags(
                     set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                set_item.setCheckState(0, QtCore.Qt.Checked)
+                # v4.0.5b: default OFF. Pre-Stage Q (v4.0.4), the
+                # visibility lookup queried the wrong tree and returned
+                # [] for every load_set, so every SID was effectively
+                # invisible. Stage Q routed the lookup to the correct
+                # tree, exposing the fact that the build-time default
+                # was Checked — which, on MEGA (1,962 SIDs / 512k
+                # entries), made the post-parse pass build glyph
+                # geometry for every load entry. Default Unchecked
+                # matches the user's expected UX ("loads/constraints
+                # off unless explicitly enabled") AND keeps post-parse
+                # render fast.
+                set_item.setCheckState(0, QtCore.Qt.Unchecked)
                 set_item.setData(0, QtCore.Qt.UserRole, ('load_set', sid))
                 # v3.5.0: placeholder child so the disclosure triangle
                 # appears. Real entries are built on first expand.
@@ -7686,6 +9396,9 @@ class MainWindow(QMainWindow):
                 set_items.append(set_item)
             loads_root.addChildren(set_items)
             loads_root.setExpanded(True)
+            _w_perf_event('top_row_flags', 'after_loads_root_addchildren',
+                          flags=_flag_int(loads_root.flags()),
+                          checkable=_is_checkable(loads_root.flags()))
 
         # --- Constraint Sets (same lazy pattern) ---
         if model.spcs:
@@ -7694,6 +9407,11 @@ class MainWindow(QMainWindow):
             constr_root = QTreeWidgetItem(
                 tree, [f"Constraint Sets ({n_constr} nodes)"])
             constr_root.setData(0, QtCore.Qt.UserRole, ('constraints_root',))
+            # v4.0.9: clear ItemIsUserCheckable from header row (see loads_root).
+            constr_root.setFlags(constr_root.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+            _w_perf_event('top_row_flags', 'after_constr_root_create',
+                          flags=_flag_int(constr_root.flags()),
+                          checkable=_is_checkable(constr_root.flags()))
             constr_items = []
             for sid, spc_list in sorted(model.spcs.items()):
                 all_nodes = set()
@@ -7703,7 +9421,10 @@ class MainWindow(QMainWindow):
                     [f"SID {sid}: SPC ({len(all_nodes)} Nodes)"])
                 set_item.setFlags(
                     set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                set_item.setCheckState(0, QtCore.Qt.Checked)
+                # v4.0.5b: default OFF — same rationale as load_set
+                # above. Constraint glyph geometry only builds when
+                # the user explicitly turns on a SID.
+                set_item.setCheckState(0, QtCore.Qt.Unchecked)
                 set_item.setData(0, QtCore.Qt.UserRole, ('constraint_set', sid))
                 if all_nodes:
                     placeholder = QTreeWidgetItem(
@@ -7715,6 +9436,9 @@ class MainWindow(QMainWindow):
                 constr_items.append(set_item)
             constr_root.addChildren(constr_items)
             constr_root.setExpanded(True)
+            _w_perf_event('top_row_flags', 'after_constr_root_addchildren',
+                          flags=_flag_int(constr_root.flags()),
+                          checkable=_is_checkable(constr_root.flags()))
 
         # --- Load Combinations (batched; combos themselves are flat) ---
         if hasattr(model, 'load_combinations') and model.load_combinations:
@@ -7722,13 +9446,19 @@ class MainWindow(QMainWindow):
                 tree,
                 [f"Load Combinations ({len(model.load_combinations)})"])
             combos_root.setData(0, QtCore.Qt.UserRole, ('combos_root',))
+            # v4.0.9: clear ItemIsUserCheckable from header row (see loads_root).
+            combos_root.setFlags(combos_root.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+            _w_perf_event('top_row_flags', 'after_combos_root_create',
+                          flags=_flag_int(combos_root.flags()),
+                          checkable=_is_checkable(combos_root.flags()))
             combo_items = []
             for combo_sid, combo_data in sorted(
                     model.load_combinations.items()):
                 try:
-                    scale = combo_data.get('scale', 1.0)
-                    components = combo_data.get('scale_factors', [])
-                    load_ids = combo_data.get('load_ids', [])
+                    payload = read_combo_payload(combo_data)
+                    scale = payload['scale']
+                    components = payload['scale_factors']
+                    load_ids = payload['load_ids']
                     n_members = len(load_ids)
                     parts = [f"SID {lid} x{sf:.3g}"
                              for sf, lid in zip(components, load_ids)]
@@ -8748,7 +10478,116 @@ class MainWindow(QMainWindow):
             self.showNormal()
 
     def eventFilter(self, obj, event):
-        """Catch ESC on the plotter to exit presentation mode."""
+        """Catch ESC on the plotter to exit presentation mode.
+
+        v4.0.3 (Stage K): also catch every event reaching tree_widget
+        (and its viewport) when profiling is enabled. Pure diagnostic
+        — we never consume the event. Lets us prove or disprove
+        whether user clicks even reach Qt before reaching our slots.
+        """
+        # v4.0.3 (Stage K) / v4.0.4 (Stage R): tree-widget click trace.
+        # v4.0.4 enriches MouseButtonPress with `itemAt(pos)` + tree
+        # state so we can prove or disprove whether the click lands
+        # on a real item and whether Qt is suppressing signals.
+        try:
+            tree = getattr(self, 'tree_widget', None)
+            if tree is not None and (obj is tree or obj is tree.viewport()):
+                etype = int(event.type())
+                # Only log the few event types we actually care about
+                # so we don't drown the log in MouseMove etc.
+                CARED_ABOUT = (
+                    QtCore.QEvent.MouseButtonPress,
+                    QtCore.QEvent.MouseButtonRelease,
+                    QtCore.QEvent.MouseButtonDblClick,
+                    QtCore.QEvent.KeyPress,
+                    QtCore.QEvent.FocusIn,
+                    QtCore.QEvent.FocusOut,
+                    QtCore.QEvent.Enter,
+                    QtCore.QEvent.Leave,
+                )
+                if event.type() in CARED_ABOUT:
+                    from node_runner.profiling import perf_event
+                    pos = None
+                    px = py = None
+                    btn = None
+                    try:
+                        if hasattr(event, 'position'):
+                            p = event.position()
+                            px, py = int(p.x()), int(p.y())
+                            pos = f"({px},{py})"
+                        if hasattr(event, 'button'):
+                            btn = int(event.button())
+                    except Exception:
+                        pass
+
+                    # v4.0.4 (Stage R) — for MouseButtonPress on the
+                    # viewport, log full tree state to nail down why
+                    # itemChanged/itemClicked don't fire.
+                    extra = {}
+                    if (event.type() == QtCore.QEvent.MouseButtonPress
+                            and obj is tree.viewport()
+                            and px is not None):
+                        try:
+                            # itemAt expects viewport coords.
+                            hit_item = tree.itemAt(px, py)
+                        except Exception:
+                            hit_item = None
+                        if hit_item is not None:
+                            try:
+                                hit_label = hit_item.text(0)
+                            except Exception:
+                                hit_label = '?'
+                            try:
+                                hit_data = hit_item.data(0, QtCore.Qt.UserRole)
+                            except Exception:
+                                hit_data = None
+                            try:
+                                hit_state = int(hit_item.checkState(0))
+                            except Exception:
+                                hit_state = -1
+                            try:
+                                hit_checkable = bool(
+                                    hit_item.flags() & QtCore.Qt.ItemIsUserCheckable)
+                            except Exception:
+                                hit_checkable = None
+                            extra.update(
+                                item_at_hit=True,
+                                hit_label=hit_label,
+                                hit_data=str(hit_data)[:80],
+                                hit_state=hit_state,
+                                hit_checkable=hit_checkable,
+                            )
+                        else:
+                            extra['item_at_hit'] = False
+                        try:
+                            extra['tree_signals_blocked'] = bool(tree.signalsBlocked())
+                        except Exception:
+                            pass
+                        try:
+                            extra['viewport_signals_blocked'] = bool(
+                                tree.viewport().signalsBlocked())
+                        except Exception:
+                            pass
+                        try:
+                            extra['tree_enabled'] = bool(tree.isEnabled())
+                            extra['tree_visible'] = bool(tree.isVisible())
+                            extra['viewport_enabled'] = bool(
+                                tree.viewport().isEnabled())
+                            extra['updates_enabled'] = bool(
+                                tree.updatesEnabled())
+                        except Exception:
+                            pass
+
+                    perf_event(
+                        'tree_event_filter', 'event',
+                        target=('viewport' if obj is tree.viewport() else 'widget'),
+                        type=etype,
+                        pos=pos,
+                        button=btn,
+                        **extra)
+        except Exception:
+            pass
+
         if (event.type() == QtCore.QEvent.KeyPress
                 and event.key() == QtCore.Qt.Key_Escape
                 and self.presentation_action.isChecked()):
@@ -8851,7 +10690,48 @@ class MainWindow(QMainWindow):
         self._request_render()
         
     def _set_coloring_mode(self, mode):
+        from node_runner.profiling import perf_event as _cm_perf_event
         self.color_mode = mode
+        # v4.0.15: pre-built per-category actors are color-mode-
+        # dependent. Tear them down + rebuild so the next fast-path
+        # category toggle renders the right colors. Skipped when
+        # no pre-built actors exist (before first viewer build or
+        # when the prior mode was unsupported so they were never
+        # built). Future-proof: the build site reads `self.color_mode`
+        # and consults `_PRE_BUILT_SUPPORTED_COLOR_MODES` so adding
+        # a new color mode "just works" here.
+        if getattr(self, '_category_actors', None):
+            try:
+                for ntype in list(self._category_actors.keys()):
+                    self.plotter.remove_actor(f'cat_{ntype}', render=False)
+                self._category_actors = {}
+                self._category_visible_ntypes = set()
+                self._using_legacy_mesh = False
+                if (self.current_grid is not None
+                        and 'type' in self.current_grid.cell_data):
+                    self._build_pre_built_category_actors()
+                _cm_perf_event('actors', 'rebuild_on_color_mode',
+                               mode=mode,
+                               n_built=len(self._category_actors))
+            except Exception as _exc:
+                _cm_perf_event('actors', 'rebuild_on_color_mode_failed',
+                               mode=mode,
+                               exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+        elif self.current_grid is not None:
+            # No pre-built actors yet (prior mode was unsupported, or
+            # they were never built). If the new mode IS supported,
+            # build them now so the next category toggle hits the
+            # fast path with the right colors.
+            if mode in _PRE_BUILT_SUPPORTED_COLOR_MODES:
+                try:
+                    self._build_pre_built_category_actors()
+                    _cm_perf_event('actors', 'rebuild_on_color_mode',
+                                   mode=mode,
+                                   n_built=len(self._category_actors))
+                except Exception as _exc:
+                    _cm_perf_event('actors', 'rebuild_on_color_mode_failed',
+                                   mode=mode,
+                                   exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
         # Sync sidebar combo
         mode_map = {"property": 0, "type": 1, "quality": 2, "results": 3}
         idx = mode_map.get(mode, 0)
@@ -8880,8 +10760,46 @@ class MainWindow(QMainWindow):
         self._update_status(f"Color mode: {mode}.")
         
     def _rebuild_plot(self, visibility_mask=None):
+        from node_runner.profiling import perf_event as _rb_perf_event
+        # v4.0.14 (Fix C v2): coexistence with pre-built per-category
+        # actors. When pre-built actors exist AND no cell-level
+        # filter is active (visibility_mask is all-True), skip the
+        # legacy shells/beams extract+split+add — the pre-built
+        # actors already render the mesh at full density. When a
+        # filter IS active, hide pre-built actors and add legacy
+        # filtered shells/beams. The user's category toggle on the
+        # next click (after filter clears) restores pre-built
+        # visibility via the fast path.
+        _has_pre_built = bool(getattr(self, '_category_actors', None))
+        _filter_active = False
+        if visibility_mask is not None:
+            try:
+                _filter_active = not bool(np.all(visibility_mask))
+            except Exception:
+                _filter_active = True
+        _skip_legacy_mesh = _has_pre_built and not _filter_active
+        if _skip_legacy_mesh:
+            # Restore pre-built actor visibility per category state.
+            for ntype, actor in self._category_actors.items():
+                vis = self._compute_category_actor_visibility(ntype)
+                actor.SetVisibility(bool(vis) if vis is not None else True)
+            self._using_legacy_mesh = False
+            _rb_perf_event('mesh', 'rebuild_plot_skipped',
+                           reason='pre_built_no_filter')
+        else:
+            # Hide pre-built so they don't double-render with the
+            # filtered shells/beams added below.
+            for actor in (getattr(self, '_category_actors', None) or {}).values():
+                actor.SetVisibility(False)
+            self._using_legacy_mesh = True
+            if _has_pre_built:
+                _rb_perf_event('mesh', 'rebuild_plot_entered',
+                               reason='filter_active' if _filter_active else 'no_pre_built')
         self.plotter.remove_actor(['nodes_actor', 'shells', 'beams', 'beam_sections_3d',
                                    'selection_highlight'])
+        # v4.0.14: when skipping the legacy mesh, still let the
+        # nodes_actor / selection_highlight code below run, then
+        # early-return before the extract_cells + add_mesh.
 
         nodes_visible = False
         if (nodes_item_list := self._find_tree_items(('group', 'nodes'))):
@@ -8920,15 +10838,27 @@ class MainWindow(QMainWindow):
             if node_points is not None and len(node_points) > 0:
                 self._add_node_cloud(node_points, name='nodes_actor')
 
+        # v4.0.14: when pre-built actors handle the mesh and no
+        # filter is active, the legacy extract+split+add chain
+        # below is wasted work. Pre-built actors are already
+        # visible from the gating above. Render and return.
+        if _skip_legacy_mesh:
+            self.plotter.render()
+            return
+
         # v3.2.0: prefer the display-LOD'd grid when no visibility mask
         # is active. With a visibility mask we have to extract from the
         # full grid because cell indices are full-grid indices. Cell
         # picking always targets self.current_grid so EID resolution
         # is unaffected by display LOD.
+        from node_runner.profiling import perf_stage as _perf_stage
         if visibility_mask is not None:
             visible_indices = np.where(visibility_mask)[0]
             if visible_indices.size > 0:
-                grid_to_render = self.current_grid.extract_cells(visible_indices)
+                with _perf_stage('rebuild_plot', 'extract_cells_visible',
+                                 n_visible=int(visible_indices.size),
+                                 n_total=int(visibility_mask.size)):
+                    grid_to_render = self.current_grid.extract_cells(visible_indices)
             else:
                 self.plotter.remove_actor(['shells', 'beams'])
                 self.plotter.render()
@@ -8942,12 +10872,77 @@ class MainWindow(QMainWindow):
 
         # --- FIX: Check if cell data (like 'is_shell') exists before trying to use it ---
         if grid_to_render and grid_to_render.n_cells > 0 and 'is_shell' in grid_to_render.cell_data:
-            shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
-            beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
+            with _perf_stage('rebuild_plot', 'split_shells_beams',
+                             n_cells=int(grid_to_render.n_cells)):
+                shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
+                beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
 
             # Apply element shrink if set
             if self.elem_shrink > 0 and shells.n_cells > 0:
                 shells = shells.shrink(1.0 - self.elem_shrink)
+
+            # v4.0.7: compute point normals on the shells surface so
+            # phong shading has data to interpolate. Without normals,
+            # VTK falls back to flat-equivalent shading regardless of
+            # the actor's `interpolation` property, which is why the
+            # v4.0.5 / v4.0.6 shading toggle visibly did nothing. We
+            # convert to PolyData first (UnstructuredGrid doesn't
+            # auto-compute normals) via extract_surface, then run the
+            # vtkPolyDataNormals filter via .compute_normals(). The
+            # cost is one-shot per visibility update on the LOD'd
+            # mesh (~248k cells on MEGA, fast in C++).
+            if shells.n_cells > 0:
+                # v4.0.9: cache the computed-normals shells PolyData
+                # across visibility cycles. The compute_normals call on
+                # 2.36M LOD'd cells costs ~1.1 s per click on MEGA, but
+                # the inputs (visibility-filtered shells subset + shrink
+                # factor) are identical across many consecutive clicks
+                # when the user is toggling unrelated things like loads
+                # or coord systems. Cache key is (id(current_grid),
+                # n_cells, EID-array hash, shrink) — invalidates
+                # automatically when _update_viewer runs (new
+                # current_grid) or the user filters by PID/Type/Material
+                # (different EID set). Hashing the EID array is ~2 ms;
+                # saves ~1.1 s on every cache hit.
+                from node_runner.profiling import perf_event as _norm_perf_event
+                cache_key = None
+                try:
+                    eid_hash = None
+                    if 'EID' in shells.cell_data:
+                        eid_hash = hash(bytes(shells.cell_data['EID']))
+                    cache_key = (
+                        id(self.current_grid),
+                        int(shells.n_cells),
+                        eid_hash,
+                        float(self.elem_shrink),
+                    )
+                except Exception:
+                    cache_key = None
+                cached = getattr(self, '_shells_normals_cache', None)
+                if cache_key is not None and cached is not None and cached[0] == cache_key:
+                    shells = cached[1]
+                    _norm_perf_event('shells_normals', 'cache_hit',
+                                     n_cells=int(shells.n_cells))
+                else:
+                    try:
+                        with _perf_stage('rebuild_plot', 'shells_compute_normals',
+                                         n_cells=int(shells.n_cells)):
+                            shells = shells.extract_surface().compute_normals(
+                                cell_normals=False,
+                                point_normals=True,
+                                consistent_normals=True,
+                                auto_orient_normals=False,
+                                split_vertices=False,
+                                non_manifold_traversal=True,
+                                inplace=False,
+                            )
+                        if cache_key is not None:
+                            self._shells_normals_cache = (cache_key, shells)
+                            _norm_perf_event('shells_normals', 'cache_miss_recompute',
+                                             n_cells=int(shells.n_cells))
+                    except Exception as _exc:
+                        _norm_perf_event('rebuild_plot', 'shells_normals_failed',
+                                         exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
 
             # Determine render style for pyvista
             pv_style = self.render_style
@@ -8956,12 +10951,21 @@ class MainWindow(QMainWindow):
             show_edges = self.render_style == "surface"
 
             # Common shell kwargs
+            # v4.0.13 (Fix A): reset_camera=False on every legacy-mesh
+            # add_mesh path. Without it, every Plates/Beams/Solids/etc.
+            # toggle was snapping the camera back to fit the full
+            # model. v4.0.11 fixed the GLYPH paths but missed the
+            # MESH paths (shell_kw / beam_kw feed all ~10 add_mesh
+            # sites in _rebuild_plot's color-mode branches).
             shell_kw = dict(style=pv_style, show_edges=show_edges,
-                            opacity=self.shell_opacity, name="shells")
+                            opacity=self.shell_opacity, name="shells",
+                            reset_camera=False)
             if show_edges:
                 shell_kw['edge_color'] = self.edge_color
                 shell_kw['line_width'] = self.edge_width
-            beam_kw = dict(render_lines_as_tubes=True, line_width=self.beam_width, name="beams")
+            beam_kw = dict(render_lines_as_tubes=True,
+                           line_width=self.beam_width, name="beams",
+                           reset_camera=False)
 
             if self.color_mode == "type":
                 if shells.n_cells > 0:
@@ -8969,16 +10973,21 @@ class MainWindow(QMainWindow):
                 if beams.n_cells > 0:
                     self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
             elif self.color_mode == "property":
+                # v4.0.17: per-cell RGB instead of categorical LUT.
+                # Identical pid_color_map[PID] color for every cell,
+                # consistent across legacy and pre-built code paths,
+                # consistent across rebuilds. See
+                # `_attach_per_cell_rgb_for_property_mode` for details.
                 if shells.n_cells > 0:
-                    pids = np.unique(shells.cell_data['PID'])
-                    cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
-                    self.plotter.add_mesh(shells, scalars="PID", cmap=cmap, categories=True,
-                                          show_scalar_bar=False, **shell_kw)
+                    self._attach_per_cell_rgb_for_property_mode(shells)
+                    self.plotter.add_mesh(
+                        shells, scalars='cell_rgb', rgb=True,
+                        show_scalar_bar=False, **shell_kw)
                 if beams.n_cells > 0:
-                    pids = np.unique(beams.cell_data['PID'])
-                    cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
-                    self.plotter.add_mesh(beams, scalars="PID", cmap=cmap, categories=True,
-                                          show_scalar_bar=False, **beam_kw)
+                    self._attach_per_cell_rgb_for_property_mode(beams)
+                    self.plotter.add_mesh(
+                        beams, scalars='cell_rgb', rgb=True,
+                        show_scalar_bar=False, **beam_kw)
             elif self.color_mode == "quality":
                 if self.quality_results is None:
                     self.quality_results = self.current_generator.calculate_element_quality()
@@ -9086,17 +11095,17 @@ class MainWindow(QMainWindow):
                     if beams.n_cells > 0:
                         self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
                 else:
-                    # Fallback: property coloring
+                    # Fallback: property coloring (v4.0.17 per-cell RGB).
                     if shells.n_cells > 0:
-                        pids = np.unique(shells.cell_data['PID'])
-                        cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
-                        self.plotter.add_mesh(shells, scalars="PID", cmap=cmap, categories=True,
-                                              show_scalar_bar=False, **shell_kw)
+                        self._attach_per_cell_rgb_for_property_mode(shells)
+                        self.plotter.add_mesh(
+                            shells, scalars='cell_rgb', rgb=True,
+                            show_scalar_bar=False, **shell_kw)
                     if beams.n_cells > 0:
-                        pids = np.unique(beams.cell_data['PID'])
-                        cmap = [self.pid_color_map.get(p, "#FFFFFF") for p in pids]
-                        self.plotter.add_mesh(beams, scalars="PID", cmap=cmap, categories=True,
-                                              show_scalar_bar=False, **beam_kw)
+                        self._attach_per_cell_rgb_for_property_mode(beams)
+                        self.plotter.add_mesh(
+                            beams, scalars='cell_rgb', rgb=True,
+                            show_scalar_bar=False, **beam_kw)
         else:
              # If there's no 'is_shell' data, it means there are no elements to draw.
              # Ensure any old shell/beam actors are removed.
@@ -9491,9 +11500,8 @@ class MainWindow(QMainWindow):
             self.command_manager.execute(cmd, model)
 
             self._update_status(f"Added load entries to SID {sid}.")
-            self._populate_tree()
-            self._create_all_load_actors()
-            self._update_plot_visibility()
+            # v4.0.0 (B2): narrow LOADS refresh via the command's hint.
+            self._dispatch_refresh(cmd.refresh_hint)
 
         self.active_creation_dialog = None
 
@@ -9511,9 +11519,13 @@ class MainWindow(QMainWindow):
             self.command_manager.execute(cmd, model)
 
             self._update_status(f"Added constraint entries to SID {sid}.")
-            self._populate_tree()
-            self._create_all_constraint_actors()
-            self._update_plot_visibility()
+            # v4.0.0 (B2): use the command's narrow refresh hint
+            # (CONSTRAINTS) instead of the pre-v4.0.0 _populate_tree
+            # blanket rebuild. On the MEGA-XWFF deck this drops the
+            # post-edit pause from multi-second tree rebuilds to a
+            # near-instant constraint-actors-only refresh, and B1's
+            # tree snapshot/restore preserves the user's checkbox state.
+            self._dispatch_refresh(cmd.refresh_hint)
 
         self.active_creation_dialog = None
 
@@ -9641,6 +11653,522 @@ class MainWindow(QMainWindow):
             normals[shell_idx] = cross
         return centers, normals
 
+    def _build_load_glyphs_for_sid(self, sid):
+        """v4.0.9: build force/moment/pressure glyph actors for ONE
+        load SID. Extracted from the load_sid_loop inside
+        ``_update_plot_visibility`` so the per-SID fast path in
+        ``_handle_tree_item_changed`` can build glyphs for a single
+        SID without iterating all 1,962. The lazily-built per-SID
+        data actors (``force_actors_{sid}`` etc.) must already exist —
+        callers are responsible for calling
+        ``_ensure_load_actor_for_sid(sid)`` first.
+        """
+        if not self.current_grid:
+            return
+        try:
+            arrow_size_percent = float(self.arrow_scale_input.text())
+            use_relative_scaling = self.relative_scaling_check.isChecked()
+        except (ValueError, AttributeError):
+            arrow_size_percent = 10.0
+            use_relative_scaling = True
+        base_scale = self.current_grid.length * (arrow_size_percent / 100.0)
+        max_force_mag = self.load_scaling_info.get('force_max_mag', 0.0)
+        max_moment_mag = self.load_scaling_info.get('moment_max_mag', 0.0)
+        max_pressure_mag = self.load_scaling_info.get('pressure_max_mag', 0.0)
+
+        from node_runner.profiling import perf_event
+        for kind, max_mag in [('force', max_force_mag),
+                              ('moment', max_moment_mag),
+                              ('pressure', max_pressure_mag)]:
+            actor_name = f"{kind}_actors_{sid}"
+            glyph_name = f"{kind}_glyphs_{sid}"
+            if glyph_name in self.plotter.actors:
+                self.plotter.remove_actor(glyph_name, render=False)
+            actor = self.plotter.actors.get(actor_name)
+            if not actor:
+                # v4.0.10: distinguish "no lazy actor for this SID" from
+                # "lazy actor exists but dataset empty". Both produce
+                # no glyphs, but the diagnostic story is different.
+                perf_event('glyph', f'{kind}_no_actor', sid=sid)
+                continue
+            dataset = actor.mapper.dataset
+            if not dataset.n_points:
+                # v4.0.10: this SID has no cards of this kind (e.g.
+                # SID with only forces → moment dataset empty). Quiet
+                # signal so users can tell "moments not built because
+                # SID has no moment cards" from "build failed".
+                perf_event('glyph', f'{kind}_empty_dataset', sid=sid)
+                continue
+            if kind == 'force':
+                vectors = dataset['vectors']
+                mags = np.linalg.norm(vectors, axis=1)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    unit_vectors = np.nan_to_num(vectors / mags[:, np.newaxis])
+                if use_relative_scaling and max_mag > 1e-9:
+                    scaled_vectors = unit_vectors * (mags / max_mag * base_scale)[:, np.newaxis]
+                else:
+                    scaled_vectors = unit_vectors * base_scale
+                self.plotter.add_arrows(dataset.points, scaled_vectors,
+                                        color='red', name=glyph_name,
+                                        reset_camera=False)
+                # v4.0.10: settle "did N arrows actually land on screen?".
+                perf_event('glyph', 'force_added',
+                           sid=sid, n_arrows=int(dataset.n_points))
+            elif kind == 'moment':
+                # v4.0.11: right-hand-rule-respecting composite moment
+                # glyph (single arrow + curl + curl arrowhead). Cached
+                # via _get_moment_glyph_geom.
+                # v4.0.12 (Bug 4 fix): two-tier fallback. The v4.0.11
+                # MEGA crash was a VTK SEGFAULT in vtkGlyph3D when the
+                # composite resolved to an UnstructuredGrid (mixed
+                # cell types). We attempt the composite first; on any
+                # Python-side exception OR when the composite returns
+                # None, retry with a plain single-tipped pv.Arrow. If
+                # THAT fails too, log and skip this SID's moment
+                # glyph rather than crashing the whole app.
+                def _try_build_moment_glyph(geom_polydata):
+                    """Inner: do the glyph instance + add_mesh. May raise."""
+                    if use_relative_scaling and max_mag > 1e-9:
+                        mags = np.linalg.norm(dataset['vectors'], axis=1)
+                        dataset['relative_mag'] = mags / max_mag
+                        out_glyphs = dataset.glyph(orient='vectors',
+                                                   scale='relative_mag',
+                                                   factor=base_scale,
+                                                   geom=geom_polydata)
+                    else:
+                        out_glyphs = dataset.glyph(orient='vectors',
+                                                   scale=False,
+                                                   factor=base_scale,
+                                                   geom=geom_polydata)
+                    self.plotter.add_mesh(out_glyphs, color='cyan',
+                                          name=glyph_name,
+                                          reset_camera=False)
+                    return out_glyphs
+                glyphs = None
+                composite_attempted = False
+                try:
+                    composite_geom = self._get_moment_glyph_geom()
+                    if composite_geom is not None:
+                        composite_attempted = True
+                        glyphs = _try_build_moment_glyph(composite_geom)
+                except Exception as _exc:
+                    perf_event('glyph', 'moment_glyph_failed', sid=sid,
+                               reason='composite_attempt',
+                               exc=f"{_exc.__class__.__name__}: {str(_exc)[:120]}")
+                    glyphs = None
+                if glyphs is None:
+                    # Fallback: single-tipped pv.Arrow. Still right-hand
+                    # rule by convention (vector direction = thumb),
+                    # just without the curl decoration.
+                    try:
+                        fallback_arrow = pv.Arrow(
+                            start=(0.0, 0.0, 0.0),
+                            direction=(1.0, 0.0, 0.0),
+                            tip_length=0.2, tip_radius=0.08,
+                            shaft_radius=0.03)
+                        glyphs = _try_build_moment_glyph(fallback_arrow)
+                        perf_event('glyph', 'moment_fallback_arrow',
+                                   sid=sid,
+                                   composite_attempted=composite_attempted)
+                    except Exception as _exc:
+                        perf_event('glyph', 'moment_build_failed', sid=sid,
+                                   reason='fallback_arrow_too',
+                                   exc=f"{_exc.__class__.__name__}: {str(_exc)[:120]}")
+                        glyphs = None
+                if glyphs is not None:
+                    try:
+                        n_glyph_cells = int(glyphs.n_cells)
+                    except Exception:
+                        n_glyph_cells = -1
+                    perf_event('glyph', 'moment_added',
+                               sid=sid,
+                               n_arrows=int(dataset.n_points),
+                               n_glyph_cells=n_glyph_cells)
+            elif kind == 'pressure':
+                vectors = dataset['vectors']
+                mags = np.linalg.norm(vectors, axis=1)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    unit_vectors = np.nan_to_num(vectors / mags[:, np.newaxis])
+                uniform_size = base_scale * 0.75
+                if use_relative_scaling and max_mag > 1e-9:
+                    scaled_vectors = unit_vectors * (mags / max_mag * uniform_size)[:, np.newaxis]
+                else:
+                    scaled_vectors = unit_vectors * uniform_size
+                self.plotter.add_arrows(dataset.points, scaled_vectors,
+                                        color='yellow', name=glyph_name,
+                                        reset_camera=False)
+                perf_event('glyph', 'pressure_added',
+                           sid=sid, n_arrows=int(dataset.n_points))
+
+    def _remove_load_glyphs_for_sid(self, sid):
+        """v4.0.9: remove the 3 glyph actors for a single load SID."""
+        for prefix in ('force_glyphs_', 'moment_glyphs_', 'pressure_glyphs_'):
+            name = f"{prefix}{sid}"
+            if name in self.plotter.actors:
+                self.plotter.remove_actor(name, render=False)
+
+    def _build_constraint_glyphs_for_sid(self, sid):
+        """v4.0.9: build the constraint glyph actor for ONE SPC SID.
+        Extracted from the spc_sid_loop inside
+        ``_update_plot_visibility``.
+        """
+        from node_runner.profiling import perf_event
+        if not self.current_grid:
+            return
+        glyph_name = f"constraint_glyphs_{sid}"
+        if glyph_name in self.plotter.actors:
+            self.plotter.remove_actor(glyph_name, render=False)
+        actor = self.plotter.actors.get(f"constraint_actors_{sid}")
+        if not actor:
+            perf_event('glyph', 'constraint_no_actor', sid=sid)
+            return
+        dataset = actor.mapper.dataset
+        if not dataset.n_points:
+            perf_event('glyph', 'constraint_empty_dataset', sid=sid)
+            return
+        glyph_geom = pv.Cone(direction=(0, 0, 1), height=1.0, radius=0.3)
+        scale_factor = self.current_grid.length * 0.015
+        glyphs = dataset.glyph(scale=False, factor=scale_factor,
+                               orient=False, geom=glyph_geom)
+        self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name,
+                              reset_camera=False)
+        try:
+            n_glyph_cells = int(glyphs.n_cells)
+        except Exception:
+            n_glyph_cells = -1
+        perf_event('glyph', 'constraint_added',
+                   sid=sid,
+                   n_arrows=int(dataset.n_points),
+                   n_glyph_cells=n_glyph_cells)
+
+    def _remove_constraint_glyphs_for_sid(self, sid):
+        """v4.0.9: remove the constraint glyph actor for one SPC SID."""
+        name = f"constraint_glyphs_{sid}"
+        if name in self.plotter.actors:
+            self.plotter.remove_actor(name, render=False)
+
+    def _fast_path_sid_toggle(self, kind, sid, check_state):
+        """v4.0.9: O(1) per-SID visibility update. Returns True on
+        success so the caller can skip the full
+        ``_update_plot_visibility`` cycle (~4-5 s on MEGA). Returns
+        False on any failure — caller MUST fall through to the full
+        cycle so the user never sees a stale scene.
+
+        Safe to skip the full cycle because load_set / constraint_set
+        checkbox toggles don't affect any other scene element (main
+        mesh, coord systems, RBE spiders, etc.). Only the per-SID
+        glyphs change.
+        """
+        from node_runner.profiling import perf_event
+        if not self.current_generator or not self.current_grid:
+            return False
+        is_checked = (check_state == QtCore.Qt.Checked)
+        try:
+            if kind == 'load_set':
+                if is_checked:
+                    self._ensure_load_actor_for_sid(sid)
+                    self._build_load_glyphs_for_sid(sid)
+                    self._visible_load_sids.add(sid)
+                else:
+                    self._remove_load_glyphs_for_sid(sid)
+                    self._visible_load_sids.discard(sid)
+            elif kind == 'constraint_set':
+                if is_checked:
+                    self._build_constraint_glyphs_for_sid(sid)
+                    self._visible_spc_sids.add(sid)
+                else:
+                    self._remove_constraint_glyphs_for_sid(sid)
+                    self._visible_spc_sids.discard(sid)
+            else:
+                return False
+        except Exception as _exc:
+            perf_event('fast_path', f'{kind}_toggle_failed', sid=sid,
+                       exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            return False
+        perf_event('fast_path', f'{kind}_toggle',
+                   sid=sid, checked=is_checked,
+                   n_visible_load_sids=len(self._visible_load_sids),
+                   n_visible_spc_sids=len(self._visible_spc_sids))
+        self.plotter.render()
+        return True
+
+    # v4.0.14 (Fix C v2): pre-built per-Nastran-type actors.
+    # Redesigned after v4.0.11 was reverted in v4.0.12. Key
+    # differences from v4.0.11:
+    #   1. Build from current_grid (full mesh) — not LOD'd display_grid.
+    #      Restores full visual density on Plates and brings RBE2/RBE3
+    #      into the dict so the Rigid spider can toggle correctly.
+    #   2. RBE spider visibility derived from the Rigid checkbox state
+    #      directly (not target_states.get) — defensive against
+    #      `_category_actors` not containing every ntype.
+    #   3. Same filter-mode coexistence pattern as v4.0.11 (legacy
+    #      _rebuild_plot path triggered when PID/MID/isolate active;
+    #      pre-built actors hidden in legacy mode).
+
+    def _build_pre_built_category_actors(self):
+        """v4.0.14: build one named PyVista actor per unique Nastran
+        element type present in ``self.current_grid`` (the full,
+        non-LOD'd mesh). Category checkbox toggles in the model tree
+        (Plates, Beams, Solids, etc.) become ``actor.SetVisibility``
+        calls — sub-100 ms on MEGA — bypassing the legacy
+        ``_rebuild_plot`` extract_cells + split + compute_normals
+        chain.
+
+        PID/MID/isolate/hidden filtering still routes through legacy
+        ``_rebuild_plot``; when it runs, pre-built actors are hidden
+        to avoid double-rendering. When the filter clears, the
+        category fast-path restores pre-built visibility.
+        """
+        from node_runner.profiling import perf_stage, perf_event
+        if self.current_grid is None:
+            return
+        if 'type' not in self.current_grid.cell_data:
+            perf_event('actors', 'build_per_category_skipped',
+                       reason='no_type_cell_data')
+            return
+        # v4.0.15: gate by color_mode. Modes that need external data
+        # (quality / results) route through legacy `_rebuild_plot`
+        # so its existing scalars-from-OP2 / scalars-from-quality
+        # pipelines stay intact. The set is module-level + checked
+        # here so adding a new mode is a single-line addition there
+        # plus a branch below.
+        if self.color_mode not in _PRE_BUILT_SUPPORTED_COLOR_MODES:
+            perf_event('actors', 'build_per_category_skipped',
+                       reason=f'color_mode_{self.color_mode}_unsupported')
+            return
+        # v4.0.15: capture color_mode at build time. `_set_coloring_mode`
+        # tears these actors down and rebuilds on mode change so the
+        # cached coloring stays in sync with self.color_mode.
+        build_color_mode = self.color_mode
+        with perf_stage('actors', 'build_per_category'):
+            types_arr = np.asarray(self.current_grid.cell_data['type'])
+            unique_types = np.unique(types_arr)
+            shell_color = self.type_color_map.get('Shells', '#cccccc')
+            beam_color = self.type_color_map.get('Beams', '#88c0d0')
+            show_edges = (self.render_style == 'surface')
+            for ntype in unique_types:
+                if not isinstance(ntype, str) or ntype in ('VTK_VERTEX',):
+                    continue
+                cell_idx = np.where(types_arr == ntype)[0]
+                if cell_idx.size == 0:
+                    continue
+                try:
+                    with perf_stage('actors', 'add_one_category',
+                                    ntype=ntype, n_cells=int(cell_idx.size)):
+                        slice_grid = self.current_grid.extract_cells(cell_idx)
+                        is_shell_arr = slice_grid.cell_data.get('is_shell')
+                        is_shell = (
+                            is_shell_arr is not None
+                            and len(is_shell_arr)
+                            and bool(np.all(np.asarray(is_shell_arr) == 1)))
+                        if is_shell:
+                            try:
+                                slice_render = (slice_grid.extract_surface()
+                                                .compute_normals(
+                                    cell_normals=False, point_normals=True,
+                                    consistent_normals=True, inplace=False))
+                            except Exception:
+                                slice_render = slice_grid
+                            shape_kw = dict(
+                                show_edges=show_edges,
+                                opacity=self.shell_opacity)
+                        else:
+                            slice_render = slice_grid
+                            shape_kw = dict(render_lines_as_tubes=True,
+                                            line_width=self.beam_width)
+                        # v4.0.15: per-mode color kwargs.
+                        # v4.0.17: 'property' mode now uses per-cell
+                        # RGB via _attach_per_cell_rgb_for_property_mode
+                        # instead of the categorical LUT (which
+                        # rendered the same PID with different colors
+                        # across actors because PyVista's
+                        # `categories=True` is range-positional, not
+                        # value-keyed). Same PID, same color, every
+                        # render — across all actors and all rebuilds.
+                        if (build_color_mode == 'property'
+                                and 'PID' in slice_render.cell_data):
+                            self._attach_per_cell_rgb_for_property_mode(
+                                slice_render)
+                            color_kw = dict(
+                                scalars='cell_rgb', rgb=True,
+                                show_scalar_bar=False)
+                        else:
+                            # 'type' mode (or any safe-uniform fallback):
+                            # one color per shell/beam family.
+                            color_kw = dict(
+                                color=shell_color if is_shell else beam_color)
+                        actor = self.plotter.add_mesh(
+                            slice_render,
+                            name=f'cat_{ntype}',
+                            pickable=False, reset_camera=False,
+                            **color_kw, **shape_kw)
+                        self._category_actors[ntype] = actor
+                        perf_event('actors', 'category_added',
+                                   ntype=ntype,
+                                   n_cells=int(cell_idx.size),
+                                   is_shell=is_shell,
+                                   mode=build_color_mode)
+                except Exception as _exc:
+                    perf_event('actors', 'add_one_category_failed',
+                               ntype=ntype,
+                               exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
+            self._category_visible_ntypes = set(self._category_actors.keys())
+            self._using_legacy_mesh = False
+
+    def _has_active_cell_filter(self):
+        """v4.0.14: return True if any tree-state setting forces
+        cell-level filtering (PID, MID, isolate mode, hidden groups).
+        When True, `_fast_path_category_toggle` returns False so the
+        caller falls through to legacy ``_rebuild_plot``.
+        """
+        if getattr(self, '_isolate_mode', None):
+            return True
+        if getattr(self, '_hidden_groups', None):
+            return True
+        items = self._find_tree_items(('group', 'properties'))
+        if items:
+            parent = items[0]
+            for i in range(parent.childCount()):
+                if parent.child(i).checkState(0) != QtCore.Qt.Checked:
+                    return True
+        items = self._find_tree_items(('group', 'materials'))
+        if items:
+            parent = items[0]
+            for i in range(parent.childCount()):
+                if parent.child(i).checkState(0) != QtCore.Qt.Checked:
+                    return True
+        return False
+
+    def _compute_category_actor_visibility(self, ntype):
+        """v4.0.14: compound (by_type ∧ by_shape) visibility for the
+        per-Nastran-type actor with name ``cat_<ntype>``. Returns
+        True/False if resolvable from category state alone, or None
+        if cell-level filtering is active.
+        """
+        type_cat = _NTYPE_TO_TYPE_CATEGORY.get(ntype)
+        shape_cat = _NTYPE_TO_SHAPE_CATEGORY.get(ntype)
+        if type_cat:
+            items = self._find_tree_items(('elem_by_type_group', type_cat))
+            if items and items[0].checkState(0) != QtCore.Qt.Checked:
+                return False
+        if shape_cat:
+            items = self._find_tree_items(('elem_shape_group', shape_cat))
+            if items and items[0].checkState(0) != QtCore.Qt.Checked:
+                return False
+        if self._has_active_cell_filter():
+            return None
+        return True
+
+    def _fast_path_category_toggle(self, group_kind, group_name):
+        """v4.0.14: O(N_categories) visibility update for a category
+        (by_type or by_shape) checkbox click. Returns True if all
+        per-type actors resolve from category state alone; False if
+        any falls into cell-level filter territory — caller falls
+        through to legacy ``_rebuild_plot``.
+
+        Differs from v4.0.11: rbe_actors visibility is derived from
+        the Rigid checkbox state DIRECTLY (not from target_states),
+        defensively guarding against `_category_actors` missing
+        RBE2/RBE3 entries (e.g., a deck with no rigids).
+        """
+        from node_runner.profiling import perf_event
+        if not self._category_actors:
+            return False
+        target_states = {}
+        new_visible = set()
+        for ntype in self._category_actors:
+            vis = self._compute_category_actor_visibility(ntype)
+            if vis is None:
+                perf_event('fast_path', 'category_toggle_filter_active',
+                           group_kind=group_kind, group_name=group_name,
+                           ntype=ntype)
+                return False
+            target_states[ntype] = bool(vis)
+            if vis:
+                new_visible.add(ntype)
+        n_changed = 0
+        for ntype, actor in self._category_actors.items():
+            new_vis = target_states[ntype]
+            if bool(actor.GetVisibility()) != new_vis:
+                actor.SetVisibility(new_vis)
+                n_changed += 1
+        # Hide any legacy shells/beams actors that may remain from a
+        # prior filter cycle. v4.0.15 fix: do NOT hide nodes_actor —
+        # it's the user-controlled Nodes display, not a filter-cycle
+        # leftover. The v4.0.14 version was hiding it on every
+        # category toggle so the first click made nodes disappear
+        # and subsequent clicks left them hidden.
+        for legacy_name in ('shells', 'beams'):
+            if legacy_name in self.plotter.actors:
+                la = self.plotter.actors[legacy_name]
+                if bool(la.GetVisibility()):
+                    la.SetVisibility(False)
+                    n_changed += 1
+        # v4.0.14: rbe_actors (RBE spider visualization) visibility is
+        # derived from the Rigid type+shape checkbox state DIRECTLY,
+        # not from target_states. The v4.0.11 bug was that the LOD
+        # path dropped RBE2/RBE3 from _category_actors entirely, so
+        # `target_states.get('RBE2', True)` returned True and the
+        # spider stayed visible. Defensive query of the tree avoids
+        # this regardless of whether cat_RBE2/RBE3 exist.
+        rigid_items = self._find_tree_items(('elem_by_type_group', 'Rigid'))
+        rigid_checked = bool(
+            rigid_items and rigid_items[0].checkState(0) == QtCore.Qt.Checked)
+        shape_rigid_items = self._find_tree_items(('elem_shape_group', 'Rigid'))
+        shape_rigid_checked = bool(
+            not shape_rigid_items
+            or shape_rigid_items[0].checkState(0) == QtCore.Qt.Checked)
+        rbe_should_show = rigid_checked and shape_rigid_checked
+        rbe_actor = self.plotter.actors.get('rbe_actors')
+        if rbe_actor is not None:
+            if bool(rbe_actor.GetVisibility()) != rbe_should_show:
+                rbe_actor.SetVisibility(rbe_should_show)
+                n_changed += 1
+        self._category_visible_ntypes = new_visible
+        self._using_legacy_mesh = False
+        perf_event('fast_path', 'category_toggle',
+                   group_kind=group_kind, group_name=group_name,
+                   n_actors_changed=n_changed,
+                   n_visible_categories=len(new_visible))
+        self.plotter.render()
+        return True
+
+    def _refresh_visible_sid_sets(self):
+        """v4.0.10: rebuild ``_visible_load_sids`` and
+        ``_visible_spc_sids`` from the current loads_tab tree state.
+
+        Called at:
+          - Top of every ``_update_plot_visibility`` cycle (defensive
+            refresh in case the fast-path-maintained sets drift).
+          - End of ``_populate_loads_tab`` (because the tree rebuild
+            runs under blockSignals, no fast-path events fire during
+            it, so the sets need an explicit refresh).
+
+        Cost: O(n_load_sids + n_spc_sids) dict lookups + checkState
+        calls. ~5-10 ms on MEGA (1,962 load SIDs). Far cheaper than
+        the visibility cycle it enables.
+        """
+        if not self.current_generator:
+            self._visible_load_sids = set()
+            self._visible_spc_sids = set()
+            return
+        model = self.current_generator.model
+        li = getattr(self, '_loads_tab_item_index', None) or {}
+        new_load = set()
+        new_spc = set()
+        if model.loads:
+            for sid in model.loads.keys():
+                items = li.get(('load_set', sid))
+                if items and items[0].checkState(0) == QtCore.Qt.Checked:
+                    new_load.add(sid)
+        if model.spcs:
+            for sid in model.spcs.keys():
+                items = li.get(('constraint_set', sid))
+                if items and items[0].checkState(0) == QtCore.Qt.Checked:
+                    new_spc.add(sid)
+        self._visible_load_sids = new_load
+        self._visible_spc_sids = new_spc
+
     def _create_all_load_actors(self):
         """v3.4.2: scaling-info pass + cache prep ONLY. Per-SID actors
         are built on demand by ``_ensure_load_actor_for_sid`` when the
@@ -9702,18 +12230,26 @@ class MainWindow(QMainWindow):
 
         Centers/normals/eid-lookup caches are populated on first call
         and reused for subsequent SIDs in the same grid lifetime.
+
+        v4.0.10: catchers on every branch so the next log proves
+        whether the lazy actor build path is firing as expected.
         """
+        from node_runner.profiling import perf_event
         if sid in self._lazy_load_built_sids:
+            perf_event('lazy_load_actor', 'already_built', sid=sid)
             return
         if not self.current_generator or not self.current_grid:
+            perf_event('lazy_load_actor', 'skipped_no_grid', sid=sid)
             return
         grid = self.current_grid
         if 'EID' not in grid.cell_data:
+            perf_event('lazy_load_actor', 'skipped_no_eid', sid=sid)
             return
         model = self.current_generator.model
         load_list = (model.loads or {}).get(sid)
         if not load_list:
             self._lazy_load_built_sids.add(sid)
+            perf_event('lazy_load_actor', 'skipped_no_loads', sid=sid)
             return
 
         # First-call cache: compute centers + normals + EID lookup once.
@@ -9793,10 +12329,14 @@ class MainWindow(QMainWindow):
                                   reset_camera=False)
 
         self._lazy_load_built_sids.add(sid)
-    
-    
+        perf_event('lazy_load_actor', 'built', sid=sid,
+                   n_force=len(f_pts), n_moment=len(m_pts),
+                   n_pressure=int(sum(arr.shape[0] for arr in p_pts)) if p_pts else 0)
+
+
     def _create_all_constraint_actors(self):
         """Creates all constraint actors for the current model, one per SID."""
+        from node_runner.profiling import perf_stage, perf_event
         actor_names_to_remove = [name for name in self.plotter.actors if name.startswith('constraint_actors_')]
         self.plotter.remove_actor(actor_names_to_remove, render=False)
 
@@ -9804,22 +12344,213 @@ class MainWindow(QMainWindow):
         model = self.current_generator.model
         if not model.spcs: return
 
+        perf_event('constraints', 'rebuild_all', n_sids=len(model.spcs),
+                   removed=len(actor_names_to_remove))
         for sid, spc_list in model.spcs.items():
-            coords = []
-            for spc in spc_list:
-                for nid in spc.nodes:
-                    if nid in model.nodes:
-                        coords.append(model.nodes[nid].get_position())
-            if coords:
-                actor = pv.PolyData(np.array(coords))
-                self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
+            with perf_stage('constraints', 'per_sid', sid=int(sid),
+                            n_spc_cards=len(spc_list)):
+                coords = []
+                for spc in spc_list:
+                    for nid in spc.nodes:
+                        if nid in model.nodes:
+                            coords.append(model.nodes[nid].get_position())
+                if coords:
+                    actor = pv.PolyData(np.array(coords))
+                    self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
 
     def _create_rbe_actors(self):
-        """Creates spider-line visualization for RBE2 and RBE3 rigid elements.
+        """v4.0.2 (Stage B): vectorized RBE2/RBE3 spider-line builder.
 
-        v3.3.0: each emitted spoke gets a cell_data['EID'] entry equal
-        to its parent RBE's eid, so the cell picker can map any clicked
-        spoke back to the rigid element. Actor is now pickable.
+        Pre-v4.0.2 the per-element loop called
+        ``model.nodes[nid].get_position()`` for the center + every
+        leg (pyNastran-level Python overhead). On MEGA (46,782 RBE/
+        RBAR cards with avg ~10 legs each) this took 144 s.
+
+        New path: vectorized via ``np.searchsorted`` against
+        ``self.current_node_ids_sorted`` + array indexing into
+        ``self.current_grid.points``. The first pass (~46k iterations)
+        only gathers NIDs into Python lists — no per-leg `get_position`
+        calls. The second pass is pure numpy.
+
+        Legacy fallback retained as
+        ``_create_rbe_actors_legacy``; the new path falls back on any
+        mismatch detected via a length assertion.
+        """
+        from node_runner.profiling import perf_stage, perf_event
+        self.plotter.remove_actor('rbe_actors', render=False)
+
+        if not self.current_generator or not self.current_grid: return
+        model = self.current_generator.model
+        if not model.rigid_elements: return
+
+        # v4.0.2 (Stage B): integrity counters.
+        integrity = {
+            'center_missing': 0,
+            'partial_legs': 0,
+            'empty': 0,
+            'sample_eids': [],
+        }
+        # Per-spoke source data, collected in pass 1.
+        center_nids = []
+        leg_nids = []
+        spoke_eids = []
+        spoke_types = []  # 0 = RBE2, 1 = RBE3
+
+        with perf_stage('rbe', 'gather_spokes',
+                        n_rigid=len(model.rigid_elements)):
+            for eid, elem in model.rigid_elements.items():
+                try:
+                    t = elem.type
+                    if t == 'RBE2':
+                        center_nid = elem.gn
+                        legs = list(elem.Gmi or [])
+                        rbe_type = 0
+                    elif t == 'RBE3':
+                        center_nid = elem.refgrid
+                        legs = []
+                        for wt_cg in (elem.wt_cg_groups or []):
+                            legs.extend(wt_cg[2] or [])
+                        rbe_type = 1
+                    else:
+                        continue
+
+                    if center_nid is None or center_nid not in model.nodes:
+                        integrity['center_missing'] += 1
+                        if len(integrity['sample_eids']) < 50:
+                            integrity['sample_eids'].append(int(eid))
+                        continue
+
+                    n_valid = 0
+                    n_missing = 0
+                    for leg_nid in legs:
+                        if leg_nid is None or leg_nid not in model.nodes:
+                            n_missing += 1
+                            continue
+                        center_nids.append(int(center_nid))
+                        leg_nids.append(int(leg_nid))
+                        spoke_eids.append(int(eid))
+                        spoke_types.append(rbe_type)
+                        n_valid += 1
+                    if n_valid == 0:
+                        integrity['empty'] += 1
+                        if len(integrity['sample_eids']) < 50:
+                            integrity['sample_eids'].append(int(eid))
+                    elif n_missing > 0:
+                        integrity['partial_legs'] += 1
+                        if len(integrity['sample_eids']) < 50:
+                            integrity['sample_eids'].append(int(eid))
+                except (AttributeError, KeyError, IndexError) as e:
+                    print(f"Warning: Skipping RBE {eid} visualization: {e}", flush=True)
+                    continue
+
+        try:
+            model._rbe_integrity_warnings = integrity
+        except Exception:
+            pass
+
+        n_spokes = len(center_nids)
+        perf_event('rbe', 'count_spokes',
+                   n_rigid=len(model.rigid_elements),
+                   n_spokes=n_spokes,
+                   center_missing=integrity['center_missing'],
+                   empty=integrity['empty'],
+                   partial=integrity['partial_legs'])
+
+        if n_spokes == 0:
+            return
+
+        # v4.0.2 (Stage B): vectorized NID → grid-index lookup.
+        # ``current_node_ids_sorted`` is sorted ascending; searchsorted
+        # gives O(log N) per query, vectorized over the whole array.
+        nids_sorted = np.asarray(self.current_node_ids_sorted, dtype=np.int64)
+        n_nodes = nids_sorted.size
+        pts_array = np.asarray(self.current_grid.points)
+
+        with perf_stage('rbe', 'searchsorted_lookup', n_spokes=n_spokes,
+                        n_nodes=int(n_nodes)):
+            centers_arr = np.asarray(center_nids, dtype=np.int64)
+            legs_arr = np.asarray(leg_nids, dtype=np.int64)
+            center_idx = np.searchsorted(nids_sorted, centers_arr)
+            leg_idx = np.searchsorted(nids_sorted, legs_arr)
+            # Mask invalid (out-of-range or non-matching) entries.
+            valid = (center_idx < n_nodes) & (leg_idx < n_nodes)
+            if valid.any():
+                # Clamp before indexing to avoid out-of-range.
+                ci_clamped = np.clip(center_idx, 0, n_nodes - 1)
+                li_clamped = np.clip(leg_idx, 0, n_nodes - 1)
+                valid &= (nids_sorted[ci_clamped] == centers_arr)
+                valid &= (nids_sorted[li_clamped] == legs_arr)
+
+        n_valid = int(valid.sum())
+        perf_event('rbe', 'valid_after_lookup',
+                   n_spokes=n_spokes, n_valid=n_valid,
+                   n_dropped=n_spokes - n_valid)
+
+        if n_valid == 0:
+            return
+
+        with perf_stage('rbe', 'fill_arrays', n_spokes=n_valid):
+            center_pts = pts_array[center_idx[valid]]  # (M, 3)
+            leg_pts = pts_array[leg_idx[valid]]        # (M, 3)
+            spoke_types_arr = np.asarray(spoke_types, dtype=np.int64)[valid]
+            spoke_eids_arr = np.asarray(spoke_eids, dtype=np.int64)[valid]
+
+            # Interleave to [center, leg, center, leg, ...].
+            points = np.empty((2 * n_valid, 3), dtype=center_pts.dtype)
+            points[0::2] = center_pts
+            points[1::2] = leg_pts
+
+            # VTK lines array: [2, p0, p1, 2, p2, p3, …]
+            lines = np.empty(3 * n_valid, dtype=np.int64)
+            lines[0::3] = 2
+            lines[1::3] = np.arange(0, 2 * n_valid, 2)
+            lines[2::3] = np.arange(1, 2 * n_valid, 2)
+
+            # Vectorized color assignment: pick from a 2-row palette
+            # by spoke type.
+            from PySide6.QtGui import QColor as _QColor
+            rbe2_rgb = np.array(
+                [int(x * 255) for x in
+                 _QColor(self.type_color_map.get('RBE2', '#ff3131')).getRgbF()[:3]],
+                dtype=np.uint8)
+            rbe3_rgb = np.array(
+                [int(x * 255) for x in
+                 _QColor(self.type_color_map.get('RBE3', '#ffd700')).getRgbF()[:3]],
+                dtype=np.uint8)
+            color_rgb = np.where(spoke_types_arr[:, None] == 0,
+                                 rbe2_rgb, rbe3_rgb).astype(np.uint8)
+            point_colors = np.repeat(color_rgb, 2, axis=0)
+
+        with perf_stage('rbe', 'build_polydata',
+                        n_points=int(points.shape[0]),
+                        n_lines=n_valid):
+            poly = pv.PolyData(points, lines=lines)
+            poly.point_data['colors'] = point_colors
+            poly.cell_data['EID'] = spoke_eids_arr
+
+        # Sanity assertion — if anything is off, we want to know in
+        # the log rather than producing a silently-wrong actor.
+        if poly.n_points != 2 * n_valid or poly.n_cells != n_valid:
+            perf_event('rbe', 'mismatch',
+                       expected_points=2 * n_valid,
+                       expected_cells=n_valid,
+                       actual_points=int(poly.n_points),
+                       actual_cells=int(poly.n_cells))
+            # Fall back to the legacy path on shape mismatch.
+            try:
+                self._create_rbe_actors_legacy()
+            except Exception as exc:
+                perf_event('rbe', 'legacy_fallback_failed',
+                           exc=str(exc)[:120])
+            return
+
+        self.plotter.add_mesh(poly, scalars='colors', rgb=True,
+                              render_lines_as_tubes=True, line_width=3,
+                              name='rbe_actors', pickable=True)
+
+    def _create_rbe_actors_legacy(self):
+        """Pre-v4.0.2 RBE spider-line builder. Kept as a fallback for
+        the vectorized path. Slow on big decks (~144 s on MEGA).
         """
         self.plotter.remove_actor('rbe_actors', render=False)
 
@@ -9830,50 +12561,31 @@ class MainWindow(QMainWindow):
         points = []
         lines = []
         colors = []
-        line_eids = []  # v3.3.0: one entry per emitted spoke (= one cell)
+        line_eids = []
         pt_idx = 0
-        # v3.4.0 item 5: track per-RBE integrity issues so the import
-        # summary can flag decks with dangling references.
-        integrity = {
-            'center_missing': 0,
-            'partial_legs': 0,
-            'empty': 0,
-            'sample_eids': [],
-        }
 
         for eid, elem in model.rigid_elements.items():
             try:
                 if elem.type == 'RBE2':
-                    # RBE2: independent node (gn) is the center, dependent nodes (Gmi) are the legs
                     center_nid = elem.gn
                     leg_nids = list(elem.Gmi or [])
                     color = self.type_color_map.get('RBE2', '#ff3131')
                 elif elem.type == 'RBE3':
-                    # RBE3: dependent node (refgrid) is the center, independent nodes are the legs
                     center_nid = elem.refgrid
-                    # Extract all grid IDs from weight/component/grid groups
                     leg_nids = []
                     for wt_cg in (elem.wt_cg_groups or []):
-                        # wt_cg is (weight, components, grids_list)
                         leg_nids.extend(wt_cg[2] or [])
                     color = self.type_color_map.get('RBE3', '#ffd700')
                 else:
                     continue
 
                 if center_nid is None or center_nid not in model.nodes:
-                    integrity['center_missing'] += 1
-                    if len(integrity['sample_eids']) < 50:
-                        integrity['sample_eids'].append(int(eid))
                     continue
 
                 center_pos = model.nodes[center_nid].get_position()
 
-                # Track partial / empty legs.
-                valid_legs = 0
-                missing_legs = 0
                 for leg_nid in leg_nids:
                     if leg_nid is None or leg_nid not in model.nodes:
-                        missing_legs += 1
                         continue
                     leg_pos = model.nodes[leg_nid].get_position()
                     points.append(center_pos)
@@ -9882,50 +12594,23 @@ class MainWindow(QMainWindow):
                     colors.append(color)
                     line_eids.append(int(eid))
                     pt_idx += 2
-                    valid_legs += 1
-                if valid_legs == 0:
-                    integrity['empty'] += 1
-                    if len(integrity['sample_eids']) < 50:
-                        integrity['sample_eids'].append(int(eid))
-                elif missing_legs > 0:
-                    integrity['partial_legs'] += 1
-                    if len(integrity['sample_eids']) < 50:
-                        integrity['sample_eids'].append(int(eid))
-            except (AttributeError, KeyError, IndexError) as e:
-                print(f"Warning: Skipping RBE {eid} visualization: {e}")
+            except (AttributeError, KeyError, IndexError):
                 continue
-
-        # Surface the integrity report so the import-summary can show it.
-        try:
-            model._rbe_integrity_warnings = integrity
-        except Exception:
-            pass
 
         if not points:
             return
 
-        # v3.3.0 bugfix (3.3.1): construct PolyData with `lines=` on the
-        # ctor so it doesn't auto-generate a vertex cell per point.
-        # Previously `pv.PolyData(np.array(points))` produced N point
-        # cells + L line cells = 3L total cells (2 endpoints per spoke +
-        # 1 line per spoke), which made cell_data['EID']'s length-L array
-        # disagree with the dataset's cell count and crash with
-        # "Invalid array shape. Array 'EID' has length (L) but a length
-        # of (3L) was expected" the moment we tried to attach it.
         flat_lines = np.asarray(
             [val for line in lines for val in line], dtype=np.int64)
         poly = pv.PolyData(np.array(points), lines=flat_lines)
 
-        # Convert hex colors to per-point RGB (2 points per line segment)
         from PySide6.QtGui import QColor
         point_colors = []
         for c in colors:
             rgb = [int(x * 255) for x in QColor(c).getRgbF()[:3]]
-            point_colors.append(rgb)  # start point
-            point_colors.append(rgb)  # end point
+            point_colors.append(rgb)
+            point_colors.append(rgb)
         poly.point_data['colors'] = np.array(point_colors, dtype=np.uint8)
-
-        # v3.3.0: per-cell EID array for graphical picking.
         poly.cell_data['EID'] = np.asarray(line_eids, dtype=np.int64)
 
         self.plotter.add_mesh(poly, scalars='colors', rgb=True,
@@ -9962,9 +12647,9 @@ class MainWindow(QMainWindow):
         pts = pv.PolyData(np.array(coords))
         cube = pv.Cube(x_length=1.0, y_length=1.0, z_length=1.0)
         # v3.5.0 item 3: mass glyph scale is now a user preference
-        # (Preferences > Entity Sizes > Mass glyph scale). Stored as
-        # fraction-of-model-length; default 0.015.
-        scale_factor = getattr(self, 'mass_glyph_scale', 0.015)
+        # (Preferences > Entity Sizes > Mass glyph scale).
+        # v4.0.7: default lowered to 0.0075 (half of pre-v4.0.7 0.015).
+        scale_factor = getattr(self, 'mass_glyph_scale', 0.0075)
         scale = (self.current_grid.length * scale_factor
                  if self.current_grid.length > 0 else 1.0)
         glyphs = pts.glyph(scale=False, factor=scale, geom=cube)
@@ -10305,40 +12990,49 @@ class MainWindow(QMainWindow):
         """Rebuild all coord-system actors honouring Display-tab settings + tree state."""
         if not self.current_generator:
             return
+        from node_runner.profiling import perf_stage, perf_event
         model = self.current_generator.model
 
         master_on = self.show_csys_check.isChecked()
         show_global = self.show_global_csys_check.isChecked()
 
-        # Remove ALL existing coord actors first (clean slate)
-        for cid in list(model.coords.keys()):
-            self._remove_coord_actors(cid)
+        # v4.0.9: sub-stage timers. The whole refresh costs ~0.22 s per
+        # visibility cycle on MEGA despite only 3 coord systems; sub-stages
+        # tell us which step actually dominates.
+        with perf_stage('coord_actors', 'remove_all',
+                        n_coords=len(model.coords)):
+            for cid in list(model.coords.keys()):
+                self._remove_coord_actors(cid)
 
         if not master_on:
             if render:
                 self.plotter.render()
             return
 
-        # Determine per-CID visibility from tree checkboxes
-        tree_visible = {}
-        coord_group_items = self._find_tree_items(('group', 'coords'))
-        if coord_group_items:
-            parent = coord_group_items[0]
-            for i in range(parent.childCount()):
-                child = parent.child(i)
-                child_data = child.data(0, QtCore.Qt.UserRole)
-                if isinstance(child_data, tuple) and len(child_data) >= 2:
-                    tree_visible[child_data[1]] = (
-                        child.checkState(0) == QtCore.Qt.Checked)
+        with perf_stage('coord_actors', 'resolve_tree_visibility',
+                        n_coords=len(model.coords)):
+            tree_visible = {}
+            coord_group_items = self._find_tree_items(('group', 'coords'))
+            if coord_group_items:
+                parent = coord_group_items[0]
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    child_data = child.data(0, QtCore.Qt.UserRole)
+                    if isinstance(child_data, tuple) and len(child_data) >= 2:
+                        tree_visible[child_data[1]] = (
+                            child.checkState(0) == QtCore.Qt.Checked)
 
-        for cid in sorted(model.coords.keys()):
-            # Global CSys master toggle
-            if cid <= 2 and not show_global:
-                continue
-            # Per-CID tree checkbox
-            if not tree_visible.get(cid, cid > 2):
-                continue
-            self._create_coord_system_actors(cid)
+        built = 0
+        with perf_stage('coord_actors', 'build_visible',
+                        n_coords=len(model.coords)):
+            for cid in sorted(model.coords.keys()):
+                if cid <= 2 and not show_global:
+                    continue
+                if not tree_visible.get(cid, cid > 2):
+                    continue
+                self._create_coord_system_actors(cid)
+                built += 1
+        perf_event('coord_actors', 'build_summary', n_built=built)
 
         if render:
             self.plotter.render()
@@ -10459,30 +13153,57 @@ class MainWindow(QMainWindow):
 
     def _update_plot_visibility(self):
         """Fast update of actor visibilities based on tree state. Does not rebuild actors."""
+        from node_runner.profiling import perf_stage, perf_event
+        _t_total = time.perf_counter()
+        # v4.0.2 (Stage A): record the _find_tree_items counter at entry
+        # so we know how many lookups this single visibility cycle did.
+        self._find_tree_calls_at_entry = getattr(self, '_find_tree_calls_total', 0)
         if not self.current_generator or not self.current_grid:
-            self._rebuild_plot()
+            with perf_stage('visibility', 'rebuild_plot_empty'):
+                self._rebuild_plot()
             return
+        # v4.0.10: defensive refresh of the maintained visible-SID sets
+        # from current tree state. Cheap (~5-10 ms) and ensures the
+        # bounded load_sid_loop iteration below sees the truth even
+        # if a fast-path event slipped through unobserved.
+        try:
+            self._refresh_visible_sid_sets()
+        except Exception:
+            pass
 
-        visibility_mask = np.ones(self.current_grid.n_cells, dtype=bool)
+        n_cells = int(self.current_grid.n_cells)
+        visibility_mask = np.ones(n_cells, dtype=bool)
         model = self.current_generator.model
-        type_to_nastran_map = { 'Beams': ['CBEAM'], 'Bars': ['CBAR'], 'Rods': ['CROD'], 'Plates': ['CQUAD4', 'CMEMBRAN', 'CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Solids': ['CHEXA', 'CHEXA8', 'CHEXA20', 'CTETRA', 'CTETRA4', 'CTETRA10', 'CPENTA', 'CPENTA6', 'CPENTA15'], 'Shear': ['CSHEAR'], 'Gap': ['CGAP'] }
+        # v4.0.14: 'Bushes' was missing. Unchecking the Bushes
+        # category tree item ran the full visibility cycle but never
+        # masked CBUSH cells, so the visual didn't change.
+        type_to_nastran_map = { 'Beams': ['CBEAM'], 'Bars': ['CBAR'], 'Rods': ['CROD'], 'Bushes': ['CBUSH'], 'Plates': ['CQUAD4', 'CMEMBRAN', 'CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Solids': ['CHEXA', 'CHEXA8', 'CHEXA20', 'CTETRA', 'CTETRA4', 'CTETRA10', 'CPENTA', 'CPENTA6', 'CPENTA15'], 'Shear': ['CSHEAR'], 'Gap': ['CGAP'] }
         shape_to_nastran_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'], 'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'], 'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'], 'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'] }
-        iterator = QTreeWidgetItemIterator(self.tree_widget)
-        while iterator.value():
-            item = iterator.value()
-            item_data = item.data(0, QtCore.Qt.UserRole)
-            if isinstance(item_data, tuple) and item_data[0] == 'elem_by_type_group':
-                if item.checkState(0) != QtCore.Qt.Checked:
-                    nastran_types_to_hide = type_to_nastran_map.get(item_data[1], [])
-                    if nastran_types_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['type'], nastran_types_to_hide)] = False
-            elif isinstance(item_data, tuple) and item_data[0] == 'elem_shape_group':
-                if item.checkState(0) != QtCore.Qt.Checked:
-                    nastran_types_to_hide = shape_to_nastran_map.get(item_data[1], [])
-                    if nastran_types_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['type'], nastran_types_to_hide)] = False
-            iterator += 1
-        props_to_hide = {prop_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'properties')) for i in range(item.childCount()) if (prop_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
-        if props_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['PID'], list(props_to_hide))] = False
-        mids_to_hide = {mat_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'materials')) for i in range(item.childCount()) if (mat_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
+        with perf_stage('visibility', 'tree_walk_type_shape', n_cells=n_cells):
+            # v4.0.7: use the tree index instead of walking the
+            # entire model tree (~23k items on MEGA, ~1.3 s wall
+            # per visibility cycle). With the v4.0.3 tree index in
+            # place we can look up each category checkbox by its
+            # known UserRole key in O(1). One lookup per category
+            # instead of one walk per cycle.
+            for cat_name, nastran_types in type_to_nastran_map.items():
+                items = self._find_tree_items(('elem_by_type_group', cat_name))
+                if items and items[0].checkState(0) != QtCore.Qt.Checked:
+                    if nastran_types:
+                        visibility_mask[np.isin(
+                            self.current_grid.cell_data['type'],
+                            nastran_types)] = False
+            for shape_name, nastran_types in shape_to_nastran_map.items():
+                items = self._find_tree_items(('elem_shape_group', shape_name))
+                if items and items[0].checkState(0) != QtCore.Qt.Checked:
+                    if nastran_types:
+                        visibility_mask[np.isin(
+                            self.current_grid.cell_data['type'],
+                            nastran_types)] = False
+        with perf_stage('visibility', 'tree_walk_pid_mid', n_cells=n_cells):
+            props_to_hide = {prop_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'properties')) for i in range(item.childCount()) if (prop_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
+            if props_to_hide: visibility_mask[np.isin(self.current_grid.cell_data['PID'], list(props_to_hide))] = False
+            mids_to_hide = {mat_item.data(0, QtCore.Qt.UserRole)[1] for item in self._find_tree_items(('group', 'materials')) for i in range(item.childCount()) if (mat_item := item.child(i)).checkState(0) != QtCore.Qt.Checked}
         if mids_to_hide:
             props_using_hidden_mats = set()
             for pid, prop in model.properties.items():
@@ -10570,7 +13291,10 @@ class MainWindow(QMainWindow):
             self.plotter.remove_actor('ghost_actor', render=False)
 
         self._last_visibility_mask = visibility_mask.copy()
-        self._rebuild_plot(visibility_mask=visibility_mask)
+        with perf_stage('visibility', 'rebuild_plot',
+                        n_visible=int(visibility_mask.sum()),
+                        n_total=n_cells):
+            self._rebuild_plot(visibility_mask=visibility_mask)
 
         try:
             arrow_size_percent = float(self.arrow_scale_input.text()); use_relative_scaling = self.relative_scaling_check.isChecked()
@@ -10582,10 +13306,79 @@ class MainWindow(QMainWindow):
         max_moment_mag = self.load_scaling_info.get('moment_max_mag', 0.0)
         max_pressure_mag = self.load_scaling_info.get('pressure_max_mag', 0.0)
 
-        for sid in model.loads.keys():
+        # v4.0.2 (Stage A): wrap the 1962-SID load-actor visibility
+        # loop. The v4.0.1 log showed 265 s unaccounted for between
+        # _rebuild_plot and final_render; this loop is the prime
+        # suspect because each iteration calls _find_tree_items which
+        # walks the entire tree.
+        _t_load_loop = time.perf_counter()
+        _n_load_visible = 0
+        _find_tree_calls_before = getattr(self, '_find_tree_calls_total', 0)
+        # v4.0.9: short-circuit when no load SID is visible AND no stale
+        # load glyph exists in plotter.actors. Loads default OFF since
+        # v4.0.5 so this is the common case on MEGA decks (1,962 SIDs
+        # all unchecked → no work needed). Saves ~1.0-2.0 s per
+        # visibility cycle. Catcher stays in forever so we can spot
+        # regressions in the dirty/visible accounting.
+        # v4.0.10: short-circuit check now reads the maintained
+        # _visible_load_sids set (O(1)) instead of walking 1,962 SIDs
+        # to check checkboxes. The set is kept in sync by
+        # _fast_path_sid_toggle and the defensive
+        # _refresh_visible_sid_sets above.
+        _short_circuit_loads = False
+        if model.loads:
+            _any_stale_glyph = any(
+                isinstance(name, str) and (
+                    name.startswith('force_glyphs_')
+                    or name.startswith('moment_glyphs_')
+                    or name.startswith('pressure_glyphs_'))
+                for name in self.plotter.actors.keys())
+            _short_circuit_loads = (not self._visible_load_sids) and (not _any_stale_glyph)
+        if _short_circuit_loads:
+            perf_event('load_sid_loop', 'short_circuit',
+                       n_sids=len(model.loads),
+                       taken=True,
+                       wall_s=f"{time.perf_counter()-_t_load_loop:.3f}")
+        elif model.loads:
+            perf_event('load_sid_loop', 'short_circuit',
+                       n_sids=len(model.loads),
+                       n_visible=len(self._visible_load_sids),
+                       taken=False)
+            # v4.0.10: stale-glyph sweep. With bounded iteration below,
+            # the per-SID loop only touches SIDs currently in
+            # _visible_load_sids. Glyphs for previously-visible-but-
+            # now-hidden SIDs would leak. Sweep removes those once
+            # per cycle. O(N_actors), bounded by visible+stale count
+            # (small in practice).
+            _stale_removed = 0
+            for actor_name in list(self.plotter.actors.keys()):
+                if not isinstance(actor_name, str):
+                    continue
+                for prefix in ('force_glyphs_', 'moment_glyphs_', 'pressure_glyphs_'):
+                    if actor_name.startswith(prefix):
+                        try:
+                            _stale_sid = int(actor_name[len(prefix):])
+                        except ValueError:
+                            break
+                        if _stale_sid not in self._visible_load_sids:
+                            self.plotter.remove_actor(actor_name, render=False)
+                            _stale_removed += 1
+                        break
+            if _stale_removed:
+                perf_event('load_sid_loop', 'stale_glyphs_swept',
+                           n_removed=_stale_removed)
+        # v4.0.10: iterate only the visible SIDs instead of all 1,962.
+        # Saves ~3.7 s per click on MEGA when 1 SID visible (was the
+        # case in v4.0.9 profile log line 1647).
+        if not _short_circuit_loads and model.loads:
+            perf_event('load_sid_loop', 'iter_bounded',
+                       n_iter=len(self._visible_load_sids),
+                       n_total=len(model.loads))
+        for sid in (self._visible_load_sids if not _short_circuit_loads else ()):
             is_visible = False
             if (sid_item_list := self._find_tree_items(('load_set', sid))) and sid_item_list[0].checkState(0) == QtCore.Qt.Checked:
                 is_visible = True
+                _n_load_visible += 1
 
             # v3.4.2: lazily build per-SID actors the first time the
             # user shows this SID. Decks with thousands of SIDs (e.g.
@@ -10598,7 +13391,14 @@ class MainWindow(QMainWindow):
 
             for type, max_mag in [('force', max_force_mag), ('moment', max_moment_mag), ('pressure', max_pressure_mag)]:
                 actor_name = f"{type}_actors_{sid}"; glyph_name = f"{type}_glyphs_{sid}"
-                self.plotter.remove_actor(glyph_name, render=False)
+                # v4.0.6: skip the no-op remove_actor when the glyph
+                # doesn't exist. On MEGA (1,962 SIDs × 3 types = 5,886
+                # remove_actor calls per visibility cycle), most are
+                # no-ops — but each one still walks PyVista's internal
+                # actor list. The membership check is O(1) on the
+                # plotter.actors dict.
+                if glyph_name in self.plotter.actors:
+                    self.plotter.remove_actor(glyph_name, render=False)
                 if (actor := self.plotter.actors.get(actor_name)) and is_visible:
                     dataset = actor.mapper.dataset
                     if not dataset.n_points: continue
@@ -10610,15 +13410,66 @@ class MainWindow(QMainWindow):
                             scaled_vectors = unit_vectors * (mags / max_mag * base_scale)[:, np.newaxis]
                         else:
                             scaled_vectors = unit_vectors * base_scale
-                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='red', name=glyph_name)
+                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='red', name=glyph_name, reset_camera=False)
                     elif type == 'moment':
-                        moment_glyph = pv.DoubleArrow(tip_length=0.2, tip_radius=0.08, shaft_radius=0.03)
-                        if use_relative_scaling and max_mag > 1e-9:
-                            mags = np.linalg.norm(dataset['vectors'], axis=1); dataset['relative_mag'] = mags / max_mag
-                            glyphs = dataset.glyph(orient='vectors', scale='relative_mag', factor=base_scale, geom=moment_glyph)
-                        else:
-                            glyphs = dataset.glyph(orient='vectors', scale=False, factor=base_scale, geom=moment_glyph)
-                        self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
+                        # v4.0.5 (Stage T): pv.DoubleArrow was removed
+                        # in PyVista 0.46+. Build a "two-tipped" arrow
+                        # by merging two pv.Arrow polydatas pointing in
+                        # opposite directions. Fallback to plain
+                        # pv.Arrow on any failure so a future PyVista
+                        # API change won't crash the visibility loop.
+                        # (NOTE: ``type`` is shadowed by the outer
+                        # for-loop variable in this block, so use
+                        # ``_exc.__class__.__name__`` instead of
+                        # ``type(_exc).__name__``.)
+                        from node_runner.profiling import perf_event
+                        # v4.0.12 (Bug 4 fix): two-tier fallback —
+                        # composite first, plain pv.Arrow on
+                        # composite-side failure. Same pattern as the
+                        # _build_load_glyphs_for_sid path. Keep this
+                        # mirror in sync.
+                        def _try_build_moment_glyph_inline(geom_pd):
+                            if use_relative_scaling and max_mag > 1e-9:
+                                _mags = np.linalg.norm(dataset['vectors'], axis=1); dataset['relative_mag'] = _mags / max_mag
+                                _g = dataset.glyph(orient='vectors', scale='relative_mag', factor=base_scale, geom=geom_pd)
+                            else:
+                                _g = dataset.glyph(orient='vectors', scale=False, factor=base_scale, geom=geom_pd)
+                            self.plotter.add_mesh(_g, color='cyan', name=glyph_name, reset_camera=False)
+                            return _g
+                        try:
+                            moment_glyph = self._get_moment_glyph_geom()
+                            _g = None
+                            if moment_glyph is not None:
+                                try:
+                                    _g = _try_build_moment_glyph_inline(moment_glyph)
+                                except Exception as _exc_c:
+                                    perf_event('glyph', 'moment_glyph_failed',
+                                               sid=sid,
+                                               reason='composite_attempt_inline',
+                                               exc=f"{_exc_c.__class__.__name__}: {str(_exc_c)[:120]}")
+                                    _g = None
+                            if _g is None:
+                                fb_arrow = pv.Arrow(
+                                    start=(0.0, 0.0, 0.0),
+                                    direction=(1.0, 0.0, 0.0),
+                                    tip_length=0.2, tip_radius=0.08,
+                                    shaft_radius=0.03)
+                                try:
+                                    _g = _try_build_moment_glyph_inline(fb_arrow)
+                                    perf_event('glyph', 'moment_fallback_arrow',
+                                               sid=sid)
+                                except Exception as _exc_f:
+                                    perf_event('glyph', 'moment_build_failed',
+                                               sid=sid,
+                                               reason='inline_fallback_failed',
+                                               exc=f"{_exc_f.__class__.__name__}: {str(_exc_f)[:120]}")
+                        except Exception as _exc:
+                            # Catch-all so a glyph build failure for one
+                            # SID doesn't kill the post-parse visibility
+                            # for the whole deck.
+                            perf_event('glyph', 'moment_build_failed',
+                                       sid=sid,
+                                       exc=f"{_exc.__class__.__name__}: {str(_exc)[:120]}")
                     elif type == 'pressure':
                         vectors = dataset['vectors']; mags = np.linalg.norm(vectors, axis=1)
                         with np.errstate(divide='ignore', invalid='ignore'):
@@ -10628,35 +13479,106 @@ class MainWindow(QMainWindow):
                             scaled_vectors = unit_vectors * (mags / max_mag * uniform_size)[:, np.newaxis]
                         else:
                             scaled_vectors = unit_vectors * uniform_size
-                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='yellow', name=glyph_name)
-        
-        for sid in model.spcs.keys():
+                        self.plotter.add_arrows(dataset.points, scaled_vectors, color='yellow', name=glyph_name, reset_camera=False)
+        perf_event('visibility', 'load_sid_loop',
+                   n_sids=len(model.loads),
+                   n_visible=_n_load_visible,
+                   wall_s=f"{time.perf_counter()-_t_load_loop:.3f}",
+                   find_tree_calls=getattr(self, '_find_tree_calls_total', 0) - _find_tree_calls_before)
+
+        _t_spc_loop = time.perf_counter()
+        _n_spc_visible = 0
+        _find_tree_calls_before = getattr(self, '_find_tree_calls_total', 0)
+        # v4.0.9 / v4.0.10: short-circuit + bounded iteration mirror
+        # of the load_sid_loop optimization above. Reads
+        # self._visible_spc_sids (maintained by _fast_path_sid_toggle
+        # and refreshed in _refresh_visible_sid_sets) instead of
+        # walking model.spcs.keys() to check checkboxes.
+        _short_circuit_spcs = False
+        if model.spcs:
+            _any_stale_constraint_glyph = any(
+                isinstance(name, str) and name.startswith('constraint_glyphs_')
+                for name in self.plotter.actors.keys())
+            _short_circuit_spcs = (not self._visible_spc_sids) and (not _any_stale_constraint_glyph)
+        if _short_circuit_spcs:
+            perf_event('spc_sid_loop', 'short_circuit',
+                       n_sids=len(model.spcs),
+                       taken=True,
+                       wall_s=f"{time.perf_counter()-_t_spc_loop:.3f}")
+        elif model.spcs:
+            perf_event('spc_sid_loop', 'short_circuit',
+                       n_sids=len(model.spcs),
+                       n_visible=len(self._visible_spc_sids),
+                       taken=False)
+            # v4.0.10: stale-glyph sweep for constraint glyphs.
+            _stale_removed_spc = 0
+            for actor_name in list(self.plotter.actors.keys()):
+                if not isinstance(actor_name, str):
+                    continue
+                if actor_name.startswith('constraint_glyphs_'):
+                    try:
+                        _stale_sid = int(actor_name[len('constraint_glyphs_'):])
+                    except ValueError:
+                        continue
+                    if _stale_sid not in self._visible_spc_sids:
+                        self.plotter.remove_actor(actor_name, render=False)
+                        _stale_removed_spc += 1
+            if _stale_removed_spc:
+                perf_event('spc_sid_loop', 'stale_glyphs_swept',
+                           n_removed=_stale_removed_spc)
+        if not _short_circuit_spcs and model.spcs:
+            perf_event('spc_sid_loop', 'iter_bounded',
+                       n_iter=len(self._visible_spc_sids),
+                       n_total=len(model.spcs))
+        for sid in (self._visible_spc_sids if not _short_circuit_spcs else ()):
             is_visible = False
             if (sid_item_list := self._find_tree_items(('constraint_set', sid))) and sid_item_list[0].checkState(0) == QtCore.Qt.Checked:
                 is_visible = True
-            
+                _n_spc_visible += 1
+
             glyph_name = f"constraint_glyphs_{sid}"
-            self.plotter.remove_actor(glyph_name, render=False)
+            # v4.0.6: only call remove_actor if the glyph actually
+            # exists.
+            if glyph_name in self.plotter.actors:
+                self.plotter.remove_actor(glyph_name, render=False)
             if (actor := self.plotter.actors.get(f"constraint_actors_{sid}")) and is_visible:
                 dataset = actor.mapper.dataset
                 if not dataset.n_points: continue
-                glyph_geom = pv.Cone(direction=(0, 0, 1), height=1.0, radius=0.3); scale_factor = self.current_grid.length * 0.02
+                # v4.0.7: constraint triangle size -25% (was 0.02 →
+                # now 0.015). User preference for default glyph scale.
+                glyph_geom = pv.Cone(direction=(0, 0, 1), height=1.0, radius=0.3); scale_factor = self.current_grid.length * 0.015
                 glyphs = dataset.glyph(scale=False, factor=scale_factor, orient=False, geom=glyph_geom)
-                self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name)
+                self.plotter.add_mesh(glyphs, color='cyan', name=glyph_name, reset_camera=False)
+        perf_event('visibility', 'spc_sid_loop',
+                   n_sids=len(model.spcs),
+                   n_visible=_n_spc_visible,
+                   wall_s=f"{time.perf_counter()-_t_spc_loop:.3f}",
+                   find_tree_calls=getattr(self, '_find_tree_calls_total', 0) - _find_tree_calls_before)
 
         # --- Control visibility of coordinate system actors ---
-        self._refresh_coord_actors(render=False)
+        with perf_stage('visibility', 'refresh_coord_actors'):
+            self._refresh_coord_actors(render=False)
 
-        self._create_bush_orientation_glyphs(visibility_mask)
-        self._create_beam_orientation_glyphs(visibility_mask)
+        with perf_stage('visibility', 'bush_orientation_glyphs'):
+            self._create_bush_orientation_glyphs(visibility_mask)
+        with perf_stage('visibility', 'beam_orientation_glyphs'):
+            self._create_beam_orientation_glyphs(visibility_mask)
         if self.show_free_edges_check.isChecked():
-            self._create_free_edges_actor()
-        self._render_geometry()
+            with perf_stage('visibility', 'free_edges_actor'):
+                self._create_free_edges_actor()
+        with perf_stage('visibility', 'render_geometry'):
+            self._render_geometry()
         # If cross-section is active, push the clipping plane into the
         # mappers of the freshly-rebuilt actors so the section stays on.
         if hasattr(self, "_cross_section") and self._cross_section.is_enabled:
-            self._cross_section.reapply()
-        self.plotter.render()
+            with perf_stage('visibility', 'cross_section_reapply'):
+                self._cross_section.reapply()
+        with perf_stage('visibility', 'final_render'):
+            self.plotter.render()
+        perf_event('visibility', 'total',
+                   wall_s=f"{time.perf_counter()-_t_total:.3f}",
+                   find_tree_calls_in_this_call=getattr(self, '_find_tree_calls_total', 0) - getattr(self, '_find_tree_calls_at_entry', 0))
+        self._emit_mem_event('visibility.cycle')
 
     # --- Geometry visualization ---
 

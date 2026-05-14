@@ -1,10 +1,10 @@
-# Node Runner v3.5.0
+# Node Runner v4.1.0
 
 A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
 
 ## Running
 
-The simplest path on Windows is to grab `Node.Runner.exe` from the latest release and run it - no Python install needed.
+The simplest path on Windows is to grab `Node Runner.exe` from the latest release and run it — no Python install needed.
 
 If you'd rather run from source, use the bundled venv to avoid Qt platform-plugin errors that come from accidentally launching with a different Python:
 
@@ -14,6 +14,144 @@ run.bat            (or)
 ```
 
 `run.py` works too, as long as you've activated the project venv first.
+
+## Changelog for v4.1.0
+
+Consolidated release of the v4.0.x perf push. Builds on v3.5.0 with
+a complete rework of the visibility hot path, the moment-glyph
+convention, the camera-reset behaviour, the property-coloring
+pipeline, and a per-Nastran-type actor architecture that takes
+category toggles on the MEGA `MEGA-XWFF_04A_DUL_FUC-Entry.dat` deck
+(2.4 M elements / 1,962 load SIDs / 25 INCLUDEs) from ~5 s per
+click to sub-100 ms.
+
+### Premium per-click feel on MEGA
+
+| User action | Pre-v4.1.0 | v4.1.0 |
+|---|---|---|
+| Toggle a category (Plates, Beams, Solids, Bars, Rods, Bushes, Shear, Gap) | ~5 s | **sub-100 ms** |
+| Toggle Rigid / Masses / Plotels | full visibility cycle | sub-100 ms |
+| Toggle coord system | full visibility cycle | sub-100 ms |
+| Toggle a single load_set / constraint_set | full visibility cycle | sub-100 ms (or fall-through ≤ 1 s) |
+| Click any tree item with the visibility-load loop in the path | up to 3.7 s (1,962 SIDs walked) | ~40 ms (bounded to visible SIDs only) |
+
+### Visibility correctness
+
+- **Bushes category** (CBUSH) now masks correctly. Previously the
+  Bushes checkbox ran the full cycle but never modified the
+  visibility mask, so CBUSH elements stayed visible regardless.
+- **Camera stays put** on tree toggles. v3.5.0 would
+  snap the view to fit the whole model on every glyph add or
+  legacy mesh rebuild. Pre-built actors and every glyph add path
+  now pass `reset_camera=False`; the camera only resets on
+  explicit view buttons (Iso, Top, Front, etc.) and the first
+  model load.
+- **Nodes are independent of category toggles.** The fast-path
+  visibility router used to hide `nodes_actor` alongside legacy
+  mesh leftovers; it now leaves the user-controlled Nodes display
+  alone.
+
+### Visual fidelity
+
+- **Shading toggle** produces a visible lit / flat delta again.
+  `plotter.clear()` inside `_update_viewer` was wiping the 4-light
+  rig installed once in `__init__`. The rig now re-installs on
+  every viewer rebuild.
+- **Moment vectors** use the physics-textbook double-tipped arrow
+  (▶▶) instead of the symmetric ←→ double-arrow. The shaft
+  direction is the right-hand-rule thumb; the double tip
+  distinguishes a moment vector from a force vector (single ▶).
+- **PID coloring is value-keyed.** v4.1.0 writes per-cell RGB
+  directly to `cell_data['cell_rgb']` and renders via
+  `add_mesh(scalars='cell_rgb', rgb=True)`. The same PID renders
+  the same color regardless of which actor / which rebuild / which
+  mode-transition. Previously PyVista's `categories=True` +
+  list-cmap pattern produced different colors for the same PID
+  across actors with different unique-PID sets.
+
+### Architecture
+
+- **Pre-built per-Nastran-type actors.** At viewer-build time, the
+  full `current_grid` is partitioned by `cell_data['type']` and
+  one named PyVista actor is added per Nastran type (`cat_CQUAD4`,
+  `cat_CBEAM`, `cat_CBUSH`, `cat_CHEXA`, etc.). Category toggles
+  become `actor.SetVisibility(bool)` — sub-100 ms on MEGA.
+- **Fast-path router** in `_handle_tree_item_changed` dispatches
+  load_set / constraint_set / Rigid / Masses / Plotels / coord
+  toggles to targeted handlers that bypass the full
+  `_update_plot_visibility` cycle.
+- **Filter-mode coexistence.** When PID / MID / isolate / hidden-
+  groups state is active, the category fast path returns False
+  and the call falls through to the legacy `_rebuild_plot` path
+  for cell-level filtering. Legacy and pre-built actors never
+  double-render (each path hides the other side's actors).
+- **Color-mode rebuild.** Switching `View > Color by >
+  Property ID | Element Type | Quality | Results` invalidates and
+  rebuilds the pre-built actors so the new mode's coloring is
+  applied. Quality / Results modes fall through to legacy
+  (their scalars depend on external data flow).
+- **Module-level constants.** `_NTYPE_TO_TYPE_CATEGORY`,
+  `_NTYPE_TO_SHAPE_CATEGORY`,
+  `_PRE_BUILT_SUPPORTED_COLOR_MODES` are the single source of
+  truth for category-to-Nastran-type mapping and which color modes
+  the pre-built path handles.
+
+### Perf optimizations under the hood
+
+- **`shells_compute_normals` cache.** The phong-shading
+  `compute_normals` call on 2.36 M LOD'd shell cells costs ~1.1 s
+  per cycle. Cache key:
+  `(id(current_grid), n_cells, EID-hash, elem_shrink)`. Saves
+  ~1.1 s on every cache hit. Invalidates automatically on
+  `_update_viewer` (new `current_grid`) or PID/Type filter
+  changes (different EID set).
+- **Bounded SID-loop iteration.** A maintained
+  `self._visible_load_sids` set replaces walking
+  `model.loads.keys()` on every visibility cycle. On MEGA the
+  load_sid_loop drops from 3.7 s to ~40 ms (97× faster).
+- **Per-SID O(1) fast path.** `load_set` and `constraint_set`
+  toggles build / remove glyphs only for the affected SID — no
+  full visibility cycle.
+- **Vectorized RBE actor build.** `_create_rbe_actors` runs in
+  ~400 ms on MEGA's 46,782 rigid elements (was ~144 s of the
+  legacy 434 s viewer build via Python-level cell iteration).
+- **Parallel BDF parse.** Decks with 4+ INCLUDEs and ≥ 50 MB use
+  a `ProcessPoolExecutor` per-INCLUDE parser
+  (`node_runner/parallel_parse.py`); falls back to serial on
+  smaller decks or any DMIG presence.
+- **Status-bar element count** alongside the node count
+  (`Elements: 2,452,222` next to `Nodes: 2,484,333` on MEGA).
+
+### Diagnostics
+
+`NR_PROFILE=1` produces a structured profile log at
+`~/.node_runner/profile_<timestamp>.log`. ~30 named catchers
+across visibility / actor / glyph / shading paths emit timing and
+state. Examples:
+
+```
+[perf] viewer.apply_display_lod        wall=0.377s n_input_cells=2405441
+[perf] viewer.lod_result               active=True displayed=248261 total=2405441
+[perf] actors.build_per_category       wall=3.4s n_categories=7
+[perf] actors.category_added           ntype=CQUAD4 n_cells=2347347 is_shell=True mode=property
+[perf] fast_path.category_toggle       group_name=Plates n_actors_changed=2 wall<100ms
+[perf] load_sid_loop.iter_bounded      n_iter=1 n_total=1962
+[perf] shells_normals.cache_hit        n_cells=235765
+[perf] glyph.moment_double_tip_built   n_points=68 n_cells=50
+[perf] mem.rss_mb                      where=viewer.total mb=...
+[perf] lights.rig_installed            n_lights=4
+```
+
+The `~30` catchers are intended to stay in forever — they catch
+regressions silently on every subsequent build.
+
+### Tests
+
+The 202-test pytest suite continues to pass. New v4.1.0 tests
+cover the parallel parse path and the tree snapshot / restore
+round-trip.
+
+---
 
 ## Changelog for v3.5.0
 
@@ -222,9 +360,10 @@ Feature release covering nine items from end-user testing on
   element whose property's material is 1.
 
 ### Sketch-first workflow followed
-- `.claude/sketch_groups_v3_4_0.py` renders the new Groups tab AND
-  the Add-to-Group dialog before the production code lands. Real
-  widgets re-rendered after edits and compared against the sketches.
+- The new Groups tab and the Add-to-Group dialog were prototyped
+  in standalone PySide6 sketch scripts before the production code
+  landed. Real widgets were re-rendered after edits and compared
+  against the sketches.
 
 ### Tests
 - 156 pre-existing + 4 new RBE listing tests + 3 new bucket
@@ -306,7 +445,7 @@ Changes vs v3.2.6:
 - **Count label kept** (it's useful) - sits between the body and the bottom OK/Cancel row.
 
 ### v3.2.5 mistake addressed
-v3.2.5 created the new layout but never attached it to the body, leaving the right column blank. v3.2.7 was screenshot-tested before shipping: a standalone PySide6 sketch script (`.claude/sketch_selection.py`) builds the proposed dialog and saves a PNG. The real `EntitySelectionBar` was also rendered to PNG before the release was tagged.
+v3.2.5 created the new layout but never attached it to the body, leaving the right column blank. v3.2.7 was screenshot-tested before shipping: a standalone PySide6 sketch script builds the proposed dialog and saves a PNG. The real `EntitySelectionBar` was also rendered to PNG before the release was tagged.
 
 ### Tests
 - 138 tests still pass.

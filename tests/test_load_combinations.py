@@ -147,3 +147,119 @@ def test_copy_command_leaves_source(small_model_with_combos):
     cmd.undo(m)
     assert 9000 not in m.load_combinations
     assert m.load_combinations[1000]['scale'] == 1.0
+
+
+# ----------------------------------------------------------------------
+# v4.0.0 (A1): read_combo_payload adapter + real-parse fixtures
+#
+# After read_bdf parses a deck containing LOAD cards, the slot
+# `model.load_combinations[sid]` is `list[LOAD]`, not a dict. v3.5.0
+# field-tested as crashing the Edit dialog because the code called
+# `.get('scale', 1.0)` on a list. These tests pin the adapter's
+# behavior across both shapes.
+# ----------------------------------------------------------------------
+
+@pytest.fixture
+def parsed_model_with_combos(tmp_path):
+    """Real `read_bdf` round-trip producing list[LOAD] storage."""
+    from pyNastran.bdf.bdf import read_bdf
+    bdf_text = (
+        "GRID,1,,0.0,0.0,0.0\n"
+        "GRID,2,,1.0,0.0,0.0\n"
+        "FORCE,100,1,,1.0,1.0,0.0,0.0\n"
+        "FORCE,200,2,,2.0,0.0,1.0,0.0\n"
+        "FORCE,300,1,,3.0,0.0,0.0,1.0\n"
+        "LOAD,1000,1.0,1.0,100,0.5,200\n"
+        "LOAD,2000,2.0,1.0,300\n"
+    )
+    p = tmp_path / "combos.bdf"
+    p.write_text(bdf_text)
+    m = read_bdf(str(p), xref=False, validate=False, punch=True)
+    return m
+
+
+def test_adapter_handles_list_from_real_parse(parsed_model_with_combos):
+    from node_runner.dialogs.load_combination import read_combo_payload
+    m = parsed_model_with_combos
+    # pyNastran stores parsed LOADs as a list.
+    assert isinstance(m.load_combinations[1000], list)
+    payload = read_combo_payload(m.load_combinations[1000])
+    assert payload['scale'] == 1.0
+    assert payload['scale_factors'] == [1.0, 0.5]
+    assert payload['load_ids'] == [100, 200]
+
+
+def test_adapter_handles_dict_from_in_session():
+    from node_runner.dialogs.load_combination import read_combo_payload
+    payload = read_combo_payload(
+        {'scale': 2.5, 'scale_factors': [1.0, 0.5],
+         'load_ids': [10, 20], 'title': 'demo'})
+    assert payload['scale'] == 2.5
+    assert payload['scale_factors'] == [1.0, 0.5]
+    assert payload['load_ids'] == [10, 20]
+    assert payload['title'] == 'demo'
+
+
+def test_adapter_handles_empty_fallback():
+    from node_runner.dialogs.load_combination import read_combo_payload
+    payload = read_combo_payload(None)
+    assert payload == {
+        'scale': 1.0, 'scale_factors': [], 'load_ids': [], 'title': ''}
+
+
+def test_edit_dialog_opens_on_parsed_combo(qapp, parsed_model_with_combos):
+    """Regression: v3.5.0 dialog raised AttributeError on .get() of list."""
+    from node_runner.dialogs.load_combination import LoadCombinationDialog
+    dlg = LoadCombinationDialog(
+        parsed_model_with_combos,
+        mode=LoadCombinationDialog.MODE_EDIT,
+        combo_sid=1000)
+    sid, payload = dlg.result_payload()
+    assert sid == 1000
+    assert payload['scale'] == 1.0
+    assert payload['load_ids'] == [100, 200]
+
+
+def test_copy_dialog_opens_on_parsed_combo(qapp, parsed_model_with_combos):
+    """Regression: MODE_COPY also did `dict(list_value)` which raised."""
+    from node_runner.dialogs.load_combination import LoadCombinationDialog
+    dlg = LoadCombinationDialog(
+        parsed_model_with_combos,
+        mode=LoadCombinationDialog.MODE_COPY,
+        combo_sid=2000)
+    sid, payload = dlg.result_payload()
+    assert sid > 2000  # new SID assigned
+    assert payload['scale_factors'] == [1.0]
+    assert payload['load_ids'] == [300]
+
+
+def test_edit_command_executes_on_parsed_combo(parsed_model_with_combos):
+    """Regression: EditLoadCombinationCommand.execute called dict() on
+    the old value to snapshot for undo; that raised on list[LOAD]."""
+    from node_runner.commands import EditLoadCombinationCommand
+    m = parsed_model_with_combos
+    cmd = EditLoadCombinationCommand(
+        1000, 1000,
+        {'scale': 3.0, 'scale_factors': [2.0], 'load_ids': [300]})
+    cmd.execute(m)  # was raising TypeError pre-fix
+    assert m.load_combinations[1000]['scale'] == 3.0
+    cmd.undo(m)
+    # Undo restores dict-shape (adapter normalized snapshot).
+    restored = m.load_combinations[1000]
+    assert restored['scale'] == 1.0
+    assert restored['load_ids'] == [100, 200]
+
+
+def test_mixed_shape_model_displays_consistently(parsed_model_with_combos):
+    """Build a model with a parsed combo + an in-session combo and
+    verify the adapter normalizes both to identical payload shapes."""
+    from node_runner.dialogs.load_combination import read_combo_payload
+    m = parsed_model_with_combos
+    m.load_combinations[3000] = {
+        'scale': 1.0, 'scale_factors': [1.0], 'load_ids': [100],
+        'title': 'in-session'}
+    parsed = read_combo_payload(m.load_combinations[1000])
+    in_session = read_combo_payload(m.load_combinations[3000])
+    assert set(parsed) == set(in_session)
+    assert all(isinstance(parsed[k], type(in_session[k]))
+               for k in parsed)

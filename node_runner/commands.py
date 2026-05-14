@@ -7,8 +7,33 @@ CommandManager maintains undo/redo stacks with a configurable history limit.
 from __future__ import annotations
 
 import copy
+import enum
 from abc import ABC, abstractmethod
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# v4.0.0 (B2): refresh hints
+#
+# Pre-v4.0.0, every command's downstream call site triggered a full
+# ``_update_viewer`` (rebuild grid + rebuild all actors + rebuild tree).
+# For small edits like 'add one SPC' on a 2.4M-element deck this took
+# multi-seconds and wiped the user's tree-visibility state.
+#
+# Commands now declare a narrow ``refresh_hint`` and mainwindow's
+# dispatcher maps it to a targeted helper. FULL is the default, so
+# unmigrated commands keep the old behavior.
+# ---------------------------------------------------------------------------
+
+
+class RefreshHint(enum.Enum):
+    FULL = 'full'                # default: full _update_viewer
+    NONE = 'none'                # no viewer refresh needed (pure metadata edit)
+    CONSTRAINTS = 'constraints'  # only constraint actors changed
+    LOADS = 'loads'              # only load actors changed
+    GRID_COLOR = 'grid_color'    # color/legend changed; mesh geometry intact
+    COORDS = 'coords'            # coord-system axes changed
+    GROUPS = 'groups'            # group membership / visibility changed
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +55,17 @@ class Command(ABC):
     @abstractmethod
     def description(self) -> str:
         """Human-readable label for the status bar (e.g. "Add 3 nodes")."""
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        """v4.0.0 (B2): which narrow refresh path the caller should run
+        after ``execute``/``undo``. Default ``FULL`` preserves pre-v4.0.0
+        behavior. Override on subclasses that touch only a narrow slice
+        of the model.
+
+        Read-only by design: the hint is a class fact, not session state.
+        """
+        return RefreshHint.FULL
 
 
 class CompoundCommand(Command):
@@ -1223,6 +1259,10 @@ class EditMaterialCommand(Command):
     def description(self) -> str:
         return f"Edit material {self._mid}"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GRID_COLOR
+
 
 class DeleteMaterialCommand(Command):
     """Delete a material by MID, snapshotting for undo."""
@@ -1290,6 +1330,10 @@ class EditPropertyCommand(Command):
     @property
     def description(self) -> str:
         return f"Edit property {self._pid}"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GRID_COLOR
 
 
 class DeletePropertyCommand(Command):
@@ -1364,6 +1408,10 @@ class AddLoadCommand(Command):
     def description(self) -> str:
         return f"Add {self._load_type} load SID {self._sid}"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.LOADS
+
 
 class DeleteLoadCommand(Command):
     """Delete an entire load set by SID (from model.loads and model.tempds)."""
@@ -1388,6 +1436,10 @@ class DeleteLoadCommand(Command):
     @property
     def description(self) -> str:
         return f"Delete load set {self._sid}"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.LOADS
 
 
 class DeleteTempdCommand(Command):
@@ -1439,6 +1491,10 @@ class AddConstraintCommand(Command):
     def description(self) -> str:
         return f"Add constraint SID {self._sid}"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.CONSTRAINTS
+
 
 class DeleteConstraintCommand(Command):
     """Delete an entire constraint set by SID."""
@@ -1463,6 +1519,10 @@ class DeleteConstraintCommand(Command):
     @property
     def description(self) -> str:
         return f"Delete constraint set {self._sid}"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.CONSTRAINTS
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1585,10 @@ class AddCoordCommand(Command):
         action = "Edit" if self._old_coord is not None else "Add"
         return f"{action} coord system {self._cid}"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.COORDS
+
 
 class DeleteCoordCommand(Command):
     """Delete a coordinate system by CID, snapshotting for undo."""
@@ -1550,6 +1614,10 @@ class DeleteCoordCommand(Command):
     @property
     def description(self) -> str:
         return f"Delete coord system {self._cid}"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.COORDS
 
 
 # ---------------------------------------------------------------------------
@@ -1916,11 +1984,15 @@ class EditLoadCombinationCommand(Command):
         self._snapshot_old = None  # populated by execute()
 
     def execute(self, model) -> None:
+        from node_runner.dialogs.load_combination import read_combo_payload
         if not hasattr(model, 'load_combinations'):
             model.load_combinations = {}
-        # Snapshot for undo.
+        # Snapshot for undo. Old value may be dict (in-session) or
+        # list[LOAD] (post-parse); normalize via adapter so dict() never
+        # sees a list.
         if self._old_sid in model.load_combinations:
-            self._snapshot_old = dict(model.load_combinations[self._old_sid])
+            self._snapshot_old = read_combo_payload(
+                model.load_combinations[self._old_sid])
         # Write new SID (may be the same as old).
         model.load_combinations[self._new_sid] = dict(self._new_payload)
         # If renaming to a different SID, remove the old entry.
@@ -2036,6 +2108,10 @@ class CreateGroupCommand(Command):
     def description(self) -> str:
         return f"Create group {self._gid}: '{self._name}'"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GROUPS
+
 
 class DeleteGroupCommand(Command):
     """Delete a named group, snapshotting for undo."""
@@ -2055,6 +2131,10 @@ class DeleteGroupCommand(Command):
     @property
     def description(self) -> str:
         return f"Delete group '{self._name}'"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GROUPS
 
 
 class RenameGroupCommand(Command):
@@ -2076,6 +2156,10 @@ class RenameGroupCommand(Command):
     @property
     def description(self) -> str:
         return f"Rename group '{self._old}' to '{self._new}'"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GROUPS
 
 
 class ModifyGroupCommand(Command):
@@ -2118,6 +2202,10 @@ class ModifyGroupCommand(Command):
     @property
     def description(self) -> str:
         return f"Modify group '{self._name}'"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.GROUPS
 
 
 # ---------------------------------------------------------------------------
@@ -3447,6 +3535,10 @@ class AddPload1Command(Command):
     def description(self) -> str:
         return f"Add PLOAD1 ({self._added_count} eid{'s' if self._added_count != 1 else ''})"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.LOADS
+
 
 class AddPload2Command(Command):
     """Uniform pressure load on shell elements (PLOAD2)."""
@@ -3473,6 +3565,10 @@ class AddPload2Command(Command):
     @property
     def description(self) -> str:
         return f"Add PLOAD2 ({len(self._eids)} eid{'s' if len(self._eids) != 1 else ''})"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.LOADS
 
 
 class AddSpcdCommand(Command):
@@ -3509,6 +3605,10 @@ class AddSpcdCommand(Command):
     def description(self) -> str:
         return f"Add SPCD ({len(self._nids)} node{'s' if len(self._nids) != 1 else ''})"
 
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.LOADS
+
 
 class AddMpcCommand(Command):
     """General multi-point constraint (MPC)."""
@@ -3537,6 +3637,10 @@ class AddMpcCommand(Command):
     @property
     def description(self) -> str:
         return f"Add MPC ({len(self._terms)} terms, SID {self._sid})"
+
+    @property
+    def refresh_hint(self) -> RefreshHint:
+        return RefreshHint.CONSTRAINTS
 
 
 class AddRbarCommand(Command):
