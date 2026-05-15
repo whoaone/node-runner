@@ -1,6 +1,21 @@
-# Node Runner v5.1.0
+# Node Runner v5.1.1
 
 A lightweight **pre + solve + post** environment for Nastran models. Built with Python, PySide6, PyVista, and the open-source MYSTRAN solver.
+
+## Changelog for v5.1.1
+
+Patch release. Six small fixes on top of v5.1.0 — two real bugs in the MYSTRAN run-summary path, and four UX gaps surfaced by user testing.
+
+- **Run-summary dialog now reads correctly.** A botched `else:` indent in the v5.0.0 `_on_mystran_finished` `try/except` was overwriting the post-run message with "Auto-load is disabled in Preferences → MYSTRAN" on every successful run, regardless of the actual auto-load setting. The proper "Loaded N displacements (F06 source)" message lands again.
+- **Right-side Result Browser dock now populates from MYSTRAN runs.** `_consume_mystran_bundle` was auto-opening the v3.0.0 dock but never calling `_populate_result_browser()` to feed its Nodes / Elements tables. v5.1.1 wires that call so MYSTRAN runs feed the dock the same way `File → Load Results` does.
+- **`File → Load Results` now handles MYSTRAN OP2s gracefully.** When pyNastran 1.4.x rejects a MYSTRAN OP2 (it lacks a MYSTRAN dialect hook), the loader looks for a sibling `.F06` next to the `.op2` and falls through to the minimal F06 parser the MYSTRAN run path uses. The file-picker filter also accepts `.f06` directly now.
+- **Pre-flight dialog is compact when there are no issues.** v5.1.0 hard-coded ~820×540 for the worst-case issues table; v5.1.1 shrinks to ~620×300 when `report.issues` is empty so the green banner fills the dialog naturally.
+- **Pre-flight banner explains what pre-flight does.** Banner copy now reads "Scanned for cards MYSTRAN can't run (aero, nonlinear, contact, optimization, unsupported elements)…" so first-time users aren't guessing.
+- **Run-summary dialog has a Load Results button.** Always visible (greyed when no OP2/F06 exists); imports the run's results through the same code path as auto-load. Useful when auto-load is OFF — or as a safety net for any future bug.
+
+Tests: **247 pass + 1 skipped** (no test count change — these are runtime-behavior fixes).
+
+---
 
 ## Changelog for v5.1.0
 

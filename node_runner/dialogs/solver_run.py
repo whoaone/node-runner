@@ -65,35 +65,52 @@ class MystranPreflightDialog(QDialog):
         super().__init__(parent)
         self._report = report
         self.setWindowTitle("MYSTRAN Pre-flight Report")
-        self.setMinimumSize(720, 460)
-        self.resize(820, 540)
+        # v5.1.1 item 32: compact when there are zero issues; the
+        # green-banner case used to leave a big empty space below the
+        # banner. Sized for the worst-case (many issues) only when we
+        # actually have a table to fill.
+        if report.issues:
+            self.setMinimumSize(720, 460)
+            self.resize(820, 540)
+        else:
+            self.setMinimumSize(560, 260)
+            self.resize(620, 300)
 
         layout = QVBoxLayout(self)
 
-        # --- Banner ---
+        # --- Banner --- (v5.1.1 item 32: copy now explains what
+        # pre-flight does so first-time users aren't guessing.)
+        scan_purpose = (
+            "Scanned for cards MYSTRAN can't run "
+            "(aero, nonlinear, contact, optimization, unsupported "
+            "elements)."
+        )
         if report.has_blocking:
             banner_text = (
-                f"<b>Cannot run MYSTRAN on this deck.</b><br>"
+                f"<b>Pre-flight cannot proceed.</b><br>"
+                f"{scan_purpose} Found "
                 f"{report.blocking_count} blocking issue"
-                f"{'s' if report.blocking_count != 1 else ''}, "
-                f"{report.warning_count} warning"
-                f"{'s' if report.warning_count != 1 else ''}. "
+                f"{'s' if report.blocking_count != 1 else ''}"
+                f"{f' and {report.warning_count} warning' if report.warning_count else ''}"
+                f"{'s' if report.warning_count > 1 else ''}. "
                 f"Resolve the blocking items and try again."
             )
             banner_style = _SEVERITY_BANNER['blocking']
         elif report.warning_count:
             banner_text = (
-                f"<b>Pre-flight passed with {report.warning_count} "
-                f"warning{'s' if report.warning_count != 1 else ''}.</b><br>"
-                f"You can proceed; the MYSTRAN export will translate "
-                f"or drop the items below."
+                f"<b>Pre-flight passed with "
+                f"{report.warning_count} warning"
+                f"{'s' if report.warning_count != 1 else ''}.</b><br>"
+                f"{scan_purpose} The MYSTRAN export will translate or "
+                f"drop the items below; the run can proceed."
             )
             banner_style = _SEVERITY_BANNER['warning']
         else:
             banner_text = (
                 f"<b>Pre-flight passed.</b><br>"
+                f"{scan_purpose} None found. "
                 f"~{report.estimated_dof:,} DOF; "
-                f"estimated wall time: "
+                f"estimated wall time "
                 f"{_fmt_secs(report.estimated_wall_time_seconds)}."
             )
             banner_style = _SEVERITY_BANNER['ok']

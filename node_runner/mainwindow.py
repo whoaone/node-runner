@@ -15499,6 +15499,17 @@ class MainWindow(QMainWindow):
             else:
                 self._mystran_results_loaded_msg = (
                     "No OP2 or F06 results file found in the run folder.")
+        else:
+            # v5.1.1 item 30: this branch belongs to the outer
+            # `if mystran_settings.get('auto_load_results', True):`
+            # condition. In v5.0.0/v5.1.0 it was accidentally indented
+            # under the `try` block below, which made it fire on every
+            # successful save_meta() -- i.e. always -- and silently
+            # overwrite the real "Loaded N displacements..." message.
+            self._mystran_results_loaded_msg = (
+                "Auto-load is disabled in Edit -> Preferences -> "
+                "MYSTRAN. Click 'Load Results' below to import.")
+
         # v5.0.0 item 20: persist the final results_source. The first
         # save_meta() inside SolverRunWorker._on_finished runs before
         # load_mystran_results() sets this field, so the on-disk
@@ -15509,9 +15520,6 @@ class MainWindow(QMainWindow):
                 run.save_meta(Path(run.bdf_path).parent)
         except Exception:
             pass
-        else:
-            self._mystran_results_loaded_msg = (
-                "Auto-load is disabled in Preferences → MYSTRAN.")
 
         self._show_mystran_summary(run, bundle)
 
@@ -15631,6 +15639,23 @@ class MainWindow(QMainWindow):
 
         # ---- Buttons ----
         button_row = QHBoxLayout()
+        # v5.1.1 item 33: in-dialog Load Results button so the user
+        # always has a one-click path to import what MYSTRAN just
+        # produced, regardless of the auto-load Preference.
+        load_btn = QPushButton("Load Results")
+        load_btn.setToolTip(
+            "Parse the OP2 / F06 from this run and feed the results "
+            "into the Result Browser. Same as auto-load when that "
+            "Preference is on.")
+        # Disable when there's nothing to load.
+        can_load = bool(
+            (run.op2_path and Path(run.op2_path).exists())
+            or (run.f06_path and Path(run.f06_path).exists())
+        )
+        load_btn.setEnabled(can_load)
+        load_btn.clicked.connect(
+            lambda: self._load_results_from_run_summary(run, dlg))
+        button_row.addWidget(load_btn)
         if run_dir is not None:
             open_btn = QPushButton("Open Run Folder")
             open_btn.clicked.connect(lambda: self._open_folder(run_dir))
@@ -15651,6 +15676,30 @@ class MainWindow(QMainWindow):
         button_row.addWidget(close_btn)
         layout.addLayout(button_row)
         dlg.exec()
+
+    def _load_results_from_run_summary(self, run, dlg):
+        """v5.1.1 item 33: handler for the Load Results button on the
+        post-run summary dialog. Calls the same MYSTRAN result adapter
+        that auto-load uses, then closes the summary on success.
+        """
+        from node_runner.solve.mystran_results import load_mystran_results
+        bundle = load_mystran_results(run)
+        if bundle and self._bundle_has_data(bundle):
+            self._consume_mystran_bundle(bundle, run)
+            self._update_status(
+                f"Loaded {self._bundle_disp_count(bundle):,} "
+                f"displacements ({(run.results_source or '?').upper()} "
+                f"source).")
+            try:
+                dlg.accept()
+            except Exception:
+                pass
+        else:
+            QMessageBox.warning(
+                self, "Load Results",
+                "No displacement data could be parsed from the OP2/F06 "
+                "in this run folder. Inspect the .ERR file for the "
+                "MYSTRAN-reported failure.")
 
     def _open_folder(self, path):
         """Open a folder (or file's parent) in the host file manager."""
@@ -15700,6 +15749,28 @@ class MainWindow(QMainWindow):
         """
         self.op2_results = bundle
         self._update_results_status(run, bundle)
+        # Make the legacy results sidebar widget visible + populate its
+        # subcase / type / component combos. Without this the v3.0.0
+        # color-by-results path doesn't know which scalar to pull.
+        try:
+            self.results_widget.setVisible(True)
+        except Exception:
+            pass
+        try:
+            self._populate_results_combos()
+        except Exception:
+            pass
+        # v5.1.1 item 31: feed the legacy ResultBrowserDock's Nodes /
+        # Elements tables. v5.0.0 + v5.1.0 set ``self.op2_results`` and
+        # called ``_on_results_changed`` but never invoked the dock
+        # populator, so the dock auto-opened empty. Calling
+        # ``_populate_result_browser`` here mirrors the
+        # ``_load_results_dialog`` path so MYSTRAN runs feed the dock
+        # the same way a manual File -> Load Results would.
+        try:
+            self._populate_result_browser()
+        except Exception:
+            pass
         # Trigger the same downstream that the OP2 menu item uses.
         try:
             self._on_results_changed()
@@ -15716,6 +15787,12 @@ class MainWindow(QMainWindow):
                     self._result_browser_dock.raise_()
             except Exception:
                 pass
+        # Also surface the three v3.0.x result panels (browser /
+        # animation / vector) as a tabified group on the right.
+        try:
+            self._show_result_panels(True)
+        except Exception:
+            pass
 
     def _update_results_status(self, run, bundle):
         """Refresh the status-bar Results segment."""
@@ -15895,26 +15972,133 @@ class MainWindow(QMainWindow):
     # --- Post-processing (OP2 results) handlers ---
 
     def _load_results_dialog(self):
+        """v5.1.1 item 34: graceful OP2 + F06 loader.
+
+        Accepts both .op2 and .f06 files. On OP2 load failure (typical
+        for MYSTRAN OP2s under pyNastran 1.4.x, which lacks a MYSTRAN
+        dialect hook), looks for a sibling .F06 next to the .op2 and
+        falls through to the minimal F06 parser that the MYSTRAN run
+        path uses. Routes the bundle through ``_consume_mystran_bundle``
+        so both the new Results sidebar tab AND the legacy Result
+        Browser dock get populated identically to the post-run path.
+        """
         if not self.current_generator:
-            QMessageBox.warning(self, "No Model", "Please load a model first.")
+            QMessageBox.warning(self, "No Model",
+                                "Please load a model first.")
             return
         filepath, _ = QFileDialog.getOpenFileName(
-            self, "Load Results File", "", "OP2 Files (*.op2);;All Files (*)")
+            self, "Load Results File", "",
+            "Results files (*.op2 *.f06 *.F06);;OP2 Files (*.op2);;"
+            "F06 Files (*.f06 *.F06);;All Files (*)")
         if not filepath:
             return
-        try:
+
+        # Build a tiny pseudo-run so _consume_mystran_bundle can do its
+        # status-bar update with a sensible label.
+        from node_runner.solve import MystranRun
+        pseudo_run = MystranRun(
+            bdf_path=Path(filepath),
+            f06_path=None,
+            op2_path=None,
+            sol=101,
+            analysis_set_name="(manual load)",
+        )
+
+        bundle = None
+        load_path_label = ""
+
+        if filepath.lower().endswith('.f06'):
+            # Direct F06 path -- use the MYSTRAN minimal F06 parser.
+            try:
+                from node_runner.solve.mystran_results import (
+                    _load_f06_minimal)
+                bundle = _load_f06_minimal(filepath)
+                pseudo_run.f06_path = Path(filepath)
+                pseudo_run.results_source = "f06"
+                load_path_label = "F06"
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error",
+                    f"Failed to parse F06: {e}")
+                return
+        else:
+            # OP2 first via pyNastran's load_op2_results.
             from node_runner.model import load_op2_results
-            self.op2_results = load_op2_results(filepath)
-            self.results_widget.setVisible(True)
-            self._populate_results_combos()
-            # Theme B: surface the result browser dock and seed it with this OP2.
-            self._populate_result_browser()
-            self._show_result_panels(True)
-            subcases = sorted(self.op2_results['subcases'].keys())
-            self._update_status(f"Loaded results: {os.path.basename(filepath)} "
-                               f"({len(subcases)} subcases)")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load results: {e}")
+            try:
+                bundle = load_op2_results(filepath)
+                pseudo_run.op2_path = Path(filepath)
+                pseudo_run.results_source = "op2"
+                load_path_label = "OP2"
+            except Exception as exc:
+                # MYSTRAN OP2 fallback: pyNastran 1.4.x raises a
+                # NoneType / write attribute error on MYSTRAN-dialect
+                # OP2s. Look for a sibling .F06 and route to the
+                # F06 parser.
+                try:
+                    from node_runner.profiling import perf_event
+                    perf_event('results_load', 'op2_failed',
+                               err=str(exc)[:160])
+                except Exception:
+                    pass
+                op2_path = Path(filepath)
+                f06_guess = None
+                for ext in (".F06", ".f06"):
+                    cand = op2_path.with_suffix(ext)
+                    if cand.exists():
+                        f06_guess = cand
+                        break
+                if f06_guess is None:
+                    # Last-resort: any .f06 file in the same dir.
+                    try:
+                        siblings = sorted(op2_path.parent.glob("*.f06")) + \
+                                   sorted(op2_path.parent.glob("*.F06"))
+                        if siblings:
+                            f06_guess = siblings[0]
+                    except Exception:
+                        f06_guess = None
+                if f06_guess is None:
+                    QMessageBox.critical(
+                        self, "OP2 read failed",
+                        "pyNastran could not read this OP2 file. If "
+                        "it was produced by MYSTRAN, point Node Runner "
+                        "at the matching .F06 (in the same folder) "
+                        "instead -- the minimal F06 parser handles "
+                        "MYSTRAN's native displacement format.\n\n"
+                        f"Underlying error:\n{exc}")
+                    return
+                # Fall through to F06.
+                try:
+                    from node_runner.solve.mystran_results import (
+                        _load_f06_minimal)
+                    bundle = _load_f06_minimal(str(f06_guess))
+                    pseudo_run.op2_path = Path(filepath)
+                    pseudo_run.f06_path = f06_guess
+                    pseudo_run.results_source = "f06"
+                    load_path_label = (
+                        f"F06 fallback (pyNastran rejected the OP2; "
+                        f"used sibling {f06_guess.name})")
+                except Exception as fexc:
+                    QMessageBox.critical(
+                        self, "Both OP2 and F06 fallback failed",
+                        f"OP2: {exc}\n\nF06 fallback "
+                        f"({f06_guess.name}): {fexc}")
+                    return
+
+        if not bundle or not bundle.get('subcases'):
+            QMessageBox.warning(
+                self, "No data",
+                "The file loaded but contained no displacement / "
+                "eigenvalue tables Node Runner can show.")
+            return
+
+        # Funnel through the same consumer as post-run auto-load so
+        # both the new Results tab AND the legacy Result Browser dock
+        # land populated.
+        self._consume_mystran_bundle(bundle, pseudo_run)
+        subcases = sorted(bundle['subcases'].keys())
+        self._update_status(
+            f"Loaded results: {os.path.basename(filepath)} "
+            f"({len(subcases)} subcase(s), {load_path_label}).")
 
     def _populate_results_combos(self):
         """Populate results sidebar combos from loaded OP2 data."""
