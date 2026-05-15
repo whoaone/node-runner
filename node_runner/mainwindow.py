@@ -971,6 +971,35 @@ class MainWindow(QMainWindow):
         display_scroll.setWidget(display_inner)
         self.sidebar_tabs.addTab(display_scroll, "Display")
 
+        # ─── v5.1.0 item 25: Results sidebar tab ────────────────────
+        from node_runner.dialogs.results_tab import ResultsTab
+        self.results_tab = ResultsTab(self)
+        # Wire its signals into MainWindow handlers (built below).
+        self.results_tab.request_contour.connect(
+            self._on_results_request_contour)
+        self.results_tab.request_vector.connect(
+            self._on_results_request_vector)
+        self.results_tab.request_deform.connect(
+            self._on_results_request_deform)
+        self.results_tab.request_animate.connect(
+            self._on_results_request_animate)
+        self.results_tab.copy_values.connect(self._on_results_copy_values)
+        self.results_tab.color_range_changed.connect(
+            self._on_results_color_range_changed)
+        self.results_tab.levels_changed.connect(
+            self._on_results_levels_changed)
+        self.results_tab.markers_changed.connect(
+            self._on_results_markers_changed)
+        self.results_tab.element_labels_changed.connect(
+            self._on_results_element_labels_changed)
+        self.results_tab.deformation_changed.connect(
+            self._on_results_deformation_changed)
+        self.results_tab.open_animation_dock.connect(
+            self._on_results_open_animation_dock)
+        self.results_tab.open_vector_dock.connect(
+            self._on_results_open_vector_dock)
+        self.sidebar_tabs.addTab(self.results_tab, "Results")
+
         self.plotter = QtInteractor(self)
         self.plotter.set_background('#1e1e2e')
         self.plotter.installEventFilter(self)  # Catch ESC for presentation mode
@@ -1045,6 +1074,17 @@ class MainWindow(QMainWindow):
         # references kept here so they can be GC'd cleanly after a run.
         self._solver_worker = None
         self._solver_dialog = None
+        # v5.1.0 item 25: Results sidebar tab state. Defaults match the
+        # widget defaults so initial behaviour is "auto range, no
+        # markers, no element labels".
+        self._results_user_auto_range = True
+        self._results_user_vmin = 0.0
+        self._results_user_vmax = 1.0
+        self._results_n_levels = 9
+        self._results_show_min_marker = False
+        self._results_show_max_marker = False
+        self._results_show_element_labels = False
+        self._results_element_labels_top_n = 0
 
         # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
         self._selection_overlay = SelectionOverlay(self.plotter)
@@ -2051,36 +2091,109 @@ class MainWindow(QMainWindow):
 
 # --- NEW: Handler for the "Save BDF File..." menu action ---
     def _save_file_dialog(self):
+        """v5.1.0 item 28: a single richer dialog covering path, solver
+        target, field format, scope, and NR-META options. Replaces the
+        two-step v5.0.x flow (QFileDialog -> ExportOptionsDialog)."""
         if not self.current_generator:
             self._update_status("No model to save.", is_error=True)
             return
 
-        filepath, _ = QFileDialog.getSaveFileName(self, "Save Nastran File", "", "Nastran Files (*.bdf *.dat);;All Files (*)")
-        if not filepath:
-            self._update_status("Save cancelled.")
-            return
-
-        # Ask for field format. Pre-select the model's current format
-        # (auto-detected on import or last user choice). Cancelling the
-        # options dialog cancels the save.
-        from node_runner.dialogs import ExportOptionsDialog
+        from node_runner.dialogs import SaveBdfDialog
         from PySide6.QtCore import QSettings
         settings = QSettings("NodeRunner", "NodeRunner")
-        prefilled = self._export_format or settings.value("export/default_format", "short")
-        dlg = ExportOptionsDialog(default_format=prefilled, parent=self)
+        default_format = self._export_format or settings.value(
+            "export/default_format", "short")
+        default_target = settings.value("export/default_target", "generic")
+        default_path = self._loaded_filepath or ""
+
+        # Look up the active analysis set name (if any) for the Scope combo.
+        active_set_name = None
+        try:
+            active_set = (self.analysis_sets or {}).get(
+                self.active_analysis_set_id)
+            if active_set is not None:
+                active_set_name = getattr(active_set, 'name', None)
+        except Exception:
+            active_set_name = None
+
+        group_names = sorted((self.groups or {}).keys())
+
+        dlg = SaveBdfDialog(
+            default_path=default_path,
+            default_format=default_format,
+            default_target=default_target,
+            active_analysis_set_name=active_set_name,
+            group_names=group_names,
+            parent=self,
+        )
         if not dlg.exec():
             self._update_status("Save cancelled.")
             return
-        chosen = dlg.selected_format
-        if dlg.save_as_default:
-            settings.setValue("export/default_format", chosen)
+        opts = dlg.result_payload
+        filepath = opts.get('path')
+        if not filepath:
+            self._update_status("Save cancelled (no path).")
+            return
+
+        chosen_format = opts.get('field_format', 'short')
+        chosen_target = opts.get('target', 'generic')
+        if opts.get('remember'):
+            settings.setValue("export/default_format", chosen_format)
+            settings.setValue("export/default_target", chosen_target)
+
+        # v5.1.0 item 28: build NR-META block if requested.
+        meta_block = ""
+        if opts.get('include_nr_meta'):
+            try:
+                from node_runner import __version__ as _nr_ver
+                from node_runner.nr_meta import dump_meta
+                meta_block = dump_meta(
+                    self.groups,
+                    hidden_groups=self._hidden_groups,
+                    isolate_mode=getattr(self, '_isolate_mode', None),
+                    nr_version=_nr_ver,
+                )
+            except Exception as exc:
+                self._update_status(
+                    f"NR-META build failed (continuing without it): {exc}",
+                    is_error=True)
+                meta_block = ""
+
+        # Scope handling: 'analysis_set' and 'group' require Item 26's
+        # scope helper. v5.1.0 ships full-model scoping first; the
+        # other paths will route to scope.py once Item 26 lands.
+        if opts.get('scope_kind') in ('analysis_set', 'group'):
+            self._update_status(
+                "Scoped export (AnalysisSet / Group) lands in a later "
+                "v5.1.0 pass -- writing full model for now.",
+                is_error=False)
 
         try:
             self._apply_case_control()
-            self.current_generator._write_bdf(filepath, field_format=chosen)
-            self._export_format = chosen
+            self.current_generator._write_bdf(
+                filepath,
+                field_format=chosen_format,
+                target=chosen_target,
+                nr_meta=meta_block,
+                sidecar_nrmeta=opts.get('sidecar_nrmeta', False),
+            )
+            self._export_format = chosen_format
             self._refresh_status_widgets()
-            self._update_status(f"Model saved to {os.path.basename(filepath)} ({chosen} field)")
+            self._update_status(
+                f"Model saved to {os.path.basename(filepath)} "
+                f"({chosen_target} target, {chosen_format} field"
+                f"{', NR-META embedded' if meta_block and not opts.get('sidecar_nrmeta') else ''}"
+                f"{', NR-META sidecar' if meta_block and opts.get('sidecar_nrmeta') else ''}).")
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('save_bdf', 'completed',
+                           target=chosen_target,
+                           field_format=chosen_format,
+                           nr_meta=bool(meta_block),
+                           sidecar=bool(opts.get('sidecar_nrmeta')),
+                           scope_kind=opts.get('scope_kind', 'full'))
+            except Exception:
+                pass
         except Exception as e:
             self._update_status(f"File save failed: {e}", is_error=True)
             QMessageBox.critical(self, "Error", f"Could not save file: {e}")
@@ -2292,6 +2405,9 @@ class MainWindow(QMainWindow):
         the user's QSettings default (if set) wins on save, but for the
         initial export-format display we honor what the file actually was
         so round-tripping is intuitive.
+
+        v5.1.0 item 28: also restores groups + tree state from any
+        ``$ NR-META v1`` block embedded in the deck.
         """
         self._loaded_filepath = filepath
         if detected_format in ("short", "long", "free"):
@@ -2301,6 +2417,91 @@ class MainWindow(QMainWindow):
         # `_hidden_groups` stays empty on a fresh open so the user
         # always sees the full model on load. In-session toggles are
         # still remembered via the plain `self._hidden_groups` set.
+
+        # v5.1.0 item 28: restore Node Runner metadata if present.
+        try:
+            self._restore_nr_meta_from_model()
+        except Exception:
+            pass
+        # Also try a sidecar .nrmeta file if it exists.
+        try:
+            self._restore_nr_meta_from_sidecar(filepath)
+        except Exception:
+            pass
+
+    def _restore_nr_meta_from_model(self):
+        """v5.1.0 item 28: parse any ``$ NR-META`` block the streaming
+        reader stripped off the deck and restore groups + tree state.
+        Idempotent; safe to call multiple times."""
+        if not self.current_generator or not self.current_generator.model:
+            return
+        block = getattr(self.current_generator.model, '_nr_meta_block', '')
+        if not block:
+            return
+        from node_runner.nr_meta import parse_meta
+        meta = parse_meta(block)
+        self._apply_parsed_nr_meta(meta, source='embedded')
+
+    def _restore_nr_meta_from_sidecar(self, filepath):
+        """v5.1.0 item 28: look for a ``<deck>.nrmeta`` sidecar file
+        and merge its contents. The sidecar wins over embedded when
+        both are present -- the assumption being that a user who
+        chose sidecar specifically wanted the metadata externalized.
+        """
+        if not filepath:
+            return
+        import os as _os
+        sidecar = str(filepath) + '.nrmeta'
+        if not _os.path.exists(sidecar):
+            return
+        try:
+            with open(sidecar, 'r', encoding='utf-8',
+                      errors='replace') as fh:
+                text = fh.read()
+        except OSError:
+            return
+        from node_runner.nr_meta import parse_meta
+        meta = parse_meta(text)
+        self._apply_parsed_nr_meta(meta, source='sidecar')
+
+    def _apply_parsed_nr_meta(self, meta, source='embedded'):
+        """Common application path for ParsedMeta from either the
+        embedded block or the sidecar file."""
+        if not meta.has_content:
+            return
+        # Merge groups -- existing groups (built automatically by
+        # _group_by_property etc.) are preserved unless the metadata
+        # explicitly overrides them by name.
+        for name, data in meta.groups.items():
+            self.groups[name] = self._make_group_data(
+                gid=data.get('gid', self._next_gid()),
+                nodes=data.get('nodes'),
+                elements=data.get('elements'),
+                properties=data.get('properties'),
+                materials=data.get('materials'),
+                coords=data.get('coords'),
+            )
+        if meta.hidden_groups:
+            self._hidden_groups = set(meta.hidden_groups)
+        if meta.isolate_mode is not None:
+            self._isolate_mode = meta.isolate_mode
+        try:
+            self._populate_groups_list()
+        except Exception:
+            pass
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('nr_meta', 'restored',
+                       source=source,
+                       n_groups=len(meta.groups),
+                       n_hidden=len(meta.hidden_groups),
+                       version=meta.version or '')
+        except Exception:
+            pass
+        if meta.groups:
+            self._update_status(
+                f"Restored {len(meta.groups)} group(s) from "
+                f"$ NR-META ({source}).")
 
     # --- Phase 1: Settings menu handlers ---
     def _open_export_defaults_dialog(self):
@@ -4259,6 +4460,56 @@ class MainWindow(QMainWindow):
         </div>
 
         <!-- ============================================================ -->
+        <h3>Post-Processing + Scoped Analysis <span class="tag">new in v5.1.0</span></h3>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>
+            v5.1.0 turns the existing pre/solve/post baseline into a
+            full Femap-class workflow:
+        </p>
+        <table>
+        <tr><td><b>Results tab:</b></td>
+            <td>A fifth sidebar tab with a tree of subcases &rarr;
+                output vectors &rarr; components. Right-click for
+                <i>Contour / Vector / Apply as deformed shape /
+                Animate / Copy values to CSV</i>. Controls panel below
+                the tree: Auto/Manual color range, level count
+                (2&ndash;32), Show Min/Max Markers, Show Element Value
+                Labels (with top-N filter), deformed-shape toggle and
+                scale.</td></tr>
+        <tr><td><b>AnalysisSet scope:</b></td>
+            <td>AnalysisSets now carry a <i>solver_target</i> (MYSTRAN /
+                MSC / NX / Generic), a <i>group_target</i>, explicit
+                LOAD / SPC SID white-lists, and a per-set field
+                format. <i>Analysis &rarr; Run Analysis (MYSTRAN)</i>
+                requires an active set so the scope is always
+                explicit. Right-click an AnalysisSet on the sidebar
+                for <i>Run / Export / Set Active / Edit / Duplicate /
+                Delete</i>.</td></tr>
+        <tr><td><b>Scoped exports:</b></td>
+            <td>Exports and MYSTRAN runs build a shallow-copy of the
+                BDF scoped to the active AnalysisSet (group + load +
+                SPC filtering + auto-collected dependencies) so the
+                resulting deck is self-consistent. Source model is
+                never mutated.</td></tr>
+        <tr><td><b>Save BDF redesign:</b></td>
+            <td><i>File &rarr; Save BDF&hellip;</i> is now a single
+                richer dialog: output path, solver target, field
+                format, scope picker, and an embedded
+                <code>$ NR-META v1</code> metadata block (groups + tree
+                state) that survives a MSC/NX/MYSTRAN round-trip as
+                ordinary Nastran comments. Sidecar <code>.nrmeta</code>
+                file available as an opt-in.</td></tr>
+        <tr><td><b>Groups carry dependencies:</b></td>
+            <td>Right-click a group &rarr; <i>Collect Dependencies</i>
+                auto-fills the group's <i>properties / materials /
+                coords</i> from the elements it contains. Required for
+                the new group-scoped exports.</td></tr>
+        </table>
+        </div>
+
+        <!-- ============================================================ -->
         <h3>MYSTRAN Solver Integration <span class="tag">new in v5.0.0</span></h3>
         <!-- ============================================================ -->
 
@@ -5342,7 +5593,12 @@ class MainWindow(QMainWindow):
         """v3.4.0 item 4: auto-create one group per PID. Walks both
         model.elements AND model.rigid_elements (rigids typically have
         no PID and won't end up in any PID group, but the iteration is
-        symmetric for safety)."""
+        symmetric for safety).
+
+        v5.1.0 item 27: also auto-fills `materials` for each group from
+        the property's MID(s). Previously only `properties` was set, so
+        downstream scoping (AnalysisSet group_target -> material
+        carry-along) had to recompute the lookup."""
         if not self.current_generator:
             return
         model = self.current_generator.model
@@ -5360,11 +5616,116 @@ class MainWindow(QMainWindow):
                 elem = all_elements[eid]
                 if hasattr(elem, "nodes"):
                     nids.update(n for n in elem.nodes if n)
+            # v5.1.0 item 27: collect referenced MIDs from this property
+            # (MAT1/MAT8 properties use 'mid' / 'mid1'; PCOMP uses
+            # 'mids' list; rigid-element pseudo-properties use 'mid').
+            mids: set[int] = set()
+            prop = model.properties.get(pid)
+            if prop is not None:
+                for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                    m_id = getattr(prop, attr, None)
+                    if m_id:
+                        mids.add(int(m_id))
+                ply_mids = getattr(prop, 'mids', None)
+                if ply_mids:
+                    for m_id in ply_mids:
+                        if m_id:
+                            mids.add(int(m_id))
             gid = self._next_gid()
             self.groups[f"PID {pid}"] = self._make_group_data(
-                gid, nodes=list(nids), elements=eids, properties=[pid])
+                gid, nodes=list(nids), elements=eids,
+                properties=[pid], materials=sorted(mids))
         self._populate_groups_list()
         self._update_status(f"Created {len(model.properties)} property groups.")
+
+    def _group_collect_dependencies(self, name):
+        """v5.1.0 item 27: walk a group's elements, auto-fill its
+        ``properties`` from the elements' PIDs, ``materials`` from those
+        properties' MIDs, and ``coords`` from element CIDs + node CPs.
+
+        Used by the Groups context menu so the user can build a group
+        of elements and then one-click attach everything needed to
+        export it as a self-contained sub-model.
+        """
+        if not self.current_generator:
+            return
+        if name not in self.groups:
+            return
+        model = self.current_generator.model
+        data = self.groups[name]
+        eids = list(data.get("elements", []))
+        nids = set(data.get("nodes", []))
+
+        all_elements = {**model.elements, **model.rigid_elements}
+        pids: set[int] = set()
+        coord_ids: set[int] = set()
+        for eid in eids:
+            elem = all_elements.get(eid)
+            if elem is None:
+                continue
+            pid = getattr(elem, 'pid', None)
+            if pid:
+                pids.add(int(pid))
+            # CBAR/CBEAM/CTUBE/CROD/etc. may carry a CID via the offt /
+            # cid attribute; CHEXA/CTETRA don't.
+            cid = getattr(elem, 'cid', None)
+            if cid:
+                coord_ids.add(int(cid))
+            # Auto-include the nodes the element references so the
+            # group is self-consistent.
+            for n in (getattr(elem, 'nodes', None) or []):
+                if n:
+                    nids.add(int(n))
+
+        mids: set[int] = set()
+        for pid in pids:
+            prop = model.properties.get(pid)
+            if prop is None:
+                continue
+            for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                m_id = getattr(prop, attr, None)
+                if m_id:
+                    mids.add(int(m_id))
+            ply_mids = getattr(prop, 'mids', None)
+            if ply_mids:
+                for m_id in ply_mids:
+                    if m_id:
+                        mids.add(int(m_id))
+
+        # CP from nodes (the reference coord for each node).
+        for nid in nids:
+            node = (model.nodes or {}).get(nid)
+            cp = getattr(node, 'cp', None) if node is not None else None
+            if cp:
+                coord_ids.add(int(cp))
+
+        before_p = len(data.get("properties", []) or [])
+        before_m = len(data.get("materials", []) or [])
+        before_c = len(data.get("coords", []) or [])
+        data["nodes"] = sorted(nids)
+        data["properties"] = sorted(pids)
+        data["materials"] = sorted(mids)
+        data["coords"] = sorted(coord_ids)
+        added_p = len(data["properties"]) - before_p
+        added_m = len(data["materials"]) - before_m
+        added_c = len(data["coords"]) - before_c
+        self._populate_groups_list()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('groups', 'collect_dependencies',
+                       group=name,
+                       n_props=len(data["properties"]),
+                       n_mats=len(data["materials"]),
+                       n_coords=len(data["coords"]),
+                       added_props=added_p,
+                       added_mats=added_m,
+                       added_coords=added_c)
+        except Exception:
+            pass
+        self._update_status(
+            f"Group '{name}': +{added_p} props, +{added_m} mats, "
+            f"+{added_c} coords (now {len(data['properties'])} props, "
+            f"{len(data['materials'])} mats, {len(data['coords'])} coords).")
 
     def _get_selected_element_ids(self):
         """Return set of currently highlighted/selected element IDs."""
@@ -5389,6 +5750,18 @@ class MainWindow(QMainWindow):
         edit_action = QAction(f"Edit Contents...", self)
         edit_action.triggered.connect(lambda checked=False, i=item: self._edit_group_contents(i))
         menu.addAction(edit_action)
+        # v5.1.0 item 27: one-click "make this group self-contained"
+        # action. Walks the group's elements and auto-fills properties
+        # / materials / coords from their dependencies so the group is
+        # ready to be the target of a scoped AnalysisSet export.
+        collect_deps_action = QAction("Collect Dependencies", self)
+        collect_deps_action.setToolTip(
+            "Walk this group's elements and auto-attach the properties, "
+            "materials, and coord systems they reference. Required for a "
+            "self-contained scoped export.")
+        collect_deps_action.triggered.connect(
+            lambda checked=False, n=name: self._group_collect_dependencies(n))
+        menu.addAction(collect_deps_action)
         list_action = QAction("List Contents", self)
         list_action.triggered.connect(lambda checked=False, n=name: self._list_group_contents(n))
         menu.addAction(list_action)
@@ -14848,7 +15221,7 @@ class MainWindow(QMainWindow):
         model = self.current_generator.model if self.current_generator else None
         dialog = AnalysisSetManagerDialog(
             self.analysis_sets, self.active_analysis_set_id,
-            model=model, parent=self)
+            model=model, groups=self.groups, parent=self)
         if dialog.exec():
             self.analysis_sets, self.active_analysis_set_id = dialog.get_results()
             active = self.analysis_sets.get(self.active_analysis_set_id)
@@ -14940,12 +15313,51 @@ class MainWindow(QMainWindow):
 
     def _run_mystran(self):
         """Analysis -> Run Analysis (MYSTRAN)…: pre-flight -> run-options
-        -> solver progress -> auto-load results."""
+        -> solver progress -> auto-load results.
+
+        v5.1.0 item 26: requires an active AnalysisSet. The set drives
+        what gets exported (scope/group/load/SPC filtering via
+        scope.py) and what shows up in the deck's case-control block.
+        Femap parity -- you can't just "run a model"; you run an
+        analysis set.
+        """
         if not self.current_generator or not self.current_generator.model:
             QMessageBox.warning(
                 self, "Run MYSTRAN",
                 "Open or create a model first.")
             return
+
+        # v5.1.0 item 26: block-with-pointer when no AnalysisSet is
+        # active. The user goes to AnalysisSet Manager to create or
+        # pick one -- we no longer silently run the full model.
+        active_set = (self.analysis_sets or {}).get(
+            self.active_analysis_set_id)
+        if active_set is None:
+            ret = QMessageBox.question(
+                self, "Run requires an active AnalysisSet",
+                "MYSTRAN runs need an active AnalysisSet so the scope "
+                "(group target, load/SPC SIDs, solver target) is "
+                "explicit.\n\nOpen the AnalysisSet Manager now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret == QMessageBox.Yes:
+                self._open_analysis_set_manager()
+                active_set = (self.analysis_sets or {}).get(
+                    self.active_analysis_set_id)
+            if active_set is None:
+                self._update_status(
+                    "MYSTRAN run cancelled -- no active AnalysisSet.")
+                return
+        # Confirm the AnalysisSet's solver target is MYSTRAN.
+        target = getattr(active_set, 'solver_target', 'MYSTRAN')
+        if target != 'MYSTRAN':
+            ret = QMessageBox.question(
+                self, "AnalysisSet target mismatch",
+                f"Active AnalysisSet '{active_set.name}' has "
+                f"solver_target='{target}', not MYSTRAN. Run anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+
         # Verify MYSTRAN binary is configured.
         from node_runner.solve import mystran_settings
         from node_runner.solve.mystran_runner import (
@@ -14970,16 +15382,37 @@ class MainWindow(QMainWindow):
             return
         opts = run_dlg.get_options()
 
-        # Pre-flight (in-memory model — fast).
+        # v5.1.0 item 26: build the scoped model for pre-flight + export.
+        from node_runner.scope import scope_model_to_analysis_set
+        try:
+            scoped_model, scope_report = scope_model_to_analysis_set(
+                self.current_generator.model, active_set,
+                groups=self.groups)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Scoping failed",
+                f"Could not scope model to AnalysisSet '{active_set.name}': "
+                f"{exc}")
+            return
+
+        # Pre-flight (on the scoped model so users see only relevant
+        # blocking issues).
         from node_runner.solve.mystran_preflight import scan_for_mystran
-        report = scan_for_mystran(self.current_generator.model,
-                                  sol=opts.get('sol'))
+        report = scan_for_mystran(scoped_model, sol=opts.get('sol'))
         pf_dlg = MystranPreflightDialog(report, parent=self)
         if pf_dlg.exec() != QDialog.Accepted:
             return
 
-        # Export deck to working dir.
+        # Export deck to working dir. Run-folder name carries the
+        # AnalysisSet name so Analysis History distinguishes sets.
+        safe_setname = ''.join(c if c.isalnum() or c in '-_' else '_'
+                                for c in active_set.name)[:32]
         working_dir = Path(opts['working_dir'])
+        # Replace the trailing timestamp-only folder with one that
+        # also carries the set name.
+        if safe_setname and not working_dir.name.endswith(safe_setname):
+            working_dir = working_dir.with_name(
+                f"{working_dir.name}_{safe_setname}")
         working_dir.mkdir(parents=True, exist_ok=True)
         bdf_stem = Path(self._loaded_filepath).stem if self._loaded_filepath \
             else "untitled"
@@ -14987,8 +15420,11 @@ class MainWindow(QMainWindow):
         try:
             self.current_generator._write_bdf(
                 str(bdf_path),
-                field_format='short',
+                field_format=getattr(
+                    active_set, 'field_format', 'short'),
                 target='mystran',
+                analysis_set=active_set,
+                groups=self.groups,
                 sollib=mystran_settings.get('default_sollib'),
                 quad4typ=mystran_settings.get('default_quad4typ'),
                 wtmass=mystran_settings.get('default_wtmass'),
@@ -14998,6 +15434,15 @@ class MainWindow(QMainWindow):
                 self, "Export failed",
                 f"Could not write MYSTRAN BDF: {exc}")
             return
+
+        # Status line tells the user exactly what got scoped in.
+        self._update_status(
+            f"Running '{active_set.name}': "
+            f"{scope_report.n_elements_kept:,} elements, "
+            f"{scope_report.n_loads_kept} load SID(s), "
+            f"{scope_report.n_spcs_kept} SPC SID(s)"
+            + (f" (group: {scope_report.group_target})"
+               if scope_report.group_target else ""))
 
         # Launch SolverRunWorker.
         from node_runner.solve.mystran_runner import SolverRunWorker
@@ -15017,7 +15462,7 @@ class MainWindow(QMainWindow):
             exe_path=exe,
             output_dir=working_dir,
             sol=opts.get('sol', 101),
-            analysis_set_name=opts.get('analysis_set_name', ''),
+            analysis_set_name=active_set.name,
         )
 
     def _on_mystran_finished(self, run):
@@ -15350,18 +15795,74 @@ class MainWindow(QMainWindow):
 
         if kind == 'analysis_set':
             set_id = data[1]
-            edit_action = menu.addAction(f"Edit Analysis Set {set_id}...")
-            edit_action.triggered.connect(self._open_analysis_set_manager)
+            aset = (self.analysis_sets or {}).get(set_id)
+            target = getattr(aset, 'solver_target', 'MYSTRAN') if aset else 'MYSTRAN'
+            # v5.1.0 item 26e: run + export entries at the top of the
+            # context menu so the user can fire a set without going
+            # through Analysis > Run Analysis (MYSTRAN)...
+            run_label = f"Run with {target}"
+            run_action = menu.addAction(run_label)
+            run_action.setToolTip(
+                "Set this analysis set as active and run MYSTRAN.")
+            run_action.triggered.connect(
+                lambda checked=False, sid=set_id:
+                    self._run_analysis_set_from_tab(sid))
+            if target != 'MYSTRAN':
+                run_action.setEnabled(False)
+                run_action.setToolTip(
+                    f"v5.1.0 only supports MYSTRAN runs. "
+                    f"Change AnalysisSet solver_target to MYSTRAN or "
+                    f"use Export... for an MSC/NX deck.")
+            export_action = menu.addAction("Export…")
+            export_action.setToolTip(
+                "Export this AnalysisSet's scoped deck to disk "
+                "(solver target / field format are inherited from "
+                "the set; override in the Save dialog).")
+            export_action.triggered.connect(
+                lambda checked=False, sid=set_id:
+                    self._export_analysis_set_from_tab(sid))
+            menu.addSeparator()
             active_action = menu.addAction("Set as Active")
             active_action.triggered.connect(
-                lambda checked=False, sid=set_id: self._set_active_analysis_set(sid))
+                lambda checked=False, sid=set_id:
+                    self._set_active_analysis_set(sid))
+            edit_action = menu.addAction(f"Edit Analysis Set {set_id}…")
+            edit_action.triggered.connect(self._open_analysis_set_manager)
             menu.addSeparator()
-            delete_action = menu.addAction(f"Delete Analysis Set {set_id}...")
+            delete_action = menu.addAction(f"Delete Analysis Set {set_id}…")
             delete_action.triggered.connect(
                 lambda checked=False, sid=set_id: self._delete_analysis_set(sid))
 
         if menu.actions():
             menu.exec(self.analysis_tab_tree.viewport().mapToGlobal(pos))
+
+    def _run_analysis_set_from_tab(self, set_id):
+        """v5.1.0 item 26e: right-click 'Run with MYSTRAN' on an
+        AnalysisSet. Sets active + invokes the existing run flow."""
+        if set_id not in (self.analysis_sets or {}):
+            return
+        self._set_active_analysis_set(set_id)
+        self._run_mystran()
+
+    def _export_analysis_set_from_tab(self, set_id):
+        """v5.1.0 item 26e: right-click 'Export…' on an AnalysisSet.
+        Pre-populates the Save BDF dialog with this set's
+        solver_target + field_format and a group-scope-prefilled
+        scope picker.
+        """
+        if set_id not in (self.analysis_sets or {}):
+            return
+        prior_active = self.active_analysis_set_id
+        try:
+            self._set_active_analysis_set(set_id)
+            # Reuse the canonical Save flow; SaveBdfDialog's Scope
+            # combo will list "Active AnalysisSet: <name>" as an option.
+            self._save_file_dialog()
+        finally:
+            # Restore the previously-active set so an Export doesn't
+            # silently switch what Run-with-MYSTRAN targets.
+            if prior_active != set_id:
+                self.active_analysis_set_id = prior_active
 
     def _new_analysis_set_from_tab(self):
         """Create a new analysis set and open the manager."""
@@ -15461,10 +15962,396 @@ class MainWindow(QMainWindow):
             self._populate_mode_combo()
         self._on_results_changed()
 
+    # ─── v5.1.0 item 25: Results sidebar tab handlers ──────────────────
+    #
+    # The ResultsTab widget emits high-level requests (contour, vector,
+    # deform, animate, ...) plus control-panel state changes (color
+    # range, levels, min/max markers, element labels, deformation).
+    # Each handler below translates the request into operations on
+    # the existing v5.0.x results infrastructure -- in particular the
+    # display-side results_subcase_combo / results_type_combo /
+    # results_component_combo, which drive _update_plot_visibility's
+    # results branch via _on_results_changed.
+
+    def _results_tab_select_combos(self, subcase, kind, component):
+        """Drive the existing results combos from a ResultsTab request.
+
+        ``kind`` is one of 'displacement', 'stress', 'spc_forces',
+        'eigenvector'. ``component`` is a string like 'T3' /
+        'von_mises' / 'Mode 2'.
+        """
+        # Map kind to the existing results_type_combo entries.
+        type_map = {
+            'displacement': 'Displacement',
+            'stress':       'Stress',
+            'spc_forces':   'SPC Forces',
+            'eigenvector':  'Eigenvector',
+        }
+        type_label = type_map.get(kind)
+        if type_label is None:
+            return
+        idx = self.results_type_combo.findText(type_label)
+        if idx >= 0:
+            self.results_type_combo.setCurrentIndex(idx)
+        # Subcase combo holds (subcase_id) as currentData.
+        for i in range(self.results_subcase_combo.count()):
+            if self.results_subcase_combo.itemData(i) == int(subcase):
+                self.results_subcase_combo.setCurrentIndex(i)
+                break
+        # For eigenvectors the component label encodes the mode index;
+        # the existing UI shows a separate mode_combo.
+        if kind == 'eigenvector' and component.startswith('Mode '):
+            try:
+                mode_idx = int(component.split()[1]) - 1
+                for i in range(self.results_mode_combo.count()):
+                    if self.results_mode_combo.itemData(i) == mode_idx:
+                        self.results_mode_combo.setCurrentIndex(i)
+                        break
+            except Exception:
+                pass
+        else:
+            idx = self.results_component_combo.findText(component)
+            if idx >= 0:
+                self.results_component_combo.setCurrentIndex(idx)
+
+    def _on_results_request_contour(self, subcase, kind, component):
+        """User clicked Contour on a Results-tab leaf."""
+        if self.color_mode != 'results':
+            try:
+                self._set_coloring_mode('results')
+            except Exception:
+                pass
+        self._results_tab_select_combos(subcase, kind, component)
+        self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'contour_request',
+                       subcase=int(subcase), kind=kind, component=component)
+        except Exception:
+            pass
+
+    def _on_results_request_vector(self, subcase, kind, component):
+        """User clicked 'Vector overlay' on a leaf."""
+        # Forward to the existing VectorOverlayWidget by toggling its
+        # 'disp' / 'reac' checkbox based on the kind.
+        try:
+            widget = getattr(self, '_vector_overlay_widget', None)
+            if widget is not None and hasattr(widget, 'check_disp'):
+                if kind in ('displacement', 'eigenvector'):
+                    widget.check_disp.setChecked(True)
+                if kind == 'spc_forces':
+                    widget.check_reac.setChecked(True)
+        except Exception:
+            pass
+        # Ensure the right subcase/component is selected first.
+        self._results_tab_select_combos(subcase, kind, component)
+        try:
+            self._on_vector_overlay_toggled('disp', True)
+        except Exception:
+            pass
+
+    def _on_results_request_deform(self, subcase, kind, component):
+        """User clicked 'Apply as deformed shape'."""
+        self._results_tab_select_combos(subcase, kind, component)
+        # Set a reasonable default scale if currently zero.
+        try:
+            if not self.deformation_scale_input.text() or float(
+                    self.deformation_scale_input.text()) == 0.0:
+                self.deformation_scale_input.setText("1.0")
+        except Exception:
+            self.deformation_scale_input.setText("1.0")
+        self._on_results_changed()
+
+    def _on_results_request_animate(self, subcase, kind, component):
+        """User clicked 'Animate'."""
+        self._results_tab_select_combos(subcase, kind, component)
+        # Start the existing animation timer via anim_play_btn.
+        if not self.anim_play_btn.isChecked():
+            self.anim_play_btn.setChecked(True)
+
+    def _on_results_copy_values(self, subcase, kind, component):
+        """User clicked 'Copy values to CSV'."""
+        bundle = getattr(self, 'op2_results', None)
+        if not bundle:
+            return
+        sc = bundle.get('subcases', {}).get(int(subcase))
+        if not sc:
+            return
+        lines = ["id,value"]
+        try:
+            if kind == 'displacement':
+                arr = sc.get('displacements') or {}
+                comp_idx = {'T1': 0, 'T2': 1, 'T3': 2,
+                            'R1': 3, 'R2': 4, 'R3': 5}.get(component)
+                for nid, v in sorted(arr.items()):
+                    if comp_idx is not None and comp_idx < len(v):
+                        lines.append(f"{nid},{v[comp_idx]:.6e}")
+                    elif component == 'TMAG' and len(v) >= 3:
+                        mag = (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5
+                        lines.append(f"{nid},{mag:.6e}")
+                    elif component == 'RMAG' and len(v) >= 6:
+                        mag = (v[3]**2 + v[4]**2 + v[5]**2) ** 0.5
+                        lines.append(f"{nid},{mag:.6e}")
+            elif kind == 'stress':
+                arr = sc.get('stresses') or {}
+                for eid, sdict in sorted(arr.items()):
+                    v = sdict.get(component)
+                    if v is not None:
+                        lines.append(f"{eid},{float(v):.6e}")
+        except Exception:
+            pass
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("\n".join(lines))
+        self._update_status(
+            f"Copied {len(lines) - 1} value(s) to clipboard "
+            f"(subcase {subcase} / {kind} / {component}).")
+
+    # --- Control-panel state ---
+
+    def _on_results_color_range_changed(self, auto, vmin, vmax):
+        """User toggled Auto OR entered Manual min/max."""
+        self._results_user_auto_range = bool(auto)
+        self._results_user_vmin = float(vmin)
+        self._results_user_vmax = float(vmax)
+        # Apply to the active scalar-bar actor if one exists.
+        try:
+            if not auto and vmax > vmin:
+                for actor in self.plotter.actors.values():
+                    mapper = getattr(actor, 'mapper', None)
+                    if mapper is None:
+                        continue
+                    try:
+                        mapper.SetScalarRange(vmin, vmax)
+                    except Exception:
+                        continue
+                self.plotter.render()
+        except Exception:
+            pass
+
+    def _on_results_levels_changed(self, n_levels):
+        """User changed the contour level count."""
+        self._results_n_levels = int(n_levels)
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'levels_changed', n=int(n_levels))
+        except Exception:
+            pass
+        # Trigger a redraw so the new level count takes effect.
+        self._on_results_changed()
+
+    def _on_results_markers_changed(self, show_min, show_max):
+        """User toggled Min/Max markers."""
+        self._results_show_min_marker = bool(show_min)
+        self._results_show_max_marker = bool(show_max)
+        self._refresh_results_min_max_markers()
+
+    def _on_results_element_labels_changed(self, show, top_n):
+        """User toggled Show Element Value Labels."""
+        self._results_show_element_labels = bool(show)
+        self._results_element_labels_top_n = int(top_n)
+        self._refresh_results_element_value_labels()
+
+    def _on_results_deformation_changed(self, show, scale):
+        """User toggled Show Deformed Shape."""
+        if show:
+            self.deformation_scale_input.setText(f"{float(scale):.4f}")
+        else:
+            self.deformation_scale_input.setText("0.0")
+        self._on_results_changed()
+
+    def _on_results_open_animation_dock(self):
+        """Show the existing Animation dock."""
+        dock = getattr(self, '_anim_dock', None)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+
+    def _on_results_open_vector_dock(self):
+        """Show the existing VectorOverlay dock."""
+        dock = getattr(self, '_vector_dock', None)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+
+    # --- Actor builders for min/max markers + element value labels ---
+
+    def _refresh_results_min_max_markers(self):
+        """Build (or remove) the min/max marker callouts based on the
+        currently active scalar field."""
+        show_min = getattr(self, '_results_show_min_marker', False)
+        show_max = getattr(self, '_results_show_max_marker', False)
+        # Always remove first so toggling off works.
+        for name in ('result_min_marker', 'result_max_marker'):
+            try:
+                if name in self.plotter.actors:
+                    self.plotter.remove_actor(name)
+            except Exception:
+                pass
+        if not (show_min or show_max):
+            self.plotter.render()
+            return
+        grid = getattr(self, 'current_grid', None)
+        if grid is None:
+            return
+        # Find the active scalar array on the grid (point_data first,
+        # then cell_data).
+        scalars = None
+        is_point = False
+        scalar_name = None
+        try:
+            for name in grid.point_data.keys():
+                if name.lower() in ('eid', 'pid', 'type', 'is_shell',
+                                    'cell_rgb', 'cell_visible',
+                                    'vtkghosttype'):
+                    continue
+                scalars = grid.point_data[name]
+                scalar_name = name
+                is_point = True
+                break
+        except Exception:
+            scalars = None
+        if scalars is None:
+            try:
+                for name in grid.cell_data.keys():
+                    if name.lower() in ('eid', 'pid', 'type', 'is_shell',
+                                        'cell_rgb', 'cell_visible',
+                                        'vtkghosttype'):
+                        continue
+                    scalars = grid.cell_data[name]
+                    scalar_name = name
+                    is_point = False
+                    break
+            except Exception:
+                scalars = None
+        if scalars is None or len(scalars) == 0:
+            return
+        import numpy as _np
+        arr = _np.asarray(scalars)
+        if arr.size == 0:
+            return
+        argmin = int(_np.argmin(arr))
+        argmax = int(_np.argmax(arr))
+        if is_point:
+            pts = _np.asarray(grid.points)
+        else:
+            try:
+                pts = _np.asarray(grid.cell_centers().points)
+            except Exception:
+                return
+        def _add(name, idx):
+            try:
+                p = pts[idx]
+                v = float(arr[idx])
+                self.plotter.add_point_labels(
+                    [p], [f"{name.upper()}: {v:.4g}"],
+                    name=f"result_{name}_marker",
+                    point_color='red' if name == 'max' else 'blue',
+                    point_size=10,
+                    font_size=12,
+                    text_color='white',
+                    shape_color='black',
+                    shape_opacity=0.6,
+                    always_visible=True,
+                    reset_camera=False,
+                )
+                try:
+                    from node_runner.profiling import perf_event
+                    perf_event('results_tab', 'min_max_marker',
+                               which=name, scalar=scalar_name or '',
+                               value=round(v, 6))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if show_min:
+            _add('min', argmin)
+        if show_max:
+            _add('max', argmax)
+        self.plotter.render()
+
+    def _refresh_results_element_value_labels(self):
+        """Build (or remove) the per-element value-label callouts."""
+        show = getattr(self, '_results_show_element_labels', False)
+        top_n = int(getattr(self, '_results_element_labels_top_n', 0))
+        try:
+            if 'result_element_labels' in self.plotter.actors:
+                self.plotter.remove_actor('result_element_labels')
+        except Exception:
+            pass
+        if not show:
+            self.plotter.render()
+            return
+        grid = getattr(self, 'current_grid', None)
+        if grid is None:
+            return
+        import numpy as _np
+        # Use cell_data scalars if any non-housekeeping array exists.
+        scalars = None
+        try:
+            for name in grid.cell_data.keys():
+                if name.lower() in ('eid', 'pid', 'type', 'is_shell',
+                                    'cell_rgb', 'cell_visible',
+                                    'vtkghosttype'):
+                    continue
+                scalars = _np.asarray(grid.cell_data[name])
+                break
+        except Exception:
+            return
+        if scalars is None or scalars.size == 0:
+            return
+        try:
+            centers = _np.asarray(grid.cell_centers().points)
+        except Exception:
+            return
+        if top_n > 0 and top_n < scalars.size:
+            order = _np.argsort(_np.abs(scalars))[-top_n:]
+            pick = order
+        else:
+            pick = _np.arange(scalars.size)
+        try:
+            labels = [f"{float(scalars[i]):.3g}" for i in pick]
+            self.plotter.add_point_labels(
+                centers[pick], labels,
+                name='result_element_labels',
+                font_size=10,
+                point_size=4,
+                text_color='white',
+                shape_opacity=0.0,
+                always_visible=False,
+                reset_camera=False,
+            )
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('results_tab', 'element_value_labels',
+                           n_labels=int(len(pick)), top_n=int(top_n))
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self.plotter.render()
+
     def _on_results_changed(self):
         """Re-render when any results selection changes."""
         if self.color_mode == "results":
             self._update_plot_visibility()
+            # v5.1.0 item 25: refresh tab tree + min/max marker actors
+            # to track the newly-active scalar.
+            try:
+                if hasattr(self, 'results_tab'):
+                    self.results_tab.populate_from_results(
+                        getattr(self, 'op2_results', None),
+                        file_label=(getattr(self, 'op2_results', {})
+                                    .get('filepath', '') or ''))
+            except Exception:
+                pass
+            try:
+                self._refresh_results_min_max_markers()
+            except Exception:
+                pass
+            try:
+                self._refresh_results_element_value_labels()
+            except Exception:
+                pass
 
     def _toggle_animation(self, checked):
         import math

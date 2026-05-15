@@ -1,6 +1,51 @@
-# Node Runner v5.0.0
+# Node Runner v5.1.0
 
 A lightweight **pre + solve + post** environment for Nastran models. Built with Python, PySide6, PyVista, and the open-source MYSTRAN solver.
+
+## Changelog for v5.1.0
+
+Major feature release on top of v5.0.0. Four big bodies of work:
+
+### Results sidebar tab (Femap-killer post-processing)
+- New **Results** tab (5th sidebar tab, alongside Model / Loads / Groups / Analysis / Display) with a tree of subcases → output vectors → components (Displacement / Stress / SPC Forces / Eigenvectors).
+- Right-click a component for **Contour / Vector overlay / Apply as deformed shape / Animate / Copy values to CSV**.
+- Controls panel below the tree:
+  - **Color Range** — Auto (default) or Manual with explicit Min / Max spinboxes. Manual mode clamps the LUT to user-defined bounds.
+  - **Levels** — 2–32 contour bands.
+  - **Show Min Marker / Show Max Marker** — point labels with leader lines pinned to the argmin / argmax location.
+  - **Show Element Value Labels** — text labels at element centers; optional top-N filter to keep the viewport readable.
+  - **Deformed Shape** — show / hide + scale slider.
+  - Link buttons that open the existing Animation and Vector Overlay docks.
+
+### AnalysisSet rework — scoped runs + exports
+- `AnalysisSet` dataclass extended with `solver_target` (MYSTRAN / MSC / NX / generic), `group_target` (None = full model; otherwise a group name), `load_sids` / `spc_sids` white-lists, and per-set `field_format`.
+- New **Scope tab** in the AnalysisSet Manager — pick solver target, field format, geometric scope (full model or a named group), and tick-list of LOAD / SPC SIDs to include.
+- New **`node_runner/scope.py`** helper that builds a shallow-copy of the BDF scoped to the AnalysisSet — auto-collects PIDs from elements, MIDs from properties, coord systems from nodes — so the resulting deck is self-consistent.
+- **Right-click on an AnalysisSet** in the Analysis sidebar tab → **Run with MYSTRAN / Export… / Set Active / Edit / Duplicate / Delete**. The Export… path opens the new Save BDF dialog pre-filled with the set's target and format.
+- **`Analysis → Run Analysis (MYSTRAN)`** now requires an active AnalysisSet (no more silent "run the whole model"). When none exists, a clear dialog points the user at the Manager.
+- Run folder names include the AnalysisSet name so Analysis History distinguishes runs.
+
+### Save BDF = Export v2 + embedded `$ NR-META`
+- `File → Save BDF…` now opens a single richer dialog: output path, solver target (Generic / MSC / NX / MYSTRAN), field format (Short / Long / Free), scope (Full / Active AnalysisSet / specific Group), and Node-Runner-metadata options.
+- New **`$ NR-META v1`** line protocol embeds group definitions and tree state as ordinary Nastran comments (one JSON object per line). MSC / NX / MYSTRAN parse them as no-ops; Node Runner restores them on re-import. Sidecar `.nrmeta` file available as an opt-in.
+- Entity-level color overrides are **not** persisted — the existing PID / type coloring is rebuilt from the deck on every open.
+
+### Groups now carry materials, properties, coords
+- The v3.4.0 `Group` schema (`nodes / elements / properties / materials / coords`) was already in place; v5.1.0 adds the UI to take advantage of it:
+  - New **Collect Dependencies** context-menu action — one click walks the group's elements and auto-attaches the properties / materials / coord systems they reference.
+  - `_group_by_property` now auto-fills materials too (previously only properties).
+
+### Tests
+- 8 new `tests/test_scope.py` cases.
+- 11 new `tests/test_nr_meta.py` cases.
+- **Total: 247 pass + 1 skipped** (the e2e MYSTRAN test gated behind `pytest -m mystran_e2e`).
+
+### Compatibility
+- v5.0.0 saves remain readable. v5.0.0 had no `$ NR-META` block; v5.1.0 reads decks without one normally and starts adding the block on save.
+
+---
+
+
 
 ## Running
 

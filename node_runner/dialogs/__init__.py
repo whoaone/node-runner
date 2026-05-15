@@ -36,7 +36,7 @@ from node_runner.dialogs.geometry import (
     CreateGeometrySurfaceDialog, MeshCurveDialog, MeshSurfaceDialog,
 )
 from node_runner.dialogs.export import (
-    ExportOptionsDialog, ExportDefaultsDialog, UnitsDialog,
+    ExportOptionsDialog, ExportDefaultsDialog, UnitsDialog, SaveBdfDialog,
 )
 from node_runner.dialogs.command_palette import (
     CommandPaletteDialog, install_command_palette_shortcut,

@@ -202,6 +202,52 @@ def _convert_bdf_to_free(path):
         fh.writelines(out)
 
 
+def _inject_or_sidecar_nr_meta(output_path, meta_block_text,
+                               sidecar_nrmeta=False):
+    """v5.1.0 item 28: inject a pre-built ``$ NR-META`` block into a
+    BDF, or write it to a sidecar ``.nrmeta`` file.
+
+    When inlined: inserts the block immediately before the first
+    ENDDATA line (case-insensitive) so it lives in bulk data and is
+    easy to spot near the top. If no ENDDATA is found, appends to
+    end of file.
+
+    When sidecar: writes ``<bdf_path>.nrmeta`` next to the BDF; the
+    BDF itself is untouched.
+    """
+    if not meta_block_text:
+        return
+    import os as _os
+    import re as _re
+    if sidecar_nrmeta:
+        sidecar = str(output_path) + '.nrmeta'
+        try:
+            with open(sidecar, 'w', encoding='utf-8') as fh:
+                fh.write(meta_block_text)
+        except OSError:
+            pass
+        return
+    # Inline path: read the just-written BDF, insert the block before
+    # ENDDATA, write back.
+    try:
+        with open(output_path, 'r', encoding='utf-8',
+                  errors='replace') as fh:
+            body = fh.read()
+        m = _re.search(r'(?im)^\s*ENDDATA\b.*?$', body)
+        if m:
+            insert_at = m.start()
+            new_body = (
+                body[:insert_at] + meta_block_text + body[insert_at:]
+            )
+        else:
+            tail = '' if body.endswith('\n') else '\n'
+            new_body = body + tail + meta_block_text
+        with open(output_path, 'w', encoding='utf-8') as fh:
+            fh.write(new_body)
+    except OSError:
+        pass
+
+
 def detect_bdf_field_format(filepath):
     """Inspect a BDF file and return one of 'short', 'long', 'free'.
 
@@ -322,7 +368,8 @@ class NastranModelGenerator:
             raise RuntimeError(f"pyNastran failed to parse BDF: {e}")
 
     def _write_bdf(self, output_path, field_format='short', target='generic',
-                   **target_options):
+                   nr_meta=None, sidecar_nrmeta=False,
+                   analysis_set=None, groups=None, **target_options):
         """Write the model as a Nastran BDF in the requested field format.
 
         field_format: 'short' (size=8), 'long' (size=16), or 'free' (comma).
@@ -335,6 +382,13 @@ class NastranModelGenerator:
         cards, inject MYSTRAN-required PARAMs). target_options forwards
         kwargs to the translator: sollib, quad4typ, wtmass, grdpnt.
 
+        nr_meta: optional string holding a pre-built ``$ NR-META v1``
+        block (see :mod:`node_runner.nr_meta`). If provided AND
+        ``sidecar_nrmeta`` is False, the block is injected just before
+        ENDDATA so groups + tree state round-trip. If ``sidecar_nrmeta``
+        is True the block is written to a companion ``.nrmeta`` file
+        next to the BDF instead. v5.1.0 item 28.
+
         v3.2.2: if the model was imported through the streaming reader
         and any analysis-only cards (TEMP, TLOAD, etc.) were stripped
         out before pyNastran saw them, the raw lines are stored on
@@ -344,6 +398,39 @@ class NastranModelGenerator:
         if field_format not in FIELD_FORMATS:
             field_format = 'short'
 
+        # v5.1.0 item 26: scope the in-memory model to the AnalysisSet
+        # before any translator path. The scope helper returns a
+        # shallow copy of the BDF with non-matching entities removed;
+        # the live `self.model` is never mutated.
+        write_model = self.model
+        original_self_model = self.model
+        if analysis_set is not None:
+            try:
+                from node_runner.scope import scope_model_to_analysis_set
+                write_model, _scope_report = scope_model_to_analysis_set(
+                    self.model, analysis_set, groups=groups)
+                # Temporarily swap so the existing write path operates
+                # on the scoped copy.
+                self.model = write_model
+            except Exception:
+                # Fall through to full-model write on any scoping error
+                # rather than silently writing the wrong thing.
+                self.model = original_self_model
+
+        try:
+            self._do_write_bdf_inner(
+                output_path, field_format, target, nr_meta,
+                sidecar_nrmeta, **target_options)
+        finally:
+            # Always restore the live model reference, even if the
+            # inner write raised.
+            self.model = original_self_model
+
+    def _do_write_bdf_inner(self, output_path, field_format='short',
+                            target='generic', nr_meta=None,
+                            sidecar_nrmeta=False, **target_options):
+        """Inner write that operates on ``self.model`` as-is (caller
+        is responsible for scoping)."""
         # v5.0.0 item 14: MYSTRAN target applies a translation layer
         # and writes via the existing pyNastran path internally.
         if target == 'mystran':
@@ -357,7 +444,12 @@ class NastranModelGenerator:
                 wtmass=target_options.get('wtmass'),
                 grdpnt=target_options.get('grdpnt'),
             )
-            # The translator wrote the file already; nothing else to do.
+            # MYSTRAN deck written; NR-META still applies (groups
+            # survive a MYSTRAN export round-trip the same way they
+            # survive a generic one).
+            if nr_meta:
+                _inject_or_sidecar_nr_meta(
+                    output_path, nr_meta, sidecar_nrmeta)
             return
 
         if field_format == 'long':
@@ -366,6 +458,12 @@ class NastranModelGenerator:
             self.model.write_bdf(output_path, size=8, is_double=False)
             if field_format == 'free':
                 _convert_bdf_to_free(output_path)
+
+        # v5.1.0 item 28: inject the NR-META block (or write sidecar)
+        # just before the analysis-only stash so the block sits before
+        # ENDDATA and is easy to find at the top of the bulk data.
+        if nr_meta:
+            _inject_or_sidecar_nr_meta(output_path, nr_meta, sidecar_nrmeta)
 
         # Append the stash of analysis-only cards that the import path
         # stripped before pyNastran saw them. The stash is raw text -
@@ -4381,6 +4479,18 @@ class NastranModelGenerator:
         # and is information-preserving: skipped lines are stashed
         # verbatim and appended to the export so save/save-as round-
         # trips intact.
+        # v5.1.0 item 28: strip any embedded $ NR-META block BEFORE
+        # pyNastran sees the deck. The block survives a MSC/NX/MYSTRAN
+        # round-trip as ordinary comments, but our streaming parser
+        # extracts it so we can restore Node Runner groups + tree
+        # state during _finalize_for_viewer.
+        nr_meta_block = ""
+        try:
+            from node_runner.nr_meta import strip_meta_block
+            text, nr_meta_block = strip_meta_block(text)
+        except Exception:
+            nr_meta_block = ""
+
         from node_runner.skip_cards import strip_analysis_only_cards
         _emit('parse',
               label='Stage 4/6: Stripping analysis-only cards',
@@ -4393,12 +4503,17 @@ class NastranModelGenerator:
             """Stash the analysis-only raw lines + counts onto the
             BDF model. The export path appends _skipped_raw_lines
             before ENDDATA so the round-trip preserves these cards.
+
+            v5.1.0 item 28: also attach any $ NR-META block we
+            stripped above so the MainWindow can restore groups +
+            tree state in _finalize_for_viewer / on_model_loaded.
             """
             if model_obj is None:
                 return
             try:
                 model_obj._skipped_raw_lines = _skipped_raw
                 model_obj._skipped_card_counts = dict(_skip_counts)
+                model_obj._nr_meta_block = nr_meta_block
             except Exception:
                 pass
         if _skip_counts:

@@ -54,6 +54,37 @@ class AnalysisSet:
     # Each: {'id', 'load_sid', 'spc_sid', 'method_sid', 'statsub_id',
     #         'disp', 'stress', 'force', 'strain'}
 
+    # ----- v5.1.0 item 26: scope + solver target -----
+    #
+    # solver_target drives which translator path _write_bdf takes when
+    # this AnalysisSet is the export scope. 'generic' = vanilla
+    # MSC/NX-compatible BDF (no translator); 'MYSTRAN' applies the
+    # v5.0.0 mystran_export translator. 'MSC' / 'NX' are placeholders
+    # for future vendor-specific translators -- v5.1.0 treats them as
+    # 'generic'.
+    solver_target: str = 'MYSTRAN'      # 'MYSTRAN' | 'MSC' | 'NX' | 'generic'
+
+    # group_target: None = full model; otherwise the name of a group
+    # in MainWindow.groups whose nodes/elements/properties/materials/
+    # coords define the scoped sub-deck. Run + export operations on
+    # this AnalysisSet use scope.py to build the sub-model.
+    group_target: str | None = None
+
+    # Explicit white-lists of LOAD / SPC SIDs that this AnalysisSet
+    # exports. Empty lists mean "include every SID present in
+    # model.loads / model.spcs"; non-empty lists drop SIDs not in the
+    # list. Subcases still reference SIDs by integer; if a subcase
+    # references a SID not in these lists, scope.py drops the subcase
+    # rather than emit a broken case-control reference.
+    load_sids: list = field(default_factory=list)
+    spc_sids: list = field(default_factory=list)
+
+    # Per-AnalysisSet default field format. Drives the export pipeline
+    # when the user picks "Run / Export with this AnalysisSet" from
+    # the right-click context menu without going through the Save BDF
+    # dialog. The Save BDF dialog still lets the user override.
+    field_format: str = 'short'         # 'short' | 'long' | 'free'
+
 
 # Preset output request configurations
 OUTPUT_PRESETS = {
@@ -106,7 +137,7 @@ class AnalysisSetManagerDialog(QDialog):
 
     def __init__(self, analysis_sets: dict[int, AnalysisSet],
                  active_set_id: int | None,
-                 model=None, parent=None):
+                 model=None, groups=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Analysis Set Manager")
         self.setMinimumSize(900, 600)
@@ -114,6 +145,11 @@ class AnalysisSetManagerDialog(QDialog):
         self._analysis_sets = {k: self._copy_set(v) for k, v in analysis_sets.items()}
         self._active_set_id = active_set_id
         self._model = model
+        # v5.1.0 item 26b: groups dict from MainWindow (name -> data
+        # with nodes/elements/properties/materials/coords). Drives the
+        # group_target combo on the new Scope tab. None when called
+        # from contexts that don't have a model loaded.
+        self._groups = groups or {}
 
         main_layout = QHBoxLayout(self)
 
@@ -146,6 +182,7 @@ class AnalysisSetManagerDialog(QDialog):
         # --- Right panel: tabs ---
         self.tabs = QTabWidget()
         self._build_general_tab()
+        self._build_scope_tab()        # v5.1.0 item 26b
         self._build_output_tab()
         self._build_eigrl_tab()
         self._build_params_tab()
@@ -184,6 +221,124 @@ class AnalysisSetManagerDialog(QDialog):
         layout.addRow("Solution Type:", self.sol_combo)
 
         self.tabs.addTab(tab, "General")
+
+    def _build_scope_tab(self):
+        """v5.1.0 item 26b: Scope tab.
+
+        Lets the user pick the solver target (MYSTRAN / MSC / NX /
+        Generic), per-set field format, geometric scope (Full model /
+        a specific group), and explicit LOAD / SPC SID white-lists.
+
+        Smart options: when solver_target == 'MYSTRAN', the dialog
+        shows a banner reminding the user that MSC-only PARAMs will be
+        dropped on export.
+        """
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem
+        tab = QWidget()
+        outer = QVBoxLayout(tab)
+        outer.setSpacing(6)
+
+        intro = QLabel(
+            "Configure which solver this AnalysisSet targets and what "
+            "subset of the model gets exported when this set is "
+            "active.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #cdd6f4; font-size: 11px;")
+        outer.addWidget(intro)
+
+        form = QFormLayout()
+
+        self.solver_target_combo = QComboBox()
+        for key, label in (
+                ('MYSTRAN', 'MYSTRAN (open-source)'),
+                ('MSC',     'MSC Nastran'),
+                ('NX',      'Siemens NX Nastran'),
+                ('generic', 'Generic (MSC/NX compatible)')):
+            self.solver_target_combo.addItem(label, key)
+        self.solver_target_combo.currentIndexChanged.connect(
+            self._on_solver_target_changed)
+        form.addRow("Solver target:", self.solver_target_combo)
+
+        self.field_format_combo = QComboBox()
+        for key, label in (('short', 'Short Field (8-character)'),
+                           ('long', 'Long Field (16-character)'),
+                           ('free', 'Free Field (comma-separated)')):
+            self.field_format_combo.addItem(label, key)
+        form.addRow("Field format:", self.field_format_combo)
+
+        self.group_target_combo = QComboBox()
+        self.group_target_combo.addItem("Full Model", None)
+        for gname in sorted(self._groups.keys()):
+            self.group_target_combo.addItem(f"Group: {gname}", gname)
+        self.group_target_combo.setToolTip(
+            "When set to a Group, the export only includes elements "
+            "in that group plus auto-collected property / material / "
+            "coord-system dependencies. 'Full Model' writes everything.")
+        form.addRow("Geometric scope:", self.group_target_combo)
+
+        outer.addLayout(form)
+
+        # MYSTRAN smart banner (visible only when solver_target=MYSTRAN)
+        self._mystran_banner = QLabel(
+            "<b>MYSTRAN mode:</b> MSC-only PARAMs (POST, COUPMASS, "
+            "AUTOSPC, etc.) will be dropped on export. Pre-flight "
+            "blocks aero / nonlinear / contact / optimization decks.")
+        self._mystran_banner.setWordWrap(True)
+        self._mystran_banner.setStyleSheet(
+            "background-color: #f9e2af; color: #1e1e2e; "
+            "padding: 8px; border-radius: 4px;")
+        outer.addWidget(self._mystran_banner)
+
+        # Load + SPC SID pickers
+        loads_box = QGroupBox("Loads to include (empty = all)")
+        loads_lay = QVBoxLayout(loads_box)
+        self.load_sids_list = QListWidget()
+        self.load_sids_list.setSelectionMode(QListWidget.NoSelection)
+        loads_lay.addWidget(self.load_sids_list)
+        outer.addWidget(loads_box, 1)
+
+        spcs_box = QGroupBox("SPC sets to include (empty = all)")
+        spcs_lay = QVBoxLayout(spcs_box)
+        self.spc_sids_list = QListWidget()
+        self.spc_sids_list.setSelectionMode(QListWidget.NoSelection)
+        spcs_lay.addWidget(self.spc_sids_list)
+        outer.addWidget(spcs_box, 1)
+
+        # Populate from the loaded model (these refresh on each set
+        # selection in _populate_scope_tab below).
+        self._populate_scope_sid_pickers()
+
+        self.tabs.addTab(tab, "Scope")
+
+    def _populate_scope_sid_pickers(self):
+        """(Re)populate the LOAD / SPC SID checkable lists from the
+        current model. Called once per set load."""
+        from PySide6.QtWidgets import QListWidgetItem
+        self.load_sids_list.clear()
+        self.spc_sids_list.clear()
+        if not self._model:
+            return
+        for sid in sorted((self._model.loads or {}).keys()):
+            n_cards = len((self._model.loads or {}).get(sid, []))
+            item = QListWidgetItem(f"LOAD SID {sid}  ({n_cards} card(s))")
+            item.setData(QtCore.Qt.UserRole, int(sid))
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            self.load_sids_list.addItem(item)
+        for sid in sorted((self._model.spcs or {}).keys()):
+            n_cards = len((self._model.spcs or {}).get(sid, []))
+            item = QListWidgetItem(f"SPC SID {sid}  ({n_cards} card(s))")
+            item.setData(QtCore.Qt.UserRole, int(sid))
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked)
+            self.spc_sids_list.addItem(item)
+
+    def _on_solver_target_changed(self, _idx):
+        """Toggle the MYSTRAN-mode banner visibility."""
+        if not hasattr(self, '_mystran_banner'):
+            return
+        target = self.solver_target_combo.currentData() or 'MYSTRAN'
+        self._mystran_banner.setVisible(target == 'MYSTRAN')
 
     def _build_output_tab(self):
         tab = QWidget()
@@ -375,6 +530,33 @@ class AnalysisSetManagerDialog(QDialog):
         sol_idx = next((i for i, (v, _) in enumerate(SOL_TYPES) if v == aset.sol_type), 0)
         self.sol_combo.setCurrentIndex(sol_idx)
 
+        # v5.1.0 item 26b: Scope tab
+        target = getattr(aset, 'solver_target', 'MYSTRAN') or 'MYSTRAN'
+        idx = self.solver_target_combo.findData(target)
+        self.solver_target_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._on_solver_target_changed(idx)
+        ff = getattr(aset, 'field_format', 'short') or 'short'
+        idx = self.field_format_combo.findData(ff)
+        self.field_format_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        gt = getattr(aset, 'group_target', None)
+        idx = self.group_target_combo.findData(gt)
+        self.group_target_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        load_keep = set(int(s) for s in (getattr(aset, 'load_sids', []) or []))
+        spc_keep = set(int(s) for s in (getattr(aset, 'spc_sids', []) or []))
+        # Empty list -> "include all" -> every checkbox checked.
+        for i in range(self.load_sids_list.count()):
+            it = self.load_sids_list.item(i)
+            sid = int(it.data(QtCore.Qt.UserRole))
+            it.setCheckState(
+                QtCore.Qt.Checked if (not load_keep or sid in load_keep)
+                else QtCore.Qt.Unchecked)
+        for i in range(self.spc_sids_list.count()):
+            it = self.spc_sids_list.item(i)
+            sid = int(it.data(QtCore.Qt.UserRole))
+            it.setCheckState(
+                QtCore.Qt.Checked if (not spc_keep or sid in spc_keep)
+                else QtCore.Qt.Unchecked)
+
         # Output tab
         for key, combo in self._output_combos.items():
             combo.setCurrentText(aset.output_requests.get(key, 'NONE'))
@@ -440,6 +622,40 @@ class AnalysisSetManagerDialog(QDialog):
         aset = self._analysis_sets[self._current_set_id]
         aset.name = self.name_input.text() or f"Set {aset.id}"
         aset.sol_type = self.sol_combo.currentData()
+
+        # v5.1.0 item 26b: Scope tab fields
+        if hasattr(self, 'solver_target_combo'):
+            aset.solver_target = (
+                self.solver_target_combo.currentData() or 'MYSTRAN')
+        if hasattr(self, 'field_format_combo'):
+            aset.field_format = (
+                self.field_format_combo.currentData() or 'short')
+        if hasattr(self, 'group_target_combo'):
+            aset.group_target = self.group_target_combo.currentData()
+        if hasattr(self, 'load_sids_list'):
+            checked = []
+            unchecked = []
+            for i in range(self.load_sids_list.count()):
+                it = self.load_sids_list.item(i)
+                sid = int(it.data(QtCore.Qt.UserRole))
+                if it.checkState() == QtCore.Qt.Checked:
+                    checked.append(sid)
+                else:
+                    unchecked.append(sid)
+            # Empty list semantically = "include all"; only persist a
+            # non-empty list if the user actually narrowed the set.
+            aset.load_sids = checked if unchecked else []
+        if hasattr(self, 'spc_sids_list'):
+            checked = []
+            unchecked = []
+            for i in range(self.spc_sids_list.count()):
+                it = self.spc_sids_list.item(i)
+                sid = int(it.data(QtCore.Qt.UserRole))
+                if it.checkState() == QtCore.Qt.Checked:
+                    checked.append(sid)
+                else:
+                    unchecked.append(sid)
+            aset.spc_sids = checked if unchecked else []
 
         # Output requests
         for key, combo in self._output_combos.items():
