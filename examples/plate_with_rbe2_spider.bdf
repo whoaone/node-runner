@@ -1,0 +1,79 @@
+$ ----------------------------------------------------------------------
+$ Cantilever plate with a central RBE2 spider -- SOL 101
+$
+$ Demonstrates:
+$   - Mixed CQUAD4 + CTRIA3 mesh (exercises the v5.0.0 shell-bucket
+$     split: shell_q4 + shell_tri3 sub-buckets).
+$   - RBE2 rigid spider distributing tip load to a column of nodes.
+$   - Combined SPC + FORCE on a non-trivial mesh.
+$
+$ Geometry: 10 in x 4 in cantilever plate, t = 0.05 in.
+$ Mesh: mostly CQUAD4 with two CTRIA3 cells at the tip.
+$ Material: Al 6061-T6.
+$ Load: 50 lbf at a spider master node (independent) -> RBE2 transfers
+$       to the column of grids at X = 10 in.
+$ Constraints: SPC1 123456 at the left edge.
+$ ----------------------------------------------------------------------
+SOL 101
+CEND
+TITLE = Cantilever plate with RBE2 spider (mixed quad+tri)
+SUBCASE 1
+  LOAD = 1
+  SPC = 1
+  DISPLACEMENT(PRINT,PLOT) = ALL
+  STRESS(PRINT,PLOT) = ALL
+BEGIN BULK
+$
+$ -------- Material --------
+MAT1           1  9.9+6          .33    .098
+$
+$ -------- Property (shell, t=0.05) --------
+PSHELL         1       1    .05       1               1
+$
+$ -------- Plate nodes: 5 along X, 3 along Y (15 nodes) --------
+GRID           1              0.      0.      0.
+GRID           2             2.5      0.      0.
+GRID           3              5.      0.      0.
+GRID           4             7.5      0.      0.
+GRID           5             10.      0.      0.
+GRID           6              0.      2.      0.
+GRID           7             2.5      2.      0.
+GRID           8              5.      2.      0.
+GRID           9             7.5      2.      0.
+GRID          10             10.      2.      0.
+GRID          11              0.      4.      0.
+GRID          12             2.5      4.      0.
+GRID          13              5.      4.      0.
+GRID          14             7.5      4.      0.
+GRID          15             10.      4.      0.
+$
+$ -------- Spider master node (offset 2 in past tip in +X) --------
+GRID         100             12.      2.      0.
+$
+$ -------- Elements: 8 CQUAD4 + 2 CTRIA3 (mixed mesh) --------
+$ Bottom row of quads (between y=0 and y=2)
+CQUAD4         1       1       1       2       7       6
+CQUAD4         2       1       2       3       8       7
+CQUAD4         3       1       3       4       9       8
+$ Tip column: split last quad into 2 trias to exercise shell_tri3
+CTRIA3         4       1       4       5      10
+CTRIA3         5       1       4      10       9
+$ Top row of quads (between y=2 and y=4)
+CQUAD4         6       1       6       7      12      11
+CQUAD4         7       1       7       8      13      12
+CQUAD4         8       1       8       9      14      13
+$ Top tip column: also trias
+CTRIA3         9       1       9      10      15
+CTRIA3        10       1       9      15      14
+$
+$ -------- RBE2 spider: master = node 100, slaves = tip nodes 5,10,15 -
+$ RBE2,EID,GN,CM,GM1,GM2,GM3
+RBE2          50     100  123456       5      10      15
+$
+$ -------- Constraints (root clamped) --------
+SPC1           1  123456       1       6      11
+$
+$ -------- Load: 50 lbf in -Z at the spider master node --------
+FORCE          1     100       0    -50.      0.      0.      1.
+$
+ENDDATA

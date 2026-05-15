@@ -45,10 +45,18 @@ class TestMainWindow:
         assert re.search(r"v\d+\.", main_window.windowTitle())
 
     def test_status_widgets_exist(self, main_window):
+        # v5.0.0 item 6: _status_format_lbl was removed; the export
+        # format is surfaced inside the Export Defaults dialog instead.
+        # v5.0.0 items 10/17: command-palette hint + MYSTRAN results
+        # segment are now expected on the status bar.
         assert hasattr(main_window, "_status_model_lbl")
         assert hasattr(main_window, "_status_nodes_lbl")
-        assert hasattr(main_window, "_status_format_lbl")
+        assert hasattr(main_window, "_status_elements_lbl")
         assert hasattr(main_window, "_status_units_lbl")
+        assert hasattr(main_window, "_status_results_lbl")
+        assert hasattr(main_window, "_status_palette_hint")
+        # The format-specific label should be gone.
+        assert not hasattr(main_window, "_status_format_lbl")
 
     def test_units_label_blank_by_default(self, main_window):
         # Femap-style: units field hides itself when no hint set
@@ -160,30 +168,38 @@ class TestSettingsAndToolsMenu:
         assert action.isCheckable()
 
     def test_view_cross_section(self, main_window):
+        # v5.0.0 item 2/3: the legacy "View > Cross Section..." was
+        # promoted to a dedicated Clipping Plane submenu with Toggle
+        # Active / Define... / Show Plane Outline. Define... is the
+        # closest analog of the old item.
         action = _find_action_path(
-            main_window.menuBar(), "&View", "Cross Section...",
+            main_window.menuBar(), "&View", "Clipping Plane", "Define…",
         )
-        assert action is not None
+        assert action is not None, (
+            "Expected View > Clipping Plane > Define… "
+            "(see v5.0.0 plan item 3).")
 
 
 # ---------------------------------------------------------------------------
-# Cross-section dock + plane definitions
+# Clipping plane panel + plane definitions (v5.0.0 item 3)
 # ---------------------------------------------------------------------------
 
 class TestCrossSectionDock:
 
     def test_dock_lazy_built_then_toggles(self, main_window, qtbot):
-        # Built lazily on first menu trigger.
-        assert main_window._cross_section_dock is None
+        # v5.0.0 item 3: the legacy CrossSectionDock was replaced by a
+        # floating CrossSectionPanel (non-dock QDialog). The lazy-build
+        # contract is the same, but the attribute is _clipping_panel
+        # now and the show / hide cycle is OK -> Cancel rather than
+        # toggle-on-second-trigger.
+        assert main_window._clipping_panel is None
         main_window.show()
         qtbot.waitExposed(main_window)
-        main_window._open_cross_section_dialog()
-        dock = main_window._cross_section_dock
-        assert dock is not None
-        assert dock.isVisible()
-        # Second call hides it (toggle behavior).
-        main_window._open_cross_section_dialog()
-        assert not dock.isVisible()
+        main_window._show_clipping_define_panel()
+        panel = main_window._clipping_panel
+        assert panel is not None
+        assert panel.isVisible()
+        panel.hide()
 
     def test_plane_definition_axis_resolves(self):
         from node_runner.cross_section import PlaneDefinition, METHOD_AXIS

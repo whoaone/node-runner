@@ -1,6 +1,6 @@
-# Node Runner v4.1.0
+# Node Runner v5.0.0
 
-A lightweight pre-processor for creating, editing, and visualizing Nastran models. Built with Python, PySide6, and PyVista.
+A lightweight **pre + solve + post** environment for Nastran models. Built with Python, PySide6, PyVista, and the open-source MYSTRAN solver.
 
 ## Running
 
@@ -15,17 +15,97 @@ run.bat            (or)
 
 `run.py` works too, as long as you've activated the project venv first.
 
+## Running Analyses with MYSTRAN
+
+v5.0.0 adds a complete pre→solve→post workflow for the solutions [MYSTRAN](https://www.mystran.com/) supports:
+
+- **SOL 1 / 101** — Linear static
+- **SOL 3 / 103** — Normal modes
+- **SOL 5 / 105** — Linear buckling
+
+### Quickstart
+
+1. Download a MYSTRAN binary from the upstream project. Node Runner does **not** bundle it.
+2. **Edit → Preferences… → MYSTRAN** — set the executable path (or click *Detect* to search `PATH` and common install locations).
+3. **First-run validation (recommended):** import [`examples/cantilever_beam.bdf`](examples/cantilever_beam.bdf), hit **Analysis → Run Analysis (MYSTRAN)…** (Ctrl+R). Node 11 tip displacement should land around **T3 = −0.0407 in**, matching the Euler-Bernoulli analytical (−0.0404 in) to within 0.7 %.
+4. For your own work: load your BDF, then **Analysis → Run Analysis (MYSTRAN)…**
+5. Pre-flight scan runs first — flags any cards MYSTRAN can't handle (aero, nonlinear, contact, optimization, etc.). Resolve blocking issues, accept warnings.
+6. Solver runs in a non-blocking dialog with stage tracking pulled from MYSTRAN's stdout (Reading bulk data → Assembling K → Factorizing → Solving → Recovering element results → Writing output).
+7. On finish, results auto-load into the existing Result Browser / Vector Overlay / Animation timeline. Status bar updates to `Results: SOL 1 (F06) | 1 subcase | 11 disp`. Post-run summary dialog surfaces the run folder path and embeds the MYSTRAN `.ERR` file contents for diagnostics.
+
+### Card / PARAM compatibility table
+
+The translator at `node_runner/solve/mystran_export.py` is the single source of truth. Highlights:
+
+- **Pass-through**: `PARAM,WTMASS`, `PARAM,GRDPNT`, `PARAM,EPSIL`, `PCOMP`, `MAT8`
+- **Injected**: `PARAM,SOLLIB` (`SPARSE` or `BANDED` — *not* MSC's `IntMKL`/`LAPACK`), `PARAM,QUAD4TYP` (`MIN4T` or `MIN4`), `PARAM,WTMASS` (from prefs)
+- **Dropped (silent)**: MSC/NX-only PARAMs that have no MYSTRAN equivalent — `POST`, `K6ROT`
+- **Dropped (warn)**: PARAMs that MSC honors but MYSTRAN doesn't — `COUPMASS`, `AUTOSPC`, `BAILOUT`, `MAXRATIO`, `KROT`, `PRGPST`, `SRCOMPS`, `NOCOMPS`
+- **Dropped (blocking — also flagged by pre-flight)**: aero (`CAERO*`, `SPLINE*`, `AESTAT`, `AESURF`, `TRIM`, `FLUTTER`, `MKAERO*`, `GUST`, `AEROS`, `AERO`), nonlinear (`NLPARM`, `NLPCI`), contact (`BCSET`, `BCTABLE`, `BCONTACT`), optimization (`DESVAR`, `DCONSTR`, `DRESP*`, `DVPREL*`, `DVCREL*`, `DVMREL*`, `DOPTPRM`, `DLINK`), and elements MYSTRAN doesn't implement (`CQUADR`, `CTRIAR`, `CWELD`, `CSEAM`)
+- **Not injected (v5.0.0 note)**: `PARAM,EPSIL` — MYSTRAN's syntax is two-field (`PARAM,EPSIL,<eqn_set_id>,<tol>`) and pyNastran's single-value PARAM writer can't reproduce it, so we leave MYSTRAN's default in place. Drop a hand-written `EPSIL` card into your bulk data if you need a custom tolerance.
+
+### Result loading: OP2 binary first, F06 text fallback
+
+When MYSTRAN finishes, Node Runner tries the OP2 binary first via `pyNastran.op2.OP2`. **Important caveat (pyNastran 1.4.x):** that version doesn't yet expose a MYSTRAN-dialect flag, so OP2 parsing of MYSTRAN's output may fail with an internal pyNastran error. Node Runner then falls back to a built-in minimal F06 text parser that handles MYSTRAN's native displacement table (`D I S P L A C E M E N T S`, integer coord-sys column, mixed plain / scientific floats) and the eigenvalue table. v5.0.0 ships the F06 fallback only for displacements + eigenvalues; per-element stress / strain / force tables in F06 are a planned follow-up. Use an OP2-enabled MYSTRAN build + a pyNastran release with MYSTRAN dialect support for full stress contours.
+
+### Analysis history
+
+Every run is logged to `<scratch_root>/runs/<timestamp>_<bdf_stem>/` (default `~/.node_runner/mystran_runs/`). `run_meta.json` carries SOL, wall time, return code, and the AnalysisSet name used. **Analysis → Analysis History…** browses the list; double-click reloads results into the current model.
+
+## Changelog for v5.0.0
+
+Major release: **pre + solve + post completion**. Builds on v4.1.0 with eleven polish items, a 2× scene-build speedup, sub-100 ms PID/MID toggles, and the new MYSTRAN solver integration.
+
+### MYSTRAN solver integration (items 12–18)
+
+- New `node_runner/solve/` package: `mystran_runner.py` (QProcess wrapper + executable discovery + stdout stage classifier), `mystran_export.py` (BDF translator), `mystran_preflight.py` (< 1 s compatibility scan on 2.4M-element decks), `mystran_results.py` (OP2-first / F06-fallback adapter), `mystran_settings.py` (`mystran/*` QSettings prefix).
+- New dialogs: **Run Analysis (MYSTRAN)…**, **Pre-flight Report**, **Solver Progress**, **Analysis History…**.
+- Analysis menu extended with three new entries (Run / Configure / History). New Preferences tab.
+- Status bar gains a *Results* segment that displays SOL number, result source (OP2/F06), subcase count, and displacement count once results load.
+- Hand-crafted F06 fixtures + 25 new tests cover the runner, translator, pre-flight, and minimal F06 parser. End-to-end MYSTRAN run is gated behind `pytest -m mystran_e2e` so CI passes without MYSTRAN installed.
+
+### Sub-100 ms PID/MID toggles (item 11a)
+
+Per-cell `vtkGhostType` array on each `cat_<NTYPE>` pre-built actor. PID and MID checkbox flips now update visibility in-place rather than falling through to the legacy `_rebuild_plot` cycle. `fast_path.pid_toggle wall_s` should land under 100 ms on production decks.
+
+### Shell-bucket split — 2× scene-build speedup (item 11c)
+
+The v5.0.0 diagnostic catchers identified the bottleneck: `compose_shell` was hitting the Python row-by-row fallback because the 'shell' bucket mixed 4-node CQUAD4/CMEMBRAN (2.35M cells) and 3-node CTRIA3 (13k cells) — `max_n=4` and `actual_n=3` on CTRIA3 broke the vectorized path. v5.0.0 partitions shell into `shell_q4` and `shell_tri3`; each sub-bucket is uniform-width and goes through the existing numpy block-stack path. **Expected impact**: `viewer.build_element_arrays` drops from ~24.6 s to ~14 s on a 2.4M-element production deck; `viewer.total` drops from ~39 s to ~28 s.
+
+### v5.0.0 polish items (1–11)
+
+- **Item 1**: Per-element-kind diagnostic timers in `build_element_arrays_vectorized` (already paid for themselves — produced the data that motivated item 11c).
+- **Item 2**: View menu reorganized along Femap conventions (Orientation / Camera / Display Style / Color By / Annotations / Clipping Plane / Tools).
+- **Item 3**: Clipping plane is now a Femap-style floating bottom panel (`CrossSectionPanel`) with snapshot-on-show + Cancel-reverts behavior. Toggle / Define / Show Outline split into three menu items.
+- **Item 4**: Entity Selection default height cut from ~360 px to ~260 px (still drag-resizable).
+- **Item 5**: Import progress dialog uses one denominator everywhere (`1/6 → 6/6`); no more `Stage 2b/4` sub-stages. "Last file read" updates by stage 3 (was stage 4).
+- **Item 6**: `Export: {format}` removed from the status bar; the current default is surfaced inside the Export Defaults dialog instead (green-tinted "Current default:" label).
+- **Item 7**: Materials library file (BDF path) configured in Preferences → Library, persisted via QSettings. Replaces the v4.x auto-search for `materials.bdf` in the install directory.
+- **Item 8**: New Material → **Load…** opens a MMPDS-traceable preset picker (24 metallics + 2 composite UDs). Unit-safety banner confirms US customary (psi / lbm/in³ / 1/°F) before populating MAT1/MAT8 fields. **No unit conversion** — values insert as-is to match the unitless Femap workflow.
+- **Item 9**: Default lighting brighter (fill +0.10, headlight +0.20, shading-on ambient +0.05). New Preferences → Rendering → *Mesh brightness*: Subdued / Normal / Bright.
+- **Item 10**: Bottom-right `Ctrl+P: command palette` hint label. Click to open.
+
+### Diagnostics
+
+`NR_PROFILE=1` produces a structured profile log at `~/.node_runner/profile_<timestamp>.log`. v5.0.0 adds catchers for shell-bucket attribution, MYSTRAN runner / export / preflight / results, PID/MID fast path, clipping plane, lighting brightness, and material library state.
+
+### Tests
+
+**227 tests pass + 1 skipped** (the MYSTRAN end-to-end run). New v5.0.0 tests cover the shell-bucket split, MMPDS picker data shape, clipping panel show/cancel, materials library settings, brightness preference round-trip, and the entire MYSTRAN package.
+
+---
+
 ## Changelog for v4.1.0
 
 Consolidated release of the v4.0.x perf push. Builds on v3.5.0 with
 a complete rework of the visibility hot path, the moment-glyph
 convention, the camera-reset behaviour, the property-coloring
 pipeline, and a per-Nastran-type actor architecture that takes
-category toggles on the MEGA `MEGA-XWFF_04A_DUL_FUC-Entry.dat` deck
+category toggles on a large production deck
 (2.4 M elements / 1,962 load SIDs / 25 INCLUDEs) from ~5 s per
 click to sub-100 ms.
 
-### Premium per-click feel on MEGA
+### Premium per-click feel on a large production deck
 
 | User action | Pre-v4.1.0 | v4.1.0 |
 |---|---|---|
@@ -75,7 +155,7 @@ click to sub-100 ms.
   full `current_grid` is partitioned by `cell_data['type']` and
   one named PyVista actor is added per Nastran type (`cat_CQUAD4`,
   `cat_CBEAM`, `cat_CBUSH`, `cat_CHEXA`, etc.). Category toggles
-  become `actor.SetVisibility(bool)` — sub-100 ms on MEGA.
+  become `actor.SetVisibility(bool)` — sub-100 ms on large production decks.
 - **Fast-path router** in `_handle_tree_item_changed` dispatches
   load_set / constraint_set / Rigid / Masses / Plotels / coord
   toggles to targeted handlers that bypass the full
@@ -107,20 +187,21 @@ click to sub-100 ms.
   changes (different EID set).
 - **Bounded SID-loop iteration.** A maintained
   `self._visible_load_sids` set replaces walking
-  `model.loads.keys()` on every visibility cycle. On MEGA the
-  load_sid_loop drops from 3.7 s to ~40 ms (97× faster).
+  `model.loads.keys()` on every visibility cycle. On a 1,962-SID
+  production deck the load_sid_loop drops from 3.7 s to ~40 ms (97× faster).
 - **Per-SID O(1) fast path.** `load_set` and `constraint_set`
   toggles build / remove glyphs only for the affected SID — no
   full visibility cycle.
 - **Vectorized RBE actor build.** `_create_rbe_actors` runs in
-  ~400 ms on MEGA's 46,782 rigid elements (was ~144 s of the
+  ~400 ms on a deck with 46,782 rigid elements (was ~144 s of the
   legacy 434 s viewer build via Python-level cell iteration).
 - **Parallel BDF parse.** Decks with 4+ INCLUDEs and ≥ 50 MB use
   a `ProcessPoolExecutor` per-INCLUDE parser
   (`node_runner/parallel_parse.py`); falls back to serial on
   smaller decks or any DMIG presence.
 - **Status-bar element count** alongside the node count
-  (`Elements: 2,452,222` next to `Nodes: 2,484,333` on MEGA).
+  (`Elements: 2,452,222` next to `Nodes: 2,484,333` on the largest
+  production deck we test against).
 
 ### Diagnostics
 
@@ -155,9 +236,8 @@ round-trip.
 
 ## Changelog for v3.5.0
 
-Feature release covering four items reported on
-`MEGA-XWFF_04A_DUL_FUC-Entry.dat` (512,203 load entries, 3,911 load
-combinations).
+Feature release covering four items reported on a large production
+deck (512,203 load entries, 3,911 load combinations).
 
 ### Entity selection respects tree visibility (item 1)
 Hiding a category in the Model tree (e.g. unchecking "Plates") now
@@ -206,8 +286,8 @@ All values persist via `QSettings("NodeRunner", "NodeRunner")` and
 are read on app startup so changes survive restart. Restore Defaults
 on the dialog resets every row to its baked-in default.
 
-### MEGA-XWFF deck profile (headless)
-On `MEGA-XWFF_04A_DUL_FUC-Entry.dat` (2.48M nodes, 2.40M elements,
+### Large production deck profile (headless)
+On a large production deck (2.48M nodes, 2.40M elements,
 1,962 load SIDs, 3,912 load combos, 512k load cards, 269k PLOAD4
 face refs):
 
@@ -232,7 +312,7 @@ parallel/streaming parse to bring the parse phase down further.
 
 ## Changelog for v3.4.2
 
-Hotfix for an import hang on decks with thousands of load SIDs (e.g. `FUSE-XWFF_04A_DUL_FUL-Entry.dat` has 1,962 SIDs).
+Hotfix for an import hang on decks with thousands of load SIDs (one production deck we exercised has 1,962 SIDs).
 
 ### Symptom
 Even after v3.4.1's PLOAD4 fix, import would still creep through "Stage 6/6: Building 3D scene -> Building load actors (840/1962 SIDs)..." over minutes.
@@ -257,7 +337,7 @@ Workflows that visualize 1-5 SIDs at a time (the common case) now pay only for t
 
 ## Changelog for v3.4.1
 
-Hotfix for an import hang on decks with hundreds of thousands of PLOAD4 pressure-load faces (e.g. `FUSE-XWFF_04A_DUL_FDC-Boost-2.dat`).
+Hotfix for an import hang on decks with hundreds of thousands of PLOAD4 pressure-load faces (the trigger was a large pressure-load production deck).
 
 ### Symptom
 Import would reach "Stage 6/6: Building 3D scene" and stick on "Building load actors (FORCE/MOMENT/PLOAD4)..." with Windows marking the app "Not Responding" indefinitely.
@@ -280,8 +360,8 @@ Per-SID progress is also emitted into the import dialog so monster decks with ma
 
 ## Changelog for v3.4.0
 
-Feature release covering nine items from end-user testing on
-`Fuse_BFEM_Complete.bdf` (1.28M elements).
+Feature release covering nine items from end-user testing on a
+1.28M-element production deck.
 
 ### Entity selection
 - **Ctrl+V into the bucket** - the EntitySelectionBar now has a
@@ -374,7 +454,7 @@ Feature release covering nine items from end-user testing on
 Hotfix for a v3.3.0 regression on decks with RBE elements.
 
 ### `Invalid array shape. Array 'EID' has length (L) but a length of (3L) was expected`
-Symptom: importing a deck with RBE2/RBE3 elements (e.g. `Fuse_BFEM_Complete.bdf`) failed with the popup above. Pre-v3.3.0, RBE actors were `pickable=False` so this code path didn't exist.
+Symptom: importing a deck with RBE2/RBE3 elements (e.g. a 1.28M-element production deck) failed with the popup above. Pre-v3.3.0, RBE actors were `pickable=False` so this code path didn't exist.
 
 Root cause: `_create_rbe_actors` built the PolyData as `pv.PolyData(np.array(points))` then assigned `.lines = ...`. The first call auto-generates one VERTEX cell per point, so a polydata with 2L endpoints + L lines ends up with 3L cells — and the L-entry `cell_data['EID']` array length didn't match. PyVista's array-shape validator raised, the exception bubbled to the post-parse popup.
 
@@ -385,7 +465,7 @@ Fix: construct PolyData with the lines on the ctor (`pv.PolyData(points, lines=f
 Minor release: real-deck stability fixes, faster model-tree population, picking now works on every element type, and a Femap-style selection bucket.
 
 ### CORD2R safety
-On the user's `FUSE-XWFF_04A_DUL_FDC-Boost-1.dat` deck, import failed with `Post-parse handling failed: Local unit vectors haven't been set. Type='CORD2R' cid=920000 rid=200000`. The deck had a CORD2R whose `rid` referenced a coord that wasn't defined in the bulk (likely in a missing INCLUDE).
+On a user's production deck, import failed with `Post-parse handling failed: Local unit vectors haven't been set. Type='CORD2R' cid=920000 rid=200000`. The deck had a CORD2R whose `rid` referenced a coord that wasn't defined in the bulk (likely in a missing INCLUDE).
 
 `_finalize_for_viewer` is rewritten to topologically sort coords by `rid` dependency (Kahn's algorithm), assign `rid_ref` in parent-first order, and call `cs.setup()` explicitly. Dangling parents fall back to basic (cid=0) instead of leaving `rid_ref = None`, and the fallback is reported on `model._coord_resolution_warnings`. The import-summary status line now mentions `"N coord system(s) with dangling parent - treated as basic"` when this happens.
 
@@ -536,7 +616,7 @@ Patch release. Two fixes; the headline is that **decks dominated by analysis-onl
 
 ### Strip analysis-only cards on import
 
-The user's `Fuse_BFEM_Light.bdf` was 76% TEMP cards (4.6 million of 6.08 million total) — nodal temperature loads for downstream thermal analysis. Node Runner has no UI to render, edit, or otherwise use TEMP cards (or TLOAD, RLOAD, TABLED*, DCONSTR, DRESP, etc.). But v3.2.1 still fed all 4.6M to pyNastran's parser, which is what made the dialog say "Not Responding".
+A thermal-heavy production deck we tested was 76% TEMP cards (4.6 million of 6.08 million total) — nodal temperature loads for downstream thermal analysis. Node Runner has no UI to render, edit, or otherwise use TEMP cards (or TLOAD, RLOAD, TABLED*, DCONSTR, DRESP, etc.). But v3.2.1 still fed all 4.6M to pyNastran's parser, which is what made the dialog say "Not Responding".
 
 v3.2.2 strips a hardcoded set of analysis-only cards from the inlined buffer **before** pyNastran sees them. The raw lines are stashed verbatim and appended back on export, so the round-trip preserves every card. The skip list is intentionally not user-toggleable — a toggle would just be a footgun (flip it off, get a hang, no idea why).
 
@@ -549,7 +629,7 @@ The skip set covers:
 
 The post-import status line reports the count:
 ```
-Opened Fuse_BFEM_Light.bdf - includes 4,419 rigid elements (RBE/RBAR),
+Opened deck - includes 4,419 rigid elements (RBE/RBAR),
   4,638,690 analysis-only cards stashed (TEMP: 4,638,690) - written back on export
 ```
 
@@ -576,7 +656,7 @@ Patch release that fixes three v3.2.0 papercuts.
 - Detail line under the bar no longer repeats the source file (it was duplicating the persistent line). Detail line now carries only the in-flight info: card type, line number, error reason, counter, rate, ETA.
 
 ### Honest card count when there's no BEGIN BULK
-- v3.2.0's `_count_card_starts_in_text` returned 0 if the inlined buffer had no `BEGIN BULK` marker (which happens when a user opens a partial deck like `Fuse_BFEM_Light.bdf` whose entire content is INCLUDE statements). The dialog then read "from 0 cards in ~8k-card chunks", which is wrong and confusing.
+- v3.2.0's `_count_card_starts_in_text` returned 0 if the inlined buffer had no `BEGIN BULK` marker (which happens when a user opens a partial deck whose entire content is INCLUDE statements). The dialog then read "from 0 cards in ~8k-card chunks", which is wrong and confusing.
 - v3.2.1 falls back to counting all bulk-data card-start lines when no `BEGIN BULK` is present, so the dialog shows the real card count instead of zero.
 
 ## Changelog for v3.2.0
@@ -715,7 +795,7 @@ Patch release that fixes the v3.1.1 "stuck at 97%" symptom: when a chunk falls i
 - Default chunk size dropped 20,000 -> 8,000. Worst-case stall on a single bad chunk shrinks from ~60 s lenient to ~25 s, and the bar advances roughly 2.5x more often during a healthy run.
 
 ### Inline-phase status shows file size + tree depth
-- During the inline phase (the first 25% of the bar), status now reads "Reading   Fuse_Base_0.3.3.bdf (12 / 47 files, 92.3 / 184.0 MB)" with two-space indentation per INCLUDE depth so you can see the nesting.
+- During the inline phase (the first 25% of the bar), status now reads "Reading   include_child.bdf (12 / 47 files, 92.3 / 184.0 MB)" with two-space indentation per INCLUDE depth so you can see the nesting.
 
 ## Changelog for v3.1.1
 

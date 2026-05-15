@@ -1,0 +1,94 @@
+$ ----------------------------------------------------------------------
+$ Pinned-pinned column under axial load -- SOL 105 (Linear Buckling)
+$
+$ Geometry: L = 20 in, 0.5 in x 0.5 in square cross section.
+$ Material: Al 6061-T6 (E=9.9e6 psi).
+$ Loads: 100 lbf axial compression at the free end.
+$ Constraints: Pinned-pinned (T1/T2/T3 at root; T2/T3 at tip).
+$
+$ Analytical Euler critical load (pinned-pinned):
+$   P_cr = pi^2 * E * I / L^2
+$   I = b*h^3 / 12 = 0.5 * 0.5^3 / 12 = 0.005208 in^4
+$   P_cr = (pi^2) * 9.9e6 * 0.005208 / 400
+$        = 1271 lbf
+$ Eigenvalue lambda_1 from MYSTRAN should be ~12.71  (since the applied
+$ load is 100 lbf and lambda * P_applied = P_cr).
+$ ----------------------------------------------------------------------
+SOL 105
+CEND
+TITLE = Pinned-pinned column - SOL 105 (Euler buckling)
+SUBCASE 1
+  STATSUB(BUCKLING) = 1
+  SPC = 1
+  LOAD = 10
+  METHOD = 200
+  DISPLACEMENT(PRINT,PLOT) = ALL
+BEGIN BULK
+$
+PARAM,WTMASS,2.588-3
+$
+$ -------- Material --------
+MAT1           1  9.9+6          .33    .098
+$
+$ -------- Property (0.5 in square) --------
+PBARL,1,1,,BAR
+,0.5,0.5
+$
+$ -------- Nodes (21 nodes along X, 1 in spacing) --------
+GRID           1              0.      0.      0.
+GRID           2              1.      0.      0.
+GRID           3              2.      0.      0.
+GRID           4              3.      0.      0.
+GRID           5              4.      0.      0.
+GRID           6              5.      0.      0.
+GRID           7              6.      0.      0.
+GRID           8              7.      0.      0.
+GRID           9              8.      0.      0.
+GRID          10              9.      0.      0.
+GRID          11             10.      0.      0.
+GRID          12             11.      0.      0.
+GRID          13             12.      0.      0.
+GRID          14             13.      0.      0.
+GRID          15             14.      0.      0.
+GRID          16             15.      0.      0.
+GRID          17             16.      0.      0.
+GRID          18             17.      0.      0.
+GRID          19             18.      0.      0.
+GRID          20             19.      0.      0.
+GRID          21             20.      0.      0.
+$
+$ -------- Elements --------
+CBAR           1       1       1       2      0.      1.      0.
+CBAR           2       1       2       3      0.      1.      0.
+CBAR           3       1       3       4      0.      1.      0.
+CBAR           4       1       4       5      0.      1.      0.
+CBAR           5       1       5       6      0.      1.      0.
+CBAR           6       1       6       7      0.      1.      0.
+CBAR           7       1       7       8      0.      1.      0.
+CBAR           8       1       8       9      0.      1.      0.
+CBAR           9       1       9      10      0.      1.      0.
+CBAR          10       1      10      11      0.      1.      0.
+CBAR          11       1      11      12      0.      1.      0.
+CBAR          12       1      12      13      0.      1.      0.
+CBAR          13       1      13      14      0.      1.      0.
+CBAR          14       1      14      15      0.      1.      0.
+CBAR          15       1      15      16      0.      1.      0.
+CBAR          16       1      16      17      0.      1.      0.
+CBAR          17       1      17      18      0.      1.      0.
+CBAR          18       1      18      19      0.      1.      0.
+CBAR          19       1      19      20      0.      1.      0.
+CBAR          20       1      20      21      0.      1.      0.
+$
+$ -------- Constraints: pinned-pinned --------
+$ Root pinned in T1/T2/T3, free in rotation
+SPC1           1     123       1
+$ Tip pinned in T2/T3, free in T1 (so the column can shorten)
+SPC1           1      23      21
+$
+$ -------- Static load: 100 lbf compression at tip --------
+FORCE         10      21       0   -100.      1.      0.      0.
+$
+$ -------- Eigenvalue extraction for buckling --------
+EIGRL        200      0.    100.       3
+$
+ENDDATA

@@ -24,6 +24,15 @@ from PySide6.QtWidgets import (
     QProgressDialog, QApplication,
 )
 
+# v5.0.0 item 5: single source of truth for the import-progress stage
+# denominator. Update here when adding or removing a stage.
+_N_IMPORT_STAGES = 6
+
+
+def _stage(n: int, title: str) -> str:
+    """Format a stage label using the unified denominator."""
+    return f"Stage {n}/{_N_IMPORT_STAGES}: {title}"
+
 
 class BdfReadWorker(QObject):
     """Run NastranModelGenerator's robust read in a background thread.
@@ -380,12 +389,19 @@ class _BdfImportThread(QThread):
             self.progress.emit(record)
 
         try:
+            # v5.0.0 item 5: unified 6-stage numbering. Stages:
+            #   1/6 Detecting field format
+            #   2/6 Scanning INCLUDE statements
+            #   3/6 Reading include files
+            #   4/6 Stripping analysis-only cards
+            #   5/6 Parsing BDF (chunked / strict / lenient + coord resolve)
+            #   6/6 Building 3D scene
             self.progress.emit(ImportProgress(
                 stage='inline',
-                label='Stage 1/5: Detecting field format',
+                label=_stage(1, 'Detecting field format'),
                 source_file=os.path.basename(self._filepath)
                 if self._filepath else '',
-                fraction=0.0,
+                fraction=0.02,
             ))
             detected_format = detect_bdf_field_format(self._filepath)
             has_includes = NastranModelGenerator._file_has_includes(
@@ -394,9 +410,9 @@ class _BdfImportThread(QThread):
             if has_includes:
                 self.progress.emit(ImportProgress(
                     stage='inline',
-                    label='Stage 2/5: Scanning INCLUDE chain',
-                    source_file='Counting files + sizes...',
-                    fraction=0.0,
+                    label=_stage(2, 'Scanning INCLUDE statements'),
+                    source_file='',
+                    fraction=0.05,
                 ))
                 # v4.0.0 (Phase D): for big multi-INCLUDE decks, route to
                 # the per-INCLUDE ProcessPoolExecutor parser. Falls back
@@ -417,11 +433,25 @@ class _BdfImportThread(QThread):
                         NastranModelGenerator._read_bdf_streaming(
                             self._filepath, progress=_bridge))
             else:
+                # No-INCLUDE deck: emit pro-forma stages 2/3/4 so the
+                # dialog doesn't visually jump from 1/6 to 5/6.
+                self.progress.emit(ImportProgress(
+                    stage='inline',
+                    label=_stage(2, 'Scanning INCLUDE statements'),
+                    source_file='',
+                    fraction=0.05,
+                ))
+                self.progress.emit(ImportProgress(
+                    stage='inline',
+                    label=_stage(3, 'Reading include files (none)'),
+                    source_file='',
+                    fraction=0.10,
+                ))
                 self.progress.emit(ImportProgress(
                     stage='parse',
-                    label='Stage 2/5: Parsing BDF',
+                    label=_stage(5, 'Parsing BDF'),
                     source_file='No INCLUDE statements - reading directly',
-                    fraction=0.1,
+                    fraction=0.15,
                 ))
                 model, lenient_result = (
                     NastranModelGenerator._read_bdf_robust(self._filepath))
@@ -435,7 +465,7 @@ class _BdfImportThread(QThread):
                 raise _Cancelled()
             self.progress.emit(ImportProgress(
                 stage='render',
-                label='Stage 5/5: Resolving coordinate references',
+                label=_stage(5, 'Resolving coordinate references'),
                 source_file='Wiring up grid coord systems for the viewer...',
                 fraction=1.0,
             ))

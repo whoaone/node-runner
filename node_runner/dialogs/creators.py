@@ -68,6 +68,13 @@ class CreateMaterialDialog(QDialog):
             import_btn = QPushButton("Import from BDF...")
             import_btn.clicked.connect(self.import_requested.emit)
             btn_row.addWidget(import_btn)
+            # v5.0.0 item 8: built-in MMPDS-traceable preset picker.
+            load_btn = QPushButton("Load…")
+            load_btn.setToolTip(
+                "Load preset values from the built-in MMPDS-traceable "
+                "library (US customary units).")
+            load_btn.clicked.connect(self._open_library_picker)
+            btn_row.addWidget(load_btn)
         btn_row.addStretch()
         ok_btn = QPushButton("OK")
         ok_btn.setDefault(True)
@@ -80,6 +87,60 @@ class CreateMaterialDialog(QDialog):
 
         if existing_material:
             self._populate_from_existing(existing_material)
+
+    # ------------------------------------------------------------------
+    # v5.0.0 item 8: built-in material library
+    # ------------------------------------------------------------------
+    def _open_library_picker(self):
+        from node_runner.dialogs.material_library_picker import (
+            MaterialLibraryPicker)
+        try:
+            from node_runner.profiling import perf_event
+            from node_runner.material_library import MATERIALS_US
+            perf_event('materials', 'picker_open',
+                       n_entries=len(MATERIALS_US))
+        except Exception:
+            pass
+        dlg = MaterialLibraryPicker(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        mat = dlg.selected_material()
+        if not mat:
+            return
+        self._populate_from_library(mat)
+
+    def _populate_from_library(self, mat):
+        """Populate the MAT1 / MAT8 fields from a library dict.
+
+        The dict comes from node_runner.material_library.MATERIALS_US;
+        units are US customary (psi / lbm/in^3 / 1/degF) and we insert
+        the values as-is per the explicit "no conversion" policy.
+        """
+        kind = mat.get("type", "MAT1")
+        # Switch the stacked widget to the matching tab.
+        index_for_type = {"MAT1": 0, "MAT8": 1, "MAT9": 2}.get(kind, 0)
+        self.type_combo.setCurrentIndex(index_for_type)
+        # Title gets the material name (user can edit).
+        self.title_input.setText(str(mat.get("name", "")))
+        if kind == "MAT1":
+            self.mat1_e.setText(f"{mat.get('E', 0.0):.6g}")
+            self.mat1_g.setText(f"{mat.get('G', 0.0):.6g}")
+            self.mat1_nu.setText(f"{mat.get('nu', 0.0):.6g}")
+            self.mat1_rho.setText(f"{mat.get('rho', 0.0):.6g}")
+            self.mat1_a.setText(f"{mat.get('alpha', 0.0):.6g}")
+            self.mat1_tref.setText(f"{mat.get('Tref', 70.0):.6g}")
+            # Damping stays at whatever the user had (no MMPDS value).
+        elif kind == "MAT8":
+            self.mat8_e1.setText(f"{mat.get('E1', 0.0):.6g}")
+            self.mat8_e2.setText(f"{mat.get('E2', 0.0):.6g}")
+            self.mat8_nu12.setText(f"{mat.get('nu12', 0.0):.6g}")
+            self.mat8_g12.setText(f"{mat.get('G12', 0.0):.6g}")
+            self.mat8_g1z.setText(f"{mat.get('G1z', 0.0):.6g}")
+            self.mat8_g2z.setText(f"{mat.get('G2z', 0.0):.6g}")
+            self.mat8_rho.setText(f"{mat.get('rho', 0.0):.6g}")
+            self.mat8_a1.setText(f"{mat.get('a1', 0.0):.6g}")
+            self.mat8_a2.setText(f"{mat.get('a2', 0.0):.6g}")
+            self.mat8_tref.setText(f"{mat.get('Tref', 70.0):.6g}")
 
     def _create_mat_qlineedit(self, default_val="0.0"):
         le = QLineEdit(default_val)

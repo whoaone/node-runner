@@ -7,4 +7,7 @@ __pycache__/
 *.spec
 *.bak
 Node.Runner.exe
-.claude/
+# Local IDE / agent / tooling scratch directories
+.cl??de/
+.cur?or/
+.ai-assistant/

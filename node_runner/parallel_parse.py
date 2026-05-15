@@ -220,8 +220,11 @@ def parse_bdf_parallel(
         except Exception:
             pass
 
+    # v5.0.0 item 5: use the unified Stage 3/6 label so the import
+    # dialog stays consistent across serial / parallel paths.
     _emit('parse',
-          f'Parallel parse: {len(files)} files across {n_workers} workers',
+          f'Stage 3/6: Reading include files (parallel, {len(files)} files, '
+          f'{n_workers} workers)',
           0.05)
 
     work_items = [(f, True) for f in files]
@@ -240,13 +243,14 @@ def parse_bdf_parallel(
                 payloads.append(payload)
                 completed += 1
                 _emit('parse',
-                      f'Parsed {completed}/{len(files)} INCLUDE files',
+                      f'Stage 3/6: Parsed {completed}/{len(files)} '
+                      f'INCLUDE files',
                       0.1 + 0.7 * (completed / len(files)),
                       source=os.path.basename(payload['filepath']))
     except Exception:
         return (None, None)
 
-    _emit('parse', 'Merging worker results...',
+    _emit('parse', 'Stage 5/6: Merging worker results...',
           0.85, source=os.path.basename(filepath))
 
     master = BDF(debug=False)

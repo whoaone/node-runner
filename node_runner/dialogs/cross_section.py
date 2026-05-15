@@ -555,6 +555,268 @@ class CrossSectionDock(QDockWidget):
 
 
 # ---------------------------------------------------------------------------
+# v5.0.0 item 3: Femap-style floating Clipping Plane panel
+# ---------------------------------------------------------------------------
+
+
+class CrossSectionPanel(QDialog):
+    """Floating, modeless Define-Plane panel.
+
+    Mirrors the v4.x ``CrossSectionDock`` layout (same controller,
+    same PlaneDefinition model) but lives as a free-floating QDialog
+    rather than a dock widget. The user opens it from
+    ``View → Clipping Plane → Define…``; positioning defaults to the
+    bottom-center of the parent window. OK persists the new plane
+    definition and hides the panel; Cancel reverts to the snapshot
+    captured on show.
+
+    The actual enable/disable of clipping is driven by the menu's
+    ``Toggle Active`` checkbox - this panel only defines geometry.
+    """
+
+    SETTINGS_KEY = "cross_section/last_definition"
+
+    plane_committed = Signal()
+
+    def __init__(self, controller, main_window, parent=None):
+        super().__init__(parent or main_window)
+        self.setWindowTitle("Clipping Plane - Define")
+        self.setWindowFlags(
+            Qt.Dialog
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowCloseButtonHint
+            | Qt.CustomizeWindowHint
+        )
+        self.setModal(False)
+        self.setMinimumWidth(480)
+
+        self.controller = controller
+        self.main_window = main_window
+        self._definition: Optional[PlaneDefinition] = (
+            controller.definition or PlaneDefinition()
+        )
+        # v5.0.0 item 3: snapshot at show-time so Cancel can revert.
+        self._snapshot_def: Optional[PlaneDefinition] = None
+        self._snapshot_enabled: bool = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        # Active-plane summary + Define/Flip row.
+        summary_box = QGroupBox("Active plane")
+        summary_layout = QVBoxLayout(summary_box)
+        self._summary_label = QLabel(self._definition.summary())
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setStyleSheet("font-weight: 500;")
+        summary_layout.addWidget(self._summary_label)
+
+        btn_row = QHBoxLayout()
+        define_btn = QPushButton("Define Plane…")
+        define_btn.clicked.connect(self._on_define_plane)
+        flip_btn = QPushButton("Flip Normal")
+        flip_btn.clicked.connect(self._on_flip)
+        btn_row.addWidget(define_btn)
+        btn_row.addWidget(flip_btn)
+        summary_layout.addLayout(btn_row)
+        layout.addWidget(summary_box)
+
+        # Position slider + spin.
+        pos_box = QGroupBox("Position along normal")
+        pos_layout = QVBoxLayout(pos_box)
+        slider_row = QHBoxLayout()
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setRange(0, SLIDER_RANGE)
+        self.position_slider.setValue(int(controller.slider_fraction * SLIDER_RANGE))
+        self.position_slider.valueChanged.connect(self._on_slider_changed)
+        slider_row.addWidget(self.position_slider, 1)
+        self.position_value = QDoubleSpinBox()
+        self.position_value.setDecimals(3)
+        self.position_value.setRange(-1e9, 1e9)
+        self.position_value.setSingleStep(0.1)
+        self.position_value.setMinimumWidth(110)
+        self.position_value.editingFinished.connect(self._on_value_edited)
+        slider_row.addWidget(self.position_value)
+        pos_layout.addLayout(slider_row)
+        center_btn = QPushButton("Center plane")
+        center_btn.clicked.connect(self._on_center)
+        pos_layout.addWidget(center_btn, alignment=Qt.AlignRight)
+        layout.addWidget(pos_box)
+
+        info = QLabel(
+            "OK applies the plane and closes this panel. "
+            "Use View → Clipping Plane → Toggle Active to switch the plane "
+            "on or off afterwards."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(info)
+
+        # OK / Cancel row.
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self._ok_btn = QPushButton("OK")
+        self._ok_btn.setDefault(True)
+        self._ok_btn.clicked.connect(self._on_ok)
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        button_row.addWidget(self._ok_btn)
+        button_row.addWidget(self._cancel_btn)
+        layout.addLayout(button_row)
+
+        # Push the initial definition through.
+        self._apply_definition_to_controller()
+        self._apply_slider_to_controller(self.position_slider.value())
+
+    # ----- helpers (mirror the dock) -----
+
+    def _model(self):
+        gen = getattr(self.main_window, "current_generator", None)
+        if gen is None:
+            return None
+        return getattr(gen, "model", None)
+
+    def _model_bounds_along_normal(self):
+        grid = getattr(self.main_window, "current_grid", None)
+        if grid is None or grid.n_points == 0:
+            return -10.0, 10.0
+        b = grid.bounds
+        nx, ny, nz = self.controller.plane.GetNormal()
+        corners = [
+            (b[0], b[2], b[4]), (b[1], b[2], b[4]),
+            (b[0], b[3], b[4]), (b[1], b[3], b[4]),
+            (b[0], b[2], b[5]), (b[1], b[2], b[5]),
+            (b[0], b[3], b[5]), (b[1], b[3], b[5]),
+        ]
+        projs = [cx * nx + cy * ny + cz * nz for cx, cy, cz in corners]
+        return min(projs), max(projs)
+
+    def _apply_definition_to_controller(self):
+        try:
+            self.controller.apply_definition(self._definition, self._model())
+        except PlaneDefinitionError as exc:
+            QMessageBox.warning(self, "Clipping Plane", str(exc))
+            self._definition = PlaneDefinition()
+            self.controller.apply_definition(self._definition, None)
+        self._summary_label.setText(self._definition.summary())
+
+    def _apply_slider_to_controller(self, slider_value):
+        frac = slider_value / float(SLIDER_RANGE)
+        self.controller.set_slider_fraction(frac)
+        lo, hi = self._model_bounds_along_normal()
+        nx, ny, nz = self.controller.plane.GetNormal()
+        if self._definition is not None and self._definition.method in (
+                METHOD_THREE_POINT, METHOD_NORMAL_POINT, METHOD_TWO_NODES):
+            base = self._definition._resolved_origin
+            offset = (frac - 0.5) * (hi - lo)
+            ox, oy, oz = (base[0] + nx * offset,
+                          base[1] + ny * offset,
+                          base[2] + nz * offset)
+            display_value = offset
+        else:
+            dist = lo + frac * (hi - lo)
+            ox, oy, oz = (nx * dist, ny * dist, nz * dist)
+            display_value = dist
+        self.controller.set_origin(ox, oy, oz)
+        self.position_value.blockSignals(True)
+        self.position_value.setValue(display_value)
+        self.position_value.blockSignals(False)
+
+    # ----- handlers -----
+
+    def _on_define_plane(self):
+        dlg = DefinePlaneDialog(self.main_window, current=self._definition,
+                                parent=self)
+        if dlg.exec() == QDialog.Accepted and dlg.result_definition is not None:
+            self._definition = dlg.result_definition
+            self._apply_definition_to_controller()
+            self.position_slider.blockSignals(True)
+            self.position_slider.setValue(SLIDER_RANGE // 2)
+            self.position_slider.blockSignals(False)
+            self._apply_slider_to_controller(self.position_slider.value())
+
+    def _on_flip(self):
+        self.controller.flip()
+
+    def _on_slider_changed(self, value):
+        self._apply_slider_to_controller(value)
+
+    def _on_value_edited(self):
+        lo, hi = self._model_bounds_along_normal()
+        v = self.position_value.value()
+        if self._definition is not None and self._definition.method in (
+                METHOD_THREE_POINT, METHOD_NORMAL_POINT, METHOD_TWO_NODES):
+            span = (hi - lo) if hi > lo else 1.0
+            frac = 0.5 + v / span
+        else:
+            frac = (v - lo) / (hi - lo) if hi > lo else 0.5
+        frac = max(0.0, min(1.0, frac))
+        self.position_slider.blockSignals(True)
+        self.position_slider.setValue(int(frac * SLIDER_RANGE))
+        self.position_slider.blockSignals(False)
+        self._apply_slider_to_controller(self.position_slider.value())
+
+    def _on_center(self):
+        self.position_slider.setValue(SLIDER_RANGE // 2)
+
+    # ----- OK / Cancel / snapshot -----
+
+    def snapshot(self):
+        """Capture the current definition + enable state, so Cancel can
+        revert. Called by MainWindow._show_clipping_define_panel right
+        before .show()."""
+        try:
+            from copy import deepcopy
+            self._snapshot_def = deepcopy(self.controller.definition)
+        except Exception:
+            self._snapshot_def = self.controller.definition
+        self._snapshot_enabled = bool(self.controller.is_enabled)
+
+    def _on_ok(self):
+        # Persist the current definition via QSettings (matching the
+        # v4.x dock behaviour at SETTINGS_KEY) and emit a signal so the
+        # menu's "Toggle Active" can reflect the new state.
+        self._snapshot_def = None
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('clipping', 'define_ok',
+                       enabled=self.controller.is_enabled)
+        except Exception:
+            pass
+        self.plane_committed.emit()
+        self.hide()
+
+    def _on_cancel(self):
+        # Revert to snapshot (definition + enabled state).
+        if self._snapshot_def is not None:
+            try:
+                self.controller.apply_definition(
+                    self._snapshot_def, self._model())
+                self._definition = self._snapshot_def
+                self._summary_label.setText(self._definition.summary())
+            except Exception:
+                pass
+        if self._snapshot_enabled:
+            self.controller.enable()
+        else:
+            self.controller.disable()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('clipping', 'define_cancel', reverted=True)
+        except Exception:
+            pass
+        self._snapshot_def = None
+        self.hide()
+
+    def closeEvent(self, ev):
+        # Window-close-X is treated as Cancel.
+        if self._snapshot_def is not None:
+            self._on_cancel()
+        super().closeEvent(ev)
+
+
+# ---------------------------------------------------------------------------
 # Backwards-compat shim
 # ---------------------------------------------------------------------------
 

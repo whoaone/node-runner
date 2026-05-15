@@ -5,6 +5,7 @@ import math
 import random
 import re
 import time
+from pathlib import Path
 import numpy as np
 import pyvista as pv
 import vtk
@@ -81,6 +82,23 @@ from node_runner.dialogs import (
     CreateGeometryArcDialog, CreateGeometryCircleDialog,
     CreateGeometrySurfaceDialog, MeshCurveDialog, MeshSurfaceDialog,
 )
+
+
+# v5.0.0 item 10: tiny clickable QLabel for status-bar hints. Emits
+# a `clicked` signal on mouse press so we can wire it to an existing
+# action callback (e.g. command palette). Kept inline here so it lives
+# next to the only consumer in `_build_status_widgets`.
+class _ClickableLabel(QLabel):
+    clicked = QtCore.Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(ev)
 
 
 # v4.0.11 (Fix C): module-level Nastran-type ↔ category lookup tables.
@@ -279,7 +297,9 @@ class SelectionOverlay:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Node Runner v4.0.7"); self.setGeometry(100, 100, 1200, 800)
+        from node_runner import __version__ as _nr_version
+        self.setWindowTitle(f"Node Runner v{_nr_version}")
+        self.setGeometry(100, 100, 1200, 800)
         self.is_dark_theme, self.current_generator, self.current_grid = True, None, None
         self.shell_opacity, self.color_mode, self.render_style = 1.0, "property", "surface"
         # Phase 3: smaller default size and theme accent (Catppuccin blue),
@@ -346,8 +366,8 @@ class MainWindow(QMainWindow):
         # scaling + arrays only; per-SID actors are built on demand by
         # _ensure_load_actor_for_sid when the visibility update path
         # actually needs them. Caps import time on decks with hundreds
-        # or thousands of load SIDs (FUSE-XWFF_04A_DUL_FUL-Entry.dat
-        # has 1,962 SIDs).
+        # or thousands of load SIDs (a production deck we exercised had
+        # 1,962 SIDs).
         self._lazy_load_centers = None
         self._lazy_load_normals = None
         self._lazy_load_eid_to_idx = None
@@ -372,6 +392,13 @@ class MainWindow(QMainWindow):
         # PID/MID/isolate/hidden_groups force fall-through to legacy
         # _rebuild_plot via `_using_legacy_mesh`.
         self._category_actors: dict = {}
+        # v5.0.0 item 11a: per-cell visibility via vtkGhostType cell-data
+        # on each `cat_<ntype>` actor's underlying grid. Sub-100 ms PID
+        # and MID toggles flip these bits in-place; the legacy
+        # _rebuild_plot path no longer engages for plain PID/MID filters.
+        self._category_actor_grids: dict = {}
+        self._hidden_pids: set = set()
+        self._hidden_mids: set = set()
         self._category_visible_ntypes: set = set()
         self._using_legacy_mesh: bool = False
 
@@ -1012,6 +1039,12 @@ class MainWindow(QMainWindow):
         # tabifies alongside Results / Animation / Vectors. Build it
         # lazily after the result browser dock so we can tabify.
         self._cross_section_dock = None
+        # v5.0.0 item 3: floating Define-Plane panel replaces the dock.
+        self._clipping_panel = None
+        # v5.0.0 items 17/18: MYSTRAN solver worker + progress dialog
+        # references kept here so they can be GC'd cleanly after a run.
+        self._solver_worker = None
+        self._solver_dialog = None
 
         # Selection overlay (VTK 2D actors for box/circle/polygon feedback)
         self._selection_overlay = SelectionOverlay(self.plotter)
@@ -1638,11 +1671,29 @@ class MainWindow(QMainWindow):
         analysis_menu.addAction(analysis_set_mgr_action)
         analysis_menu.addSeparator()
         sol_menu = analysis_menu.addMenu("Solution Type")
+        try:
+            sol_menu.setToolTipsVisible(True)
+        except Exception:
+            pass
+        from node_runner.solve import mystran_tips as _stips
         sol_none_action = QAction("None (Punch)", self, checkable=True, checked=True)
+        sol_none_action.setToolTip(
+            "<b>None (Punch)</b><br>No SOL number written -- the deck "
+            "exports as a punch fragment. Use only when handing the "
+            "deck to a solver other than MSC / MYSTRAN.")
         sol_101_action = QAction("SOL 101 - Linear Statics", self, checkable=True)
+        sol_101_action.setToolTip(_stips.SOL_101)
         sol_103_action = QAction("SOL 103 - Normal Modes", self, checkable=True)
+        sol_103_action.setToolTip(_stips.SOL_103)
         sol_105_action = QAction("SOL 105 - Buckling", self, checkable=True)
+        sol_105_action.setToolTip(_stips.SOL_105)
         sol_106_action = QAction("SOL 106 - Nonlinear Static", self, checkable=True)
+        sol_106_action.setToolTip(
+            "<b>SOL 106 — Nonlinear Static</b><br>"
+            "Iterative nonlinear (large-deformation, material "
+            "nonlinearity, contact). <b>NOT supported by MYSTRAN.</b> "
+            "Selecting this will cause MYSTRAN pre-flight to block "
+            "the run. Use for MSC / NX export only.")
         sol_group = QActionGroup(self)
         for action in [sol_none_action, sol_101_action, sol_103_action, sol_105_action, sol_106_action]:
             sol_group.addAction(action)
@@ -1663,6 +1714,36 @@ class MainWindow(QMainWindow):
         output_req_action = QAction("Output Requests...", self)
         output_req_action.triggered.connect(self._open_output_requests_dialog)
         analysis_menu.addAction(output_req_action)
+
+        # ─── v5.0.0 items 17 + 18: MYSTRAN solver integration ───
+        analysis_menu.addSeparator()
+        from node_runner.solve import mystran_tips as _mtips
+        run_mystran_action = QAction("Run Analysis (MYSTRAN)…", self)
+        run_mystran_action.setShortcut("Ctrl+R")
+        run_mystran_action.setStatusTip(
+            "Pre-flight + solve via the open-source MYSTRAN binary.")
+        run_mystran_action.setToolTip(_mtips.ANALYSIS_RUN_MENU)
+        run_mystran_action.triggered.connect(self._run_mystran)
+        analysis_menu.addAction(run_mystran_action)
+        configure_mystran_action = QAction("Configure MYSTRAN…", self)
+        configure_mystran_action.setStatusTip(
+            "Open Preferences -> MYSTRAN tab.")
+        configure_mystran_action.setToolTip(_mtips.ANALYSIS_CONFIGURE_MENU)
+        configure_mystran_action.triggered.connect(
+            self._configure_mystran)
+        analysis_menu.addAction(configure_mystran_action)
+        analysis_history_action = QAction("Analysis History…", self)
+        analysis_history_action.setStatusTip(
+            "Browse and reload prior MYSTRAN runs.")
+        analysis_history_action.setToolTip(_mtips.ANALYSIS_HISTORY_MENU)
+        analysis_history_action.triggered.connect(
+            self._open_analysis_history)
+        analysis_menu.addAction(analysis_history_action)
+        # Qt menus suppress tooltips by default; enable them.
+        try:
+            analysis_menu.setToolTipsVisible(True)
+        except Exception:
+            pass
 
         tools_menu = menu_bar.addMenu("&Tools")
         fuselage_gen_action = QAction("Fuselage Generator...", self)
@@ -1754,90 +1835,174 @@ class MainWindow(QMainWindow):
         group_by_prop_action.triggered.connect(self._group_by_property)
         groups_menu.addAction(group_by_prop_action)
 
+        # ─── v5.0.0 item 2: Femap-inspired View menu reorganization ───
         view_menu = menu_bar.addMenu("&View")
 
-        # --- NEW: Add the "Find Entities" tool to the View menu ---
         find_entities_action = QAction("Find Entities...", self)
+        find_entities_action.setShortcut("Ctrl+F")
         find_entities_action.triggered.connect(self._open_find_entity_tool)
         view_menu.addAction(find_entities_action)
         view_menu.addSeparator()
 
-        self.show_origin_action = QAction("Show Origin", self, checkable=True)
-        self.show_origin_action.toggled.connect(self._toggle_origin)
-        view_menu.addAction(self.show_origin_action)
-        # v4.0.1: default OFF (user preference; matches typical FEA preprocessors).
-        self.shading_action = QAction("Shading", self, checkable=True, checked=False)
-        self.shading_action.toggled.connect(self._toggle_shading)
-        view_menu.addAction(self.shading_action)
-        view_menu.addSeparator()
-        views_menu = view_menu.addMenu("Standard Views")
-        view_top = QAction("Top (+Z)", self); view_top.triggered.connect(lambda: self._set_standard_view('top')); views_menu.addAction(view_top)
-        view_bottom = QAction("Bottom (-Z)", self); view_bottom.triggered.connect(lambda: self._set_standard_view('bottom')); views_menu.addAction(view_bottom)
-        view_front = QAction("Front (+X)", self); view_front.triggered.connect(lambda: self._set_standard_view('front')); views_menu.addAction(view_front)
-        view_back = QAction("Back (-X)", self); view_back.triggered.connect(lambda: self._set_standard_view('back')); views_menu.addAction(view_back)
-        view_right = QAction("Right (+Y)", self); view_right.triggered.connect(lambda: self._set_standard_view('right')); views_menu.addAction(view_right)
-        view_left = QAction("Left (-Y)", self); view_left.triggered.connect(lambda: self._set_standard_view('left')); views_menu.addAction(view_left)
-        camera_menu = view_menu.addMenu("Camera")
-        self.perspective_action = QAction("Perspective View", self, checkable=True, checked=True)
-        self.perspective_action.toggled.connect(self._toggle_perspective_view)
-        camera_menu.addAction(self.perspective_action)
-        zoom_menu = view_menu.addMenu("Zoom")
-        zoom_model_action = QAction("Zoom to Model", self)
+        # --- Orientation submenu (was "Zoom" + standalone "Standard Views") ---
+        orientation_menu = view_menu.addMenu("Orientation")
+        views_menu = orientation_menu.addMenu("Standard Views")
+        for label, key in [("Top (+Z)", 'top'), ("Bottom (-Z)", 'bottom'),
+                           ("Front (+X)", 'front'), ("Back (-X)", 'back'),
+                           ("Right (+Y)", 'right'), ("Left (-Y)", 'left')]:
+            act = QAction(label, self)
+            act.triggered.connect(
+                lambda _checked=False, k=key: self._set_standard_view(k))
+            views_menu.addAction(act)
+        orientation_menu.addSeparator()
+        zoom_model_action = QAction("Fit to Model", self)
+        zoom_model_action.setShortcut("Ctrl+0")
         zoom_model_action.triggered.connect(self._zoom_to_model)
-        zoom_menu.addAction(zoom_model_action)
-        zoom_all_action = QAction("Zoom to All", self)
+        orientation_menu.addAction(zoom_model_action)
+        zoom_all_action = QAction("Fit to All", self)
         zoom_all_action.triggered.connect(self._zoom_to_all)
-        zoom_menu.addAction(zoom_all_action)
-        style_menu = view_menu.addMenu("Style")
-        style_group = QActionGroup(self)
-        self.style_wire_action = QAction("Wireframe", self, checkable=True); self.style_wire_action.triggered.connect(lambda: self._set_render_style("wireframe")); style_group.addAction(self.style_wire_action)
-        self.style_surf_action = QAction("Surface with Edges", self, checkable=True, checked=True); self.style_surf_action.triggered.connect(lambda: self._set_render_style("surface")); style_group.addAction(self.style_surf_action)
-        style_menu.addAction(self.style_wire_action); style_menu.addAction(self.style_surf_action)
-        color_menu = view_menu.addMenu("Color By")
-        color_group = QActionGroup(self)
-        color_type = QAction("Element Type", self, checkable=True); color_type.triggered.connect(lambda: self._set_coloring_mode("type")); color_group.addAction(color_type)
-        color_prop = QAction("Property ID", self, checkable=True, checked=True); color_prop.triggered.connect(lambda: self._set_coloring_mode("property")); color_group.addAction(color_prop)
-        color_qual = QAction("Quality", self, checkable=True); color_qual.triggered.connect(lambda: self._set_coloring_mode("quality")); color_group.addAction(color_qual)
-        color_results = QAction("Results", self, checkable=True); color_results.triggered.connect(lambda: self._set_coloring_mode("results")); color_group.addAction(color_results)
-        color_menu.addAction(color_type); color_menu.addAction(color_prop); color_menu.addAction(color_qual); color_menu.addAction(color_results)
-        self.transparent_shells_action = QAction("Transparent Shells", self, checkable=True)
-        self.transparent_shells_action.toggled.connect(self._toggle_shell_transparency)
-        view_menu.addAction(self.transparent_shells_action)
-        self.show_normals_action = QAction("Show Element Normals", self, checkable=True)
-        self.show_normals_action.toggled.connect(self._toggle_element_normals_visibility)
-        view_menu.addAction(self.show_normals_action)
-        self.show_free_edges_action = QAction("Show Free Edges", self, checkable=True)
-        self.show_free_edges_action.toggled.connect(self._toggle_free_edges_visibility)
-        view_menu.addAction(self.show_free_edges_action)
+        orientation_menu.addAction(zoom_all_action)
 
-        # Phase 4.2: ghost mode toggle. When on, hidden groups render as
-        # translucent wireframe overlays instead of vanishing.
-        self.ghost_mode_action = QAction("Ghost Hidden Groups", self, checkable=True)
+        # --- Camera submenu (Perspective / Parallel radio pair) ---
+        camera_menu = view_menu.addMenu("Camera")
+        projection_group = QActionGroup(self)
+        projection_group.setExclusive(True)
+        self.perspective_action = QAction(
+            "Perspective", self, checkable=True, checked=True)
+        self.perspective_action.toggled.connect(self._toggle_perspective_view)
+        projection_group.addAction(self.perspective_action)
+        camera_menu.addAction(self.perspective_action)
+        self.parallel_action = QAction(
+            "Parallel (Orthographic)", self, checkable=True)
+        # QActionGroup(exclusive=True) auto-unchecks perspective when
+        # parallel becomes checked, which fires perspective_action.toggled
+        # (-> _toggle_perspective_view) with False - that flips the
+        # camera to parallel projection. Nothing more needed here.
+        projection_group.addAction(self.parallel_action)
+        camera_menu.addAction(self.parallel_action)
+
+        view_menu.addSeparator()
+
+        # --- Display Style submenu ---
+        style_menu = view_menu.addMenu("Display Style")
+        style_group = QActionGroup(self)
+        self.style_wire_action = QAction("Wireframe", self, checkable=True)
+        self.style_wire_action.triggered.connect(
+            lambda: self._set_render_style("wireframe"))
+        style_group.addAction(self.style_wire_action)
+        self.style_surf_action = QAction(
+            "Surface with Edges", self, checkable=True, checked=True)
+        self.style_surf_action.triggered.connect(
+            lambda: self._set_render_style("surface"))
+        style_group.addAction(self.style_surf_action)
+        style_menu.addAction(self.style_wire_action)
+        style_menu.addAction(self.style_surf_action)
+        style_menu.addSeparator()
+        # v4.0.1: default OFF (user preference; matches typical FEA preprocessors).
+        self.shading_action = QAction(
+            "Shading (Phong)", self, checkable=True, checked=False)
+        self.shading_action.toggled.connect(self._toggle_shading)
+        style_menu.addAction(self.shading_action)
+        self.transparent_shells_action = QAction(
+            "Transparent Shells", self, checkable=True)
+        self.transparent_shells_action.toggled.connect(
+            self._toggle_shell_transparency)
+        style_menu.addAction(self.transparent_shells_action)
+        self.ghost_mode_action = QAction(
+            "Ghost Hidden Groups", self, checkable=True)
         self.ghost_mode_action.setChecked(self._ghost_mode_enabled)
         self.ghost_mode_action.toggled.connect(self._toggle_ghost_mode)
-        view_menu.addAction(self.ghost_mode_action)
+        style_menu.addAction(self.ghost_mode_action)
+
+        # --- Color By submenu ---
+        color_menu = view_menu.addMenu("Color By")
+        color_group = QActionGroup(self)
+        color_type = QAction("Element Type", self, checkable=True)
+        color_type.triggered.connect(lambda: self._set_coloring_mode("type"))
+        color_group.addAction(color_type)
+        color_prop = QAction("Property ID", self, checkable=True, checked=True)
+        color_prop.triggered.connect(
+            lambda: self._set_coloring_mode("property"))
+        color_group.addAction(color_prop)
+        color_qual = QAction("Quality", self, checkable=True)
+        color_qual.triggered.connect(
+            lambda: self._set_coloring_mode("quality"))
+        color_group.addAction(color_qual)
+        color_results = QAction("Results", self, checkable=True)
+        color_results.triggered.connect(
+            lambda: self._set_coloring_mode("results"))
+        color_group.addAction(color_results)
+        for a in (color_type, color_prop, color_qual, color_results):
+            color_menu.addAction(a)
 
         view_menu.addSeparator()
-        display_settings_action = QAction("Display Settings...", self)
-        display_settings_action.triggered.connect(self._open_display_settings)
-        view_menu.addAction(display_settings_action)
-        # Cross-section / clipping plane: lets you "chop" the model and
-        # see internal structure (frames, stringers, stanchions, ribs).
-        cross_section_action = QAction("Cross Section...", self)
-        cross_section_action.setShortcut("Ctrl+Shift+X")
-        cross_section_action.triggered.connect(self._open_cross_section_dialog)
-        view_menu.addAction(cross_section_action)
+
+        # --- Annotations submenu (promoted Show Origin, Show Axes) ---
+        annotations_menu = view_menu.addMenu("Annotations")
+        self.show_origin_action = QAction("Show Origin", self, checkable=True)
+        self.show_origin_action.toggled.connect(self._toggle_origin)
+        annotations_menu.addAction(self.show_origin_action)
+        # v5.0.0 item 2: axes triad toggle promoted from Display Settings.
+        self.show_axes_action = QAction(
+            "Show Axes Triad", self, checkable=True,
+            checked=bool(self._display_settings.get('show_axes', True)))
+        self.show_axes_action.toggled.connect(self._toggle_axes_triad)
+        annotations_menu.addAction(self.show_axes_action)
+        self.show_normals_action = QAction(
+            "Show Element Normals", self, checkable=True)
+        self.show_normals_action.toggled.connect(
+            self._toggle_element_normals_visibility)
+        annotations_menu.addAction(self.show_normals_action)
+        self.show_free_edges_action = QAction(
+            "Show Free Edges", self, checkable=True)
+        self.show_free_edges_action.toggled.connect(
+            self._toggle_free_edges_visibility)
+        annotations_menu.addAction(self.show_free_edges_action)
+
+        view_menu.addSeparator()
+
+        # --- Clipping Plane submenu (v5.0.0 item 3) ---
+        clipping_menu = view_menu.addMenu("Clipping Plane")
+        self.clipping_toggle_action = QAction(
+            "Toggle Active", self, checkable=True, checked=False)
+        self.clipping_toggle_action.setShortcut("Ctrl+Shift+C")
+        self.clipping_toggle_action.triggered.connect(
+            self._toggle_clipping_plane)
+        clipping_menu.addAction(self.clipping_toggle_action)
+        clipping_define_action = QAction("Define…", self)
+        clipping_define_action.setShortcut("Ctrl+Shift+X")
+        clipping_define_action.triggered.connect(
+            self._show_clipping_define_panel)
+        clipping_menu.addAction(clipping_define_action)
+        from PySide6.QtCore import QSettings as _QS
+        _show_outline_default = _QS("NodeRunner", "NodeRunner").value(
+            "cross_section/show_outline", False, type=bool)
+        self.clipping_outline_action = QAction(
+            "Show Plane Outline", self, checkable=True,
+            checked=bool(_show_outline_default))
+        self.clipping_outline_action.toggled.connect(
+            self._toggle_clipping_outline)
+        clipping_menu.addAction(self.clipping_outline_action)
+
+        view_menu.addSeparator()
+
+        # --- Tools submenu ---
+        tools_submenu = view_menu.addMenu("Tools")
         capture_screenshot_action = QAction("Capture Screenshot...", self)
         capture_screenshot_action.triggered.connect(self._capture_screenshot)
-        view_menu.addAction(capture_screenshot_action)
-        self.presentation_action = QAction("Presentation Mode", self, checkable=True)
+        tools_submenu.addAction(capture_screenshot_action)
+        self.presentation_action = QAction(
+            "Presentation Mode", self, checkable=True)
         self.presentation_action.setShortcut("F11")
         self.presentation_action.toggled.connect(self._toggle_presentation_mode)
-        view_menu.addAction(self.presentation_action)
-        view_menu.addSeparator()
+        tools_submenu.addAction(self.presentation_action)
+        tools_submenu.addSeparator()
         edit_colors_action = QAction("Edit Colors...", self)
         edit_colors_action.triggered.connect(self._open_color_manager)
-        view_menu.addAction(edit_colors_action)
+        tools_submenu.addAction(edit_colors_action)
+        display_settings_action = QAction("Display Settings...", self)
+        display_settings_action.triggered.connect(self._open_display_settings)
+        tools_submenu.addAction(display_settings_action)
 
         settings_menu = menu_bar.addMenu("&Settings")
         export_defaults_action = QAction("Export Defaults...", self)
@@ -2033,41 +2198,63 @@ class MainWindow(QMainWindow):
             visit(sub, top_label)
         return registry
 
-    # --- Phase 1: persistent status-bar widgets (model / nodes / export / units) ---
+    # --- Phase 1: persistent status-bar widgets (model / nodes / elements / units / palette hint) ---
     def _build_status_widgets(self):
-        """Add four permanent labels to the status bar.
+        """Add permanent labels to the status bar.
 
         Permanent widgets coexist with transient `showMessage()` calls; Qt
         renders transient messages on the left and permanent widgets on the
+        right. v5.0.0: Export-format label moved into Export Defaults dialog;
+        Ctrl+P command-palette hint added as a clickable label on the far
         right.
         """
         from PySide6.QtWidgets import QLabel, QFrame
         bar = self.statusBar()
         self._status_model_lbl = QLabel("Model: Untitled")
         self._status_nodes_lbl = QLabel("Nodes: 0")
-        # v4.1.0: element count alongside node count.
         self._status_elements_lbl = QLabel("Elements: 0")
-        self._status_format_lbl = QLabel(f"Export: {self._export_format.title()}")
         self._status_units_lbl = QLabel(
             f"Units: {self._units}" if self._units else ""
         )
+        # v5.0.0 items 16/17: results state segment, populated by
+        # _on_mystran_results_loaded / _update_results_status. Empty
+        # string when no results are loaded.
+        self._status_results_lbl = QLabel("")
+        try:
+            from node_runner.solve import mystran_tips as _mtips
+            self._status_results_lbl.setToolTip(_mtips.STATUS_RESULTS)
+        except Exception:
+            pass
         for lbl in (self._status_model_lbl, self._status_nodes_lbl,
-                    self._status_elements_lbl,
-                    self._status_format_lbl, self._status_units_lbl):
+                    self._status_elements_lbl, self._status_units_lbl,
+                    self._status_results_lbl):
             lbl.setStyleSheet("padding: 0 8px;")
         sep1 = QFrame(); sep1.setFrameShape(QFrame.VLine); sep1.setFrameShadow(QFrame.Sunken)
         sep_el = QFrame(); sep_el.setFrameShape(QFrame.VLine); sep_el.setFrameShadow(QFrame.Sunken)
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.VLine); sep2.setFrameShadow(QFrame.Sunken)
-        sep3 = QFrame(); sep3.setFrameShape(QFrame.VLine); sep3.setFrameShadow(QFrame.Sunken)
+        sep_units = QFrame(); sep_units.setFrameShape(QFrame.VLine); sep_units.setFrameShadow(QFrame.Sunken)
+        sep_results = QFrame(); sep_results.setFrameShape(QFrame.VLine); sep_results.setFrameShadow(QFrame.Sunken)
+        sep_hint = QFrame(); sep_hint.setFrameShape(QFrame.VLine); sep_hint.setFrameShadow(QFrame.Sunken)
         bar.addPermanentWidget(self._status_model_lbl)
         bar.addPermanentWidget(sep1)
         bar.addPermanentWidget(self._status_nodes_lbl)
         bar.addPermanentWidget(sep_el)
         bar.addPermanentWidget(self._status_elements_lbl)
-        bar.addPermanentWidget(sep2)
-        bar.addPermanentWidget(self._status_format_lbl)
-        bar.addPermanentWidget(sep3)
+        bar.addPermanentWidget(sep_units)
         bar.addPermanentWidget(self._status_units_lbl)
+        bar.addPermanentWidget(sep_results)
+        bar.addPermanentWidget(self._status_results_lbl)
+
+        # v5.0.0 item 10: Ctrl+P command-palette hint, clickable.
+        self._status_palette_hint = _ClickableLabel("Ctrl+P: command palette")
+        self._status_palette_hint.setStyleSheet(
+            "color: #6c7086; padding: 0 8px; font-size: 11px;"
+        )
+        self._status_palette_hint.setToolTip(
+            "Click to open the command palette (or press Ctrl+P)."
+        )
+        self._status_palette_hint.clicked.connect(self._open_command_palette)
+        bar.addPermanentWidget(sep_hint)
+        bar.addPermanentWidget(self._status_palette_hint)
 
     def _refresh_status_widgets(self):
         """Recompute the four status labels from current state."""
@@ -2094,7 +2281,6 @@ class MainWindow(QMainWindow):
                 element_count = 0
         self._status_nodes_lbl.setText(f"Nodes: {node_count:,}")
         self._status_elements_lbl.setText(f"Elements: {element_count:,}")
-        self._status_format_lbl.setText(f"Export: {self._export_format.title()}")
         self._status_units_lbl.setText(
             f"Units: {self._units}" if self._units else ""
         )
@@ -2565,47 +2751,118 @@ class MainWindow(QMainWindow):
         # Reuse existing animation tick logic
         self._on_animation_tick()
 
-    # --- Cross-section controls ---
-    def _open_cross_section_dialog(self):
-        """View -> Cross Section: toggle the dock visible/hidden.
+    # --- v5.0.0 item 3: Clipping plane (floating Define panel) ---
+    def _ensure_clipping_panel(self):
+        """Lazy-build the floating Define-Plane panel."""
+        if self._clipping_panel is None:
+            from node_runner.dialogs.cross_section import CrossSectionPanel
+            self._clipping_panel = CrossSectionPanel(
+                self._cross_section, self, parent=self)
+            self._clipping_panel.plane_committed.connect(
+                self._sync_clipping_toggle_action)
+        return self._clipping_panel
 
-        The old QDialog covered the model; this version is a QDockWidget
-        tabified next to Results / Animation / Vectors. First call builds
-        the dock; subsequent calls toggle visibility and bring its tab to
-        the front when shown.
+    def _show_clipping_define_panel(self):
+        """View -> Clipping Plane -> Define...: floating panel."""
+        panel = self._ensure_clipping_panel()
+        panel.snapshot()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('clipping', 'define_open',
+                       had_definition=self._cross_section.definition is not None,
+                       was_enabled=self._cross_section.is_enabled)
+        except Exception:
+            pass
+        # Position at bottom-center of the main window so the user knows
+        # where it'll show up (mirrors EntitySelectionBar's positioning).
+        panel.show()
+        panel.adjustSize()
+        try:
+            pg = self.frameGeometry()
+            panel.move(
+                pg.x() + max(0, (pg.width() - panel.sizeHint().width()) // 2),
+                pg.y() + pg.height() - panel.sizeHint().height() - 80,
+            )
+        except Exception:
+            pass
+        panel.raise_()
+        panel.activateWindow()
+
+    def _toggle_clipping_plane(self, checked):
+        """View -> Clipping Plane -> Toggle Active."""
+        controller = self._cross_section
+        if controller.definition is None:
+            # No definition yet -> open the panel so the user can define
+            # one first. Restore the menu checkbox to OFF in the
+            # meantime; it flips on after the user hits OK.
+            self.clipping_toggle_action.blockSignals(True)
+            self.clipping_toggle_action.setChecked(False)
+            self.clipping_toggle_action.blockSignals(False)
+            self._show_clipping_define_panel()
+            return
+        try:
+            if checked:
+                controller.enable()
+            else:
+                controller.disable()
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('clipping', 'toggle',
+                           on=bool(checked),
+                           had_definition=True)
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.warning(self, "Clipping Plane", str(exc))
+
+    def _toggle_clipping_outline(self, checked):
+        """View -> Clipping Plane -> Show Plane Outline."""
+        from PySide6.QtCore import QSettings
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "cross_section/show_outline", bool(checked))
+        try:
+            self._cross_section.set_outline_visible(bool(checked))
+        except Exception:
+            pass
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('clipping', 'outline_toggle', on=bool(checked))
+        except Exception:
+            pass
+
+    def _sync_clipping_toggle_action(self):
+        """Refresh the menu's Toggle Active checkbox after a Define
+        panel OK so its state reflects whether clipping is active.
         """
-        if self._cross_section_dock is None:
-            self._build_cross_section_dock()
-        dock = self._cross_section_dock
-        # isHidden() reflects an explicit hide(), unaffected by whether
-        # the main window is shown yet (matters during tests).
-        if not dock.isHidden():
-            dock.hide()
-        else:
-            dock.show()
-            dock.raise_()
-            dock.activateWindow()
+        try:
+            self.clipping_toggle_action.blockSignals(True)
+            self.clipping_toggle_action.setChecked(
+                bool(self._cross_section.is_enabled))
+        finally:
+            self.clipping_toggle_action.blockSignals(False)
 
-    def _build_cross_section_dock(self):
-        """Create the cross-section dock, tabified with the result docks."""
-        from node_runner.dialogs import CrossSectionDock
-        dock = CrossSectionDock(self._cross_section, self, parent=self)
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
-        # Tabify alongside the other right-side docks if they exist, so
-        # the user gets one column of tabs instead of stacked panels.
-        peers = [
-            getattr(self, "_result_browser_dock", None),
-            getattr(self, "_anim_dock", None),
-            getattr(self, "_vector_dock", None),
-        ]
-        for peer in peers:
-            if peer is not None:
-                try:
-                    self.tabifyDockWidget(peer, dock)
-                    break
-                except Exception:
-                    continue
-        self._cross_section_dock = dock
+    def _toggle_axes_triad(self, checked):
+        """View -> Annotations -> Show Axes Triad.
+
+        v5.0.0 item 2: this toggle was promoted from the Display Settings
+        dialog. We update the live actor immediately AND persist the
+        choice via QSettings so the next viewer rebuild honours it.
+        """
+        from PySide6.QtCore import QSettings
+        self._display_settings['show_axes'] = bool(checked)
+        QSettings("NodeRunner", "NodeRunner").setValue(
+            "display/show_axes", bool(checked))
+        if hasattr(self, 'axes_actor') and self.axes_actor is not None:
+            try:
+                self.axes_actor.SetVisibility(bool(checked))
+                self.plotter.render()
+            except Exception:
+                pass
+
+    # --- legacy: kept so old shortcuts / commands still work if any
+    # external caller references _open_cross_section_dialog by name. ---
+    def _open_cross_section_dialog(self):
+        self._show_clipping_define_panel()
 
     # --- Phase 4 toggles ---
     def _open_convert_units_dialog(self):
@@ -3847,7 +4104,11 @@ class MainWindow(QMainWindow):
         self.plotter.render()
 
     def _show_about_dialog(self):
-        title = "About Node Runner"
+        # v5.0.0 item 21: pull the version tag from __version__ instead
+        # of a hardcoded literal so the dialog never drifts from the
+        # package version again.
+        from node_runner import __version__ as _nr_version
+        title = f"About Node Runner v{_nr_version}"
         text = """
         <style>
             body { font-family: Segoe UI, sans-serif; }
@@ -3909,7 +4170,7 @@ class MainWindow(QMainWindow):
   /  |/ / __ \/ __  / _ \   / /_/ / / / / __ \/ __ \/ _ \/ ___/
  / /|  / /_/ / /_/ /  __/  / _, _/ /_/ / / / / / / /  __/ /
 /_/ |_/\____/\__,_/\___/  /_/ |_|\__,_/_/ /_/_/ /_/\___/_/</pre>
-        <p style="margin-top: 4px;"><span class="tag">v3.2.7</span></p>
+        <p style="margin-top: 4px;"><span class="tag">v__NR_VERSION__</span></p>
         <p class="subtle">Created by Angel Linares<br>Escape Velocity Ventures, LLC</p>
         <hr>
 
@@ -3988,10 +4249,83 @@ class MainWindow(QMainWindow):
                     subcases, output requests, and load/SPC
                     references.</td></tr>
             <tr><td><b>Solver Support:</b></td>
-                <td>Output is compatible with both <b>MSC Nastran</b>
-                    and <b>Siemens NX Nastran</b>. No solver-specific
-                    extensions are used.</td></tr>
+                <td>Output is compatible with <b>MSC Nastran</b>,
+                    <b>Siemens NX Nastran</b>, and the open-source
+                    <b>MYSTRAN</b> solver (new in v5.0.0 — see the
+                    integration block below). No solver-specific
+                    extensions are used in the generic export
+                    target.</td></tr>
             </table>
+        </div>
+
+        <!-- ============================================================ -->
+        <h3>MYSTRAN Solver Integration <span class="tag">new in v5.0.0</span></h3>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>
+            Node Runner v5.0.0 adds an end-to-end
+            <b>pre &rarr; solve &rarr; post</b> workflow that drives the
+            free, open-source <a href="https://www.mystran.com/">MYSTRAN</a>
+            binary as a subprocess. Configure the executable path in
+            <i>Preferences &rarr; MYSTRAN</i>, then click
+            <i>Analysis &rarr; Run Analysis (MYSTRAN)</i>&hellip;
+            (<tt>Ctrl+R</tt>).
+        </p>
+        <table>
+        <tr><td><b>Supported solutions:</b></td>
+            <td><span class="tag">SOL 101</span> Linear Static,
+                <span class="tag">SOL 103</span> Normal Modes,
+                <span class="tag">SOL 105</span> Linear Buckling.
+                Same numbering as MSC Nastran. SOL 106 (nonlinear),
+                aero, transient, frequency response, and optimization
+                solutions are <span class="warn">not supported</span>
+                by MYSTRAN and are caught by the pre-flight scanner.
+            </td></tr>
+        <tr><td><b>Pre-flight scanner:</b></td>
+            <td>Walks the in-memory model in &lt; 1 s and flags any
+                cards MYSTRAN can&rsquo;t run (aero, nonlinear,
+                contact, optimization, unsupported elements). Blocking
+                issues stop the run; warnings let the export translator
+                drop the offending cards.</td></tr>
+        <tr><td><b>Export translator:</b></td>
+            <td>Re-writes the deck for MYSTRAN: strips MSC/NX-only
+                <tt>PARAM</tt>s (POST, COUPMASS, K6ROT, AUTOSPC, &hellip;),
+                injects MYSTRAN-required PARAMs (SOLLIB, QUAD4TYP,
+                optionally WTMASS / GRDPNT), and drops blocking card
+                families. Output lands in a timestamped scratch
+                directory; your source decks are never modified.</td></tr>
+        <tr><td><b>Run UX:</b></td>
+            <td>Non-blocking progress dialog with stage tracking from
+                MYSTRAN&rsquo;s stdout (Reading bulk data &rarr;
+                Assembling K &rarr; Factorizing &rarr; Solving &rarr;
+                Recovering element results). Cancel button cleanly
+                terminates the child process. Post-run summary dialog
+                shows the run folder path, the <tt>.ERR</tt> file
+                contents inline, and Open Folder buttons.</td></tr>
+        <tr><td><b>Results adapter:</b></td>
+            <td>OP2 binary first (when MYSTRAN emits one), F06 text
+                fallback for displacements + eigenvalues. Results land
+                in the existing Result Browser / Vector Overlay /
+                Animation Timeline docks &mdash; same UX as loading a
+                vendor OP2.</td></tr>
+        <tr><td><b>Tooltips throughout:</b></td>
+            <td>Every MYSTRAN-specific control (SOLLIB, QUAD4TYP,
+                WTMASS, output requests, SOL radio, etc.) carries a
+                hover tip that cross-references the MSC Nastran or
+                Femap equivalent.</td></tr>
+        <tr><td><b>Analysis history:</b></td>
+            <td><i>Analysis &rarr; Analysis History</i>&hellip; browses
+                prior runs in the scratch directory; double-click
+                reloads a run&rsquo;s OP2 / F06 results into the
+                current model.</td></tr>
+        </table>
+        <p class="subtle">
+            Node Runner does <b>not</b> bundle the MYSTRAN binary &mdash;
+            download it from the upstream project and point Node Runner
+            at it via <i>Preferences &rarr; MYSTRAN &rarr; MYSTRAN
+            executable</i>.
+        </p>
         </div>
 
         <!-- ---- Elements ---- -->
@@ -4569,6 +4903,10 @@ class MainWindow(QMainWindow):
             <a href="https://escvelocity.space" style="color: #5dade2;">escvelocity.space</a>
         </p>
         """
+        # v5.0.0 item 21: substitute the version tag from __version__
+        # so the About dialog never drifts from the package version.
+        text = text.replace("__NR_VERSION__", _nr_version)
+
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
         layout = QVBoxLayout(dialog)
@@ -6090,15 +6428,15 @@ class MainWindow(QMainWindow):
                 # preferred default; matches the View > Shading action.
                 enabled = False
         if enabled:
-            # v4.0.0 (A2): bump ambient from 0.15 -> 0.35. The main grid
-            # is an UnstructuredGrid without computed point normals; the
-            # 0.15 baseline was leaving the model "dark" (user report)
-            # because the diffuse term collapses with no normal data.
-            # 0.35 ambient keeps the model visible even without normals
-            # while preserving a clear visual delta versus flat below.
+            # v4.0.0 (A2): bump ambient from 0.15 -> 0.35. v5.0.0 item 9
+            # bumps it further to 0.40 (in concert with bumped key/fill/
+            # headlight intensities) to address the "mesh appears dark"
+            # user feedback. Multiplied by brightness mode (Subdued /
+            # Normal / Bright) so the user can tune it.
+            mult = self._brightness_multiplier()
             actor.prop.lighting = True
             actor.prop.interpolation = 'phong'
-            actor.prop.ambient = 0.35
+            actor.prop.ambient = 0.40 * mult
             actor.prop.diffuse = 0.65
             actor.prop.specular = 0.0
         else:
@@ -6108,13 +6446,45 @@ class MainWindow(QMainWindow):
             actor.prop.diffuse = 0.0
             actor.prop.specular = 0.0
 
+    def _brightness_multiplier(self):
+        """v5.0.0 item 9: brightness multiplier read from QSettings.
+
+        Lazy-cached on ``self`` so the per-actor shading hook isn't
+        hitting QSettings on every paint. Cache is invalidated on
+        Preferences Apply via :meth:`_invalidate_brightness_cache`.
+        """
+        mult = getattr(self, '_brightness_mult_cache', None)
+        if mult is not None:
+            return mult
+        try:
+            from PySide6.QtCore import QSettings
+            mode = QSettings("NodeRunner", "NodeRunner").value(
+                "render/brightness_mode", "Normal", type=str)
+        except Exception:
+            mode = "Normal"
+        mult = {"Subdued": 0.85, "Normal": 1.0, "Bright": 1.15}.get(mode, 1.0)
+        self._brightness_mult_cache = mult
+        return mult
+
+    def _invalidate_brightness_cache(self):
+        self._brightness_mult_cache = None
+
     def _install_light_rig(self):
         """v4.0.0 (A2): replace PyVista's default single headlight with
         a warm key + cool fill + dim back rim. Makes the phong vs flat
         toggle clearly visible and gives the viewport a premium look.
+
+        v5.0.0 item 9: bumped fill 0.45 -> 0.55 and headlight 0.35 ->
+        0.55 to address "mesh appears dark" feedback. Intensities are
+        further scaled by the user's brightness preference.
         Failures are swallowed: rendering with the default light setup
         is still acceptable.
         """
+        mult = self._brightness_multiplier()
+        key_i  = 0.85 * mult
+        fill_i = 0.55 * mult
+        rim_i  = 0.25 * mult
+        head_i = 0.55 * mult
         try:
             import pyvista as pv
             renderer = self.plotter.renderer
@@ -6124,21 +6494,21 @@ class MainWindow(QMainWindow):
                 position=(1.0, 1.0, 1.0),
                 light_type='scene light',
                 color=(1.0, 0.96, 0.90),  # warm
-                intensity=0.85,
+                intensity=key_i,
             )
             fill = pv.Light(
                 position=(-1.0, -0.5, 1.0),
                 light_type='scene light',
                 color=(0.85, 0.90, 1.0),  # cool
-                intensity=0.45,
+                intensity=fill_i,
             )
             rim = pv.Light(
                 position=(0.0, -1.0, -0.5),
                 light_type='scene light',
                 color=(1.0, 1.0, 1.0),
-                intensity=0.25,
+                intensity=rim_i,
             )
-            head = pv.Light(light_type='headlight', intensity=0.35)
+            head = pv.Light(light_type='headlight', intensity=head_i)
 
             for lt in (key, fill, rim, head):
                 renderer.add_light(lt)
@@ -6153,6 +6523,10 @@ class MainWindow(QMainWindow):
             from node_runner.profiling import perf_event
             perf_event('lights', 'rig_installed',
                        n_lights=len(self.plotter.renderer.lights))
+            perf_event('lights', 'intensity_summary',
+                       mult=mult, key=key_i, fill=fill_i,
+                       rim=rim_i, headlight=head_i,
+                       total=key_i + fill_i + rim_i + head_i)
         except Exception:
             pass
 
@@ -6231,9 +6605,9 @@ class MainWindow(QMainWindow):
         color, every render, every actor.
 
         Cost: O(n_unique_pids) Python work + numpy fan-out
-        (~10 ms on MEGA's 2.4M cells). Memory: 3 bytes/cell extra
+        (~10 ms on a deck with 2.4M cells). Memory: 3 bytes/cell extra
         (uint8 × 3) vs the int32 PID array → +7 MB per actor on
-        MEGA. Acceptable.
+        production-deck. Acceptable.
         """
         if 'PID' not in grid.cell_data:
             return None
@@ -6847,6 +7221,15 @@ class MainWindow(QMainWindow):
         self.highlight_outline_width = int(
             sizes.get('highlight_outline_width',
                       getattr(self, 'highlight_outline_width', 5)))
+        # v5.0.0 item 9: brightness mode invalidates the cached
+        # multiplier so the next light-rig install reads the new value.
+        self._invalidate_brightness_cache()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('lights', 'brightness_changed',
+                       to=payload.get('brightness_mode', 'Normal'))
+        except Exception:
+            pass
         if self.current_generator:
             self._update_viewer(self.current_generator, reset_camera=False)
         self._update_status("Preferences applied - viewer updated.")
@@ -7682,8 +8065,14 @@ class MainWindow(QMainWindow):
             # pre-built per-category actor handles. Invalidate the
             # dict so the build site below starts fresh.
             self._category_actors = {}
+            self._category_actor_grids = {}
             self._category_visible_ntypes = set()
             self._using_legacy_mesh = False
+            # v5.0.0 item 11a: PID/MID hidden sets are PER-deck; clear
+            # on viewer rebuild so a freshly opened model starts with
+            # every property/material visible.
+            self._hidden_pids = set()
+            self._hidden_mids = set()
             self.axes_actor = self.plotter.renderer.axes_actor
             self._set_axes_label_color((0.804, 0.839, 0.957) if self.is_dark_theme else (0, 0, 0))
 
@@ -9111,7 +9500,7 @@ class MainWindow(QMainWindow):
                 src_tree.blockSignals(False)
             # v4.0.9: fast path for toggles that affect a single named
             # actor. The full _update_plot_visibility cycle costs ~4-5 s
-            # on MEGA; if the click only toggles one independent actor
+            # on a large production deck; if the click only toggles one independent actor
             # we skip the rebuild_plot / shells_compute_normals / SID
             # loops entirely. The router returns False on any
             # unexpected condition so we fall through safely.
@@ -9183,11 +9572,17 @@ class MainWindow(QMainWindow):
             return True
         # v4.0.14 (Fix C v2): category toggles map to pre-built
         # per-Nastran-type actors built from full current_grid. The
-        # handler returns False when PID/MID/isolate/hidden filter
-        # is active, falling through to legacy _rebuild_plot.
+        # handler returns False when isolate/hidden filter is active,
+        # falling through to legacy _rebuild_plot.
         if (len(data) == 2
                 and data[0] in ('elem_by_type_group', 'elem_shape_group')):
             return self._fast_path_category_toggle(data[0], data[1])
+        # v5.0.0 item 11a: PID and MID toggles flip per-cell vtkGhostType
+        # in-place on the pre-built actors. Sub-100 ms on a large production deck.
+        if len(data) == 2 and data[0] == 'property':
+            return self._fast_path_pid_toggle(data[1], is_checked)
+        if len(data) == 2 and data[0] == 'material':
+            return self._fast_path_mid_toggle(data[1], is_checked)
         return False
 
     # --- Loads Tab Methods ---
@@ -9255,9 +9650,9 @@ class MainWindow(QMainWindow):
         v3.5.0 item 4 (perf): lazy child population. Each Load Set /
         Constraint Set header gets a placeholder child '(N entries -
         expand to load)' and the real entries are built on first
-        expand via _on_load_tab_item_expanded. On the MEGA-XWFF deck
-        (512k load entries) this drops Loads-tab populate from 5-30s
-        to <100ms.
+        expand via _on_load_tab_item_expanded. On a large production
+        deck (512k load entries) this drops Loads-tab populate from
+        5-30s to <100ms.
 
         v4.0.0 (B1): preserve per-item check + expansion state across
         the clear/rebuild so unrelated edits don't wipe the user's
@@ -9377,7 +9772,7 @@ class MainWindow(QMainWindow):
                 # [] for every load_set, so every SID was effectively
                 # invisible. Stage Q routed the lookup to the correct
                 # tree, exposing the fact that the build-time default
-                # was Checked — which, on MEGA (1,962 SIDs / 512k
+                # was Checked — which, on a large production deck (1,962 SIDs / 512k
                 # entries), made the post-parse pass build glyph
                 # geometry for every load entry. Default Unchecked
                 # matches the user's expected UX ("loads/constraints
@@ -9910,7 +10305,11 @@ class MainWindow(QMainWindow):
             mat_model = self._auto_load_materials()
 
         if not mat_model or not mat_model.materials:
-            QMessageBox.warning(self, "No Materials", "Load a model with materials or place 'materials.bdf' in the application folder."); return
+            QMessageBox.warning(
+                self, "No Materials",
+                "Load a model with materials, or configure a materials "
+                "library path in Preferences -> Library.")
+            return
 
         dialog = GeneratorDialog(self); dialog.set_materials(mat_model)
         if dialog.exec():
@@ -10251,17 +10650,63 @@ class MainWindow(QMainWindow):
 
 
     def _auto_load_materials(self):
-        materials_path = os.path.join(PROJECT_ROOT, "materials.bdf")
-        if os.path.exists(materials_path):
+        """v5.0.0 item 7: load materials from the user-configured library
+        path (Preferences -> Library) instead of a hardcoded
+        ``materials.bdf`` in the install directory. The legacy
+        ``materials.bdf`` is auto-migrated to the new setting on first
+        run for users upgrading from v4.x.
+        """
+        from PySide6.QtCore import QSettings
+        from node_runner.profiling import perf_event
+        settings = QSettings("NodeRunner", "NodeRunner")
+        materials_path = settings.value("materials/library_path", "", type=str)
+
+        # One-time migration from the legacy auto-search to a saved path.
+        legacy = os.path.join(PROJECT_ROOT, "materials.bdf")
+        if not materials_path and os.path.exists(legacy):
+            materials_path = legacy
+            settings.setValue("materials/library_path", materials_path)
             try:
-                mat_model = BDF(debug=False)
-                mat_model.read_bdf(materials_path, punch=True)
-                self._update_status(f"Auto-loaded {len(mat_model.materials)} materials.")
-                return mat_model
-            except Exception as e:
-                self._update_status(f"Could not parse default materials: {e}", is_error=True)
-        else:
-            self._update_status("'materials.bdf' not found.", is_error=True)
+                perf_event('materials', 'library_migrated',
+                           from_path=legacy)
+            except Exception:
+                pass
+            self._update_status(
+                "Adopted legacy materials.bdf as the materials library "
+                "(change via Preferences -> Library).")
+
+        if not materials_path:
+            try:
+                perf_event('materials', 'library_not_configured')
+            except Exception:
+                pass
+            return None
+        if not os.path.exists(materials_path):
+            try:
+                perf_event('materials', 'library_missing',
+                           path=materials_path)
+            except Exception:
+                pass
+            self._update_status(
+                f"Material library not found: {materials_path} "
+                f"(configure via Preferences -> Library).",
+                is_error=True)
+            return None
+        try:
+            mat_model = BDF(debug=False)
+            mat_model.read_bdf(materials_path, punch=True)
+            try:
+                perf_event('materials', 'library_loaded',
+                           path=materials_path,
+                           n_materials=len(mat_model.materials))
+            except Exception:
+                pass
+            self._update_status(
+                f"Loaded {len(mat_model.materials)} materials from library.")
+            return mat_model
+        except Exception as e:
+            self._update_status(
+                f"Could not parse material library: {e}", is_error=True)
         return None
 
     def _save_configuration(self):
@@ -10890,11 +11335,11 @@ class MainWindow(QMainWindow):
             # auto-compute normals) via extract_surface, then run the
             # vtkPolyDataNormals filter via .compute_normals(). The
             # cost is one-shot per visibility update on the LOD'd
-            # mesh (~248k cells on MEGA, fast in C++).
+            # mesh (~248k cells on a large production deck, fast in C++).
             if shells.n_cells > 0:
                 # v4.0.9: cache the computed-normals shells PolyData
                 # across visibility cycles. The compute_normals call on
-                # 2.36M LOD'd cells costs ~1.1 s per click on MEGA, but
+                # 2.36M LOD'd cells costs ~1.1 s per click on a large production deck, but
                 # the inputs (visibility-filtered shells subset + shrink
                 # factor) are identical across many consecutive clicks
                 # when the user is toggling unrelated things like loads
@@ -11521,7 +11966,7 @@ class MainWindow(QMainWindow):
             self._update_status(f"Added constraint entries to SID {sid}.")
             # v4.0.0 (B2): use the command's narrow refresh hint
             # (CONSTRAINTS) instead of the pre-v4.0.0 _populate_tree
-            # blanket rebuild. On the MEGA-XWFF deck this drops the
+            # blanket rebuild. On large production decks this drops the
             # post-edit pause from multi-second tree rebuilds to a
             # near-instant constraint-actors-only refresh, and B1's
             # tree snapshot/restore preserves the user's checkbox state.
@@ -11607,7 +12052,7 @@ class MainWindow(QMainWindow):
         Before this, _create_all_load_actors did per-PLOAD4 cell access
         (``grid.get_cell(idx).points`` + ``np.cross`` + normalize), which
         wraps a VTK cell in a pyvista.Cell object on every iteration.
-        On the FUSE-XWFF-Boost-2.dat deck (~600k+ PLOAD4 face refs)
+        On a large pressure-load production deck (~600k+ PLOAD4 face refs)
         that loop blocked the main thread long enough for Windows to
         mark the app "Not Responding".
 
@@ -11719,7 +12164,7 @@ class MainWindow(QMainWindow):
                 # glyph (single arrow + curl + curl arrowhead). Cached
                 # via _get_moment_glyph_geom.
                 # v4.0.12 (Bug 4 fix): two-tier fallback. The v4.0.11
-                # MEGA crash was a VTK SEGFAULT in vtkGlyph3D when the
+                # a production-deck crash was a VTK SEGFAULT in vtkGlyph3D when the
                 # composite resolved to an UnstructuredGrid (mixed
                 # cell types). We attempt the composite first; on any
                 # Python-side exception OR when the composite returns
@@ -11850,7 +12295,7 @@ class MainWindow(QMainWindow):
     def _fast_path_sid_toggle(self, kind, sid, check_state):
         """v4.0.9: O(1) per-SID visibility update. Returns True on
         success so the caller can skip the full
-        ``_update_plot_visibility`` cycle (~4-5 s on MEGA). Returns
+        ``_update_plot_visibility`` cycle (~4-5 s on a large production deck). Returns
         False on any failure — caller MUST fall through to the full
         cycle so the user never sees a stale scene.
 
@@ -11910,7 +12355,7 @@ class MainWindow(QMainWindow):
         element type present in ``self.current_grid`` (the full,
         non-LOD'd mesh). Category checkbox toggles in the model tree
         (Plates, Beams, Solids, etc.) become ``actor.SetVisibility``
-        calls — sub-100 ms on MEGA — bypassing the legacy
+        calls — sub-100 ms on a large production deck — bypassing the legacy
         ``_rebuild_plot`` extract_cells + split + compute_normals
         chain.
 
@@ -12003,6 +12448,18 @@ class MainWindow(QMainWindow):
                             pickable=False, reset_camera=False,
                             **color_kw, **shape_kw)
                         self._category_actors[ntype] = actor
+                        # v5.0.0 item 11a: attach per-cell vtkGhostType
+                        # for sub-100 ms PID/MID toggles. Initialized
+                        # all-visible; mutated in-place by the new
+                        # fast-path PID/MID toggles.
+                        self._category_actor_grids[ntype] = slice_render
+                        try:
+                            n_cells = int(slice_render.n_cells)
+                            if n_cells:
+                                slice_render.cell_data['vtkGhostType'] = (
+                                    np.zeros(n_cells, dtype=np.uint8))
+                        except Exception:
+                            pass
                         perf_event('actors', 'category_added',
                                    ntype=ntype,
                                    n_cells=int(cell_idx.size),
@@ -12014,29 +12471,38 @@ class MainWindow(QMainWindow):
                                exc=f"{type(_exc).__name__}: {str(_exc)[:120]}")
             self._category_visible_ntypes = set(self._category_actors.keys())
             self._using_legacy_mesh = False
+            # v5.0.0 item 11a: replay any pre-existing PID/MID hidden
+            # state (e.g. after a color-mode change that tore down and
+            # rebuilt the actors). Applies in-place; no-op when both
+            # sets are empty.
+            try:
+                self._apply_pid_mid_visibility_to_actors()
+            except Exception:
+                pass
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('pid_visibility', 'cache_init',
+                           n_pids_hidden=len(self._hidden_pids),
+                           n_mids_hidden=len(self._hidden_mids),
+                           n_actors=len(self._category_actor_grids))
+            except Exception:
+                pass
 
     def _has_active_cell_filter(self):
         """v4.0.14: return True if any tree-state setting forces
-        cell-level filtering (PID, MID, isolate mode, hidden groups).
-        When True, `_fast_path_category_toggle` returns False so the
-        caller falls through to legacy ``_rebuild_plot``.
+        cell-level filtering routed through legacy ``_rebuild_plot``.
+
+        v5.0.0 item 11a: PID and MID checkboxes are NO LONGER counted
+        as "active cell filter" - they're handled in-place via the per-
+        cell ``vtkGhostType`` array on each ``cat_<ntype>`` actor's
+        grid, which keeps the pre-built path engaged. The remaining
+        cell-level filters (isolate mode, hidden groups) still force
+        legacy.
         """
         if getattr(self, '_isolate_mode', None):
             return True
         if getattr(self, '_hidden_groups', None):
             return True
-        items = self._find_tree_items(('group', 'properties'))
-        if items:
-            parent = items[0]
-            for i in range(parent.childCount()):
-                if parent.child(i).checkState(0) != QtCore.Qt.Checked:
-                    return True
-        items = self._find_tree_items(('group', 'materials'))
-        if items:
-            parent = items[0]
-            for i in range(parent.childCount()):
-                if parent.child(i).checkState(0) != QtCore.Qt.Checked:
-                    return True
         return False
 
     def _compute_category_actor_visibility(self, ntype):
@@ -12133,6 +12599,154 @@ class MainWindow(QMainWindow):
         self.plotter.render()
         return True
 
+    # ─── v5.0.0 item 11a: sub-100 ms PID / MID toggles ──────────────────
+    def _pid_to_mid_map(self):
+        """Build (and cache) the {pid: mid} map used by MID toggles.
+
+        Cleared on every viewer rebuild via ``current_generator`` swap.
+        """
+        cache = getattr(self, '_pid_to_mid_cache', None)
+        cur_gen = getattr(self, 'current_generator', None)
+        cache_gen = getattr(self, '_pid_to_mid_cache_gen', None)
+        if cache is not None and cache_gen is cur_gen:
+            return cache
+        out: dict[int, int] = {}
+        try:
+            model = cur_gen.model if cur_gen is not None else None
+            for pid, prop in (model.properties or {}).items():
+                mid = getattr(prop, 'mid', None)
+                if mid is None:
+                    mid = getattr(prop, 'mid1', None)
+                if mid is not None:
+                    out[int(pid)] = int(mid)
+        except Exception:
+            pass
+        self._pid_to_mid_cache = out
+        self._pid_to_mid_cache_gen = cur_gen
+        return out
+
+    def _apply_pid_mid_visibility_to_actors(self):
+        """Refresh every cat_<ntype> actor's vtkGhostType cell-data from
+        the current ``_hidden_pids`` and ``_hidden_mids`` sets.
+
+        Cheap: numpy isin over each actor's cell PID array. Sub-100 ms
+        on a deck with 2.4M cells. Marks each grid Modified() so the mapper
+        re-picks up the array on next render.
+        """
+        if not self._category_actor_grids:
+            return 0
+        hidden_pids = self._hidden_pids
+        hidden_mids = self._hidden_mids
+        # Resolve hidden MIDs to the corresponding PIDs via property->material.
+        if hidden_mids:
+            pid_to_mid = self._pid_to_mid_map()
+            hidden_via_mid = {
+                pid for pid, mid in pid_to_mid.items() if mid in hidden_mids
+            }
+        else:
+            hidden_via_mid = set()
+        hidden_combined = hidden_pids | hidden_via_mid
+        hidden_arr = (np.fromiter(hidden_combined, dtype=np.int64)
+                      if hidden_combined else None)
+        n_cells_total = 0
+        n_hidden_cells = 0
+        for ntype, grid in self._category_actor_grids.items():
+            try:
+                if 'PID' not in grid.cell_data:
+                    continue
+                n_cells = int(grid.n_cells)
+                if n_cells == 0:
+                    continue
+                pids = np.asarray(grid.cell_data['PID'])
+                if hidden_arr is None or hidden_arr.size == 0:
+                    ghost = np.zeros(n_cells, dtype=np.uint8)
+                else:
+                    mask = np.isin(pids, hidden_arr)
+                    ghost = np.where(mask,
+                                     np.uint8(0x01),  # HIDDENCELL
+                                     np.uint8(0)).astype(np.uint8)
+                    n_hidden_cells += int(mask.sum())
+                grid.cell_data['vtkGhostType'] = ghost
+                # Force VTK to re-read the array.
+                try:
+                    grid.Modified()
+                except Exception:
+                    pass
+                n_cells_total += n_cells
+            except Exception:
+                continue
+        return (n_cells_total, n_hidden_cells)
+
+    def _fast_path_pid_toggle(self, pid, checked):
+        """v5.0.0 item 11a: in-place PID visibility flip on pre-built
+        actors. Sub-100 ms on a large production deck.
+        """
+        from node_runner.profiling import perf_event
+        import time as _time
+        if not self._category_actor_grids:
+            return False
+        # Isolate / hidden-groups still force legacy.
+        if (getattr(self, '_isolate_mode', None)
+                or getattr(self, '_hidden_groups', None)):
+            return False
+        try:
+            pid_int = int(pid)
+        except Exception:
+            return False
+        if checked:
+            self._hidden_pids.discard(pid_int)
+        else:
+            self._hidden_pids.add(pid_int)
+        t0 = _time.perf_counter()
+        try:
+            res = self._apply_pid_mid_visibility_to_actors()
+            n_total, n_hidden = (res if isinstance(res, tuple) else (0, 0))
+        except Exception:
+            n_total, n_hidden = 0, 0
+        self.plotter.render()
+        perf_event('fast_path', 'pid_toggle',
+                   wall_s=round(_time.perf_counter() - t0, 4),
+                   pid=pid_int, checked=bool(checked),
+                   n_hidden_pids=len(self._hidden_pids),
+                   n_cells_total=int(n_total),
+                   n_cells_hidden=int(n_hidden))
+        return True
+
+    def _fast_path_mid_toggle(self, mid, checked):
+        """v5.0.0 item 11a: in-place MID visibility flip on pre-built
+        actors. Sub-100 ms on a large production deck. Material visibility propagates to
+        every property that references it via _pid_to_mid_map().
+        """
+        from node_runner.profiling import perf_event
+        import time as _time
+        if not self._category_actor_grids:
+            return False
+        if (getattr(self, '_isolate_mode', None)
+                or getattr(self, '_hidden_groups', None)):
+            return False
+        try:
+            mid_int = int(mid)
+        except Exception:
+            return False
+        if checked:
+            self._hidden_mids.discard(mid_int)
+        else:
+            self._hidden_mids.add(mid_int)
+        t0 = _time.perf_counter()
+        try:
+            res = self._apply_pid_mid_visibility_to_actors()
+            n_total, n_hidden = (res if isinstance(res, tuple) else (0, 0))
+        except Exception:
+            n_total, n_hidden = 0, 0
+        self.plotter.render()
+        perf_event('fast_path', 'mid_toggle',
+                   wall_s=round(_time.perf_counter() - t0, 4),
+                   mid=mid_int, checked=bool(checked),
+                   n_hidden_mids=len(self._hidden_mids),
+                   n_cells_total=int(n_total),
+                   n_cells_hidden=int(n_hidden))
+        return True
+
     def _refresh_visible_sid_sets(self):
         """v4.0.10: rebuild ``_visible_load_sids`` and
         ``_visible_spc_sids`` from the current loads_tab tree state.
@@ -12145,7 +12759,7 @@ class MainWindow(QMainWindow):
             it, so the sets need an explicit refresh).
 
         Cost: O(n_load_sids + n_spc_sids) dict lookups + checkState
-        calls. ~5-10 ms on MEGA (1,962 load SIDs). Far cheaper than
+        calls. ~5-10 ms on a deck with 1,962 load SIDs. Far cheaper than
         the visibility cycle it enables.
         """
         if not self.current_generator:
@@ -12174,7 +12788,7 @@ class MainWindow(QMainWindow):
         are built on demand by ``_ensure_load_actor_for_sid`` when the
         visibility-update path actually needs them.
 
-        On `FUSE-XWFF_04A_DUL_FUL-Entry.dat` (1,962 SIDs) the prior
+        On a 1,962-SID production deck the prior
         per-SID `add_mesh` loop hit Qt/VTK at ~50ms each = ~100 s of
         scene build, even though every actor was created with
         opacity=0 (invisible until a checkbox toggled it). Now we
@@ -12363,7 +12977,7 @@ class MainWindow(QMainWindow):
 
         Pre-v4.0.2 the per-element loop called
         ``model.nodes[nid].get_position()`` for the center + every
-        leg (pyNastran-level Python overhead). On MEGA (46,782 RBE/
+        leg (pyNastran-level Python overhead). On production-deck (46,782 RBE/
         RBAR cards with avg ~10 legs each) this took 144 s.
 
         New path: vectorized via ``np.searchsorted`` against
@@ -12550,7 +13164,7 @@ class MainWindow(QMainWindow):
 
     def _create_rbe_actors_legacy(self):
         """Pre-v4.0.2 RBE spider-line builder. Kept as a fallback for
-        the vectorized path. Slow on big decks (~144 s on MEGA).
+        the vectorized path. Slow on big decks (~144 s on a large production deck).
         """
         self.plotter.remove_actor('rbe_actors', render=False)
 
@@ -12997,7 +13611,7 @@ class MainWindow(QMainWindow):
         show_global = self.show_global_csys_check.isChecked()
 
         # v4.0.9: sub-stage timers. The whole refresh costs ~0.22 s per
-        # visibility cycle on MEGA despite only 3 coord systems; sub-stages
+        # visibility cycle on a large production deck despite only 3 coord systems; sub-stages
         # tell us which step actually dominates.
         with perf_stage('coord_actors', 'remove_all',
                         n_coords=len(model.coords)):
@@ -13181,7 +13795,7 @@ class MainWindow(QMainWindow):
         shape_to_nastran_map = { 'Line': ['CBEAM', 'CBAR', 'CROD', 'CBUSH', 'CGAP'], 'Quad': ['CQUAD4', 'CMEMBRAN', 'CSHEAR'], 'Tria': ['CTRIA3'], 'Rigid': ['RBE2', 'RBE3'], 'Hex': ['CHEXA', 'CHEXA8', 'CHEXA20'], 'Tet': ['CTETRA', 'CTETRA4', 'CTETRA10'], 'Wedge': ['CPENTA', 'CPENTA6', 'CPENTA15'] }
         with perf_stage('visibility', 'tree_walk_type_shape', n_cells=n_cells):
             # v4.0.7: use the tree index instead of walking the
-            # entire model tree (~23k items on MEGA, ~1.3 s wall
+            # entire model tree (~23k items on a large production deck, ~1.3 s wall
             # per visibility cycle). With the v4.0.3 tree index in
             # place we can look up each category checkbox by its
             # known UserRole key in O(1). One lookup per category
@@ -13316,7 +13930,7 @@ class MainWindow(QMainWindow):
         _find_tree_calls_before = getattr(self, '_find_tree_calls_total', 0)
         # v4.0.9: short-circuit when no load SID is visible AND no stale
         # load glyph exists in plotter.actors. Loads default OFF since
-        # v4.0.5 so this is the common case on MEGA decks (1,962 SIDs
+        # v4.0.5 so this is the common case on large production decks (1,962 SIDs
         # all unchecked → no work needed). Saves ~1.0-2.0 s per
         # visibility cycle. Catcher stays in forever so we can spot
         # regressions in the dirty/visible accounting.
@@ -13368,7 +13982,7 @@ class MainWindow(QMainWindow):
                 perf_event('load_sid_loop', 'stale_glyphs_swept',
                            n_removed=_stale_removed)
         # v4.0.10: iterate only the visible SIDs instead of all 1,962.
-        # Saves ~3.7 s per click on MEGA when 1 SID visible (was the
+        # Saves ~3.7 s per click on a large production deck when 1 SID visible (was the
         # case in v4.0.9 profile log line 1647).
         if not _short_circuit_loads and model.loads:
             perf_event('load_sid_loop', 'iter_bounded',
@@ -13382,7 +13996,7 @@ class MainWindow(QMainWindow):
 
             # v3.4.2: lazily build per-SID actors the first time the
             # user shows this SID. Decks with thousands of SIDs (e.g.
-            # FUSE-XWFF_04A_DUL_FUL-Entry.dat has 1962) used to spend
+            # a production deck we exercised had 1962) used to spend
             # ~50ms per SID at import time creating opacity=0 actors;
             # deferring it caps import time and adds only the cost
             # of the few SIDs the user actually shows.
@@ -13392,7 +14006,7 @@ class MainWindow(QMainWindow):
             for type, max_mag in [('force', max_force_mag), ('moment', max_moment_mag), ('pressure', max_pressure_mag)]:
                 actor_name = f"{type}_actors_{sid}"; glyph_name = f"{type}_glyphs_{sid}"
                 # v4.0.6: skip the no-op remove_actor when the glyph
-                # doesn't exist. On MEGA (1,962 SIDs × 3 types = 5,886
+                # doesn't exist. On production-deck (1,962 SIDs × 3 types = 5,886
                 # remove_actor calls per visibility cycle), most are
                 # no-ops — but each one still walks PyVista's internal
                 # actor list. The membership check is O(1) on the
@@ -14269,6 +14883,410 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             active.output_requests = dialog.get_output_requests()
             self._update_status(f"Output requests updated for '{active.name}'")
+
+    # ─── v5.0.0 items 17/18: MYSTRAN run flow ─────────────────────────
+    def _configure_mystran(self):
+        """Analysis -> Configure MYSTRAN…: open Preferences on the MYSTRAN tab."""
+        from node_runner.dialogs.preferences import (
+            PreferencesDialog, save_preferences, load_preferences)
+        current = load_preferences()
+        dlg = PreferencesDialog(current, self)
+        # Try to switch to the MYSTRAN tab.
+        try:
+            for i in range(dlg._tabs.count()):
+                if dlg._tabs.tabText(i) == "MYSTRAN":
+                    dlg._tabs.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        if dlg.exec() == QDialog.Accepted:
+            save_preferences(dlg.result_payload())
+            self._update_status("MYSTRAN preferences saved.")
+
+    def _open_analysis_history(self):
+        """Analysis -> Analysis History…"""
+        from node_runner.dialogs.solver_run import AnalysisHistoryDialog
+        from node_runner.solve import mystran_settings
+        dlg = AnalysisHistoryDialog(mystran_settings.get_scratch_root(),
+                                    parent=self)
+        dlg.reload_requested.connect(self._on_mystran_history_reload)
+        dlg.exec()
+
+    def _on_mystran_history_reload(self, run):
+        """User picked a prior run from the history dialog. Re-load
+        its results into the current model.
+        """
+        try:
+            from node_runner.solve.mystran_results import load_mystran_results
+            bundle = load_mystran_results(run)
+            if bundle is None:
+                QMessageBox.warning(
+                    self, "Analysis History",
+                    "Couldn't load OP2 or F06 from that run folder.")
+                return
+            self._consume_mystran_bundle(bundle, run)
+            # v5.0.0 item 20: update the persisted results_source so a
+            # prior run that previously read "null" now records the
+            # source that actually loaded (OP2 vs F06).
+            try:
+                if run.bdf_path:
+                    run.save_meta(Path(run.bdf_path).parent)
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Analysis History",
+                f"Failed to reload that run: {exc}")
+
+    def _run_mystran(self):
+        """Analysis -> Run Analysis (MYSTRAN)…: pre-flight -> run-options
+        -> solver progress -> auto-load results."""
+        if not self.current_generator or not self.current_generator.model:
+            QMessageBox.warning(
+                self, "Run MYSTRAN",
+                "Open or create a model first.")
+            return
+        # Verify MYSTRAN binary is configured.
+        from node_runner.solve import mystran_settings
+        from node_runner.solve.mystran_runner import (
+            discover_mystran_executable)
+        exe = discover_mystran_executable()
+        if not exe:
+            ret = QMessageBox.question(
+                self, "MYSTRAN not configured",
+                "I couldn't find the MYSTRAN executable. Configure it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret == QMessageBox.Yes:
+                self._configure_mystran()
+                exe = discover_mystran_executable()
+            if not exe:
+                return
+
+        # Open Run-options dialog.
+        from node_runner.dialogs.solver_run import (
+            RunMystranDialog, MystranPreflightDialog, SolverProgressDialog)
+        run_dlg = RunMystranDialog(self, parent=self)
+        if run_dlg.exec() != QDialog.Accepted:
+            return
+        opts = run_dlg.get_options()
+
+        # Pre-flight (in-memory model — fast).
+        from node_runner.solve.mystran_preflight import scan_for_mystran
+        report = scan_for_mystran(self.current_generator.model,
+                                  sol=opts.get('sol'))
+        pf_dlg = MystranPreflightDialog(report, parent=self)
+        if pf_dlg.exec() != QDialog.Accepted:
+            return
+
+        # Export deck to working dir.
+        working_dir = Path(opts['working_dir'])
+        working_dir.mkdir(parents=True, exist_ok=True)
+        bdf_stem = Path(self._loaded_filepath).stem if self._loaded_filepath \
+            else "untitled"
+        bdf_path = working_dir / f"{bdf_stem}.bdf"
+        try:
+            self.current_generator._write_bdf(
+                str(bdf_path),
+                field_format='short',
+                target='mystran',
+                sollib=mystran_settings.get('default_sollib'),
+                quad4typ=mystran_settings.get('default_quad4typ'),
+                wtmass=mystran_settings.get('default_wtmass'),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export failed",
+                f"Could not write MYSTRAN BDF: {exc}")
+            return
+
+        # Launch SolverRunWorker.
+        from node_runner.solve.mystran_runner import SolverRunWorker
+        self._solver_worker = SolverRunWorker(self)
+        self._solver_dialog = SolverProgressDialog(bdf_path.name, parent=self)
+        self._solver_worker.progress.connect(
+            self._solver_dialog.update_progress)
+        self._solver_worker.finished.connect(self._on_mystran_finished)
+        self._solver_worker.failed.connect(self._on_mystran_failed)
+        self._solver_worker.cancelled.connect(self._on_mystran_cancelled)
+        self._solver_dialog.cancel_requested.connect(
+            self._solver_worker.cancel)
+        self._solver_dialog.start_timer()
+        self._solver_dialog.show()
+        self._solver_worker.start(
+            bdf_path=bdf_path,
+            exe_path=exe,
+            output_dir=working_dir,
+            sol=opts.get('sol', 101),
+            analysis_set_name=opts.get('analysis_set_name', ''),
+        )
+
+    def _on_mystran_finished(self, run):
+        """Solver completed cleanly. Auto-load results per preference,
+        then show a single summary dialog that says where the files
+        landed and surfaces any MYSTRAN-level errors from the ERR file.
+        """
+        from node_runner.solve import mystran_settings
+        from node_runner.solve.mystran_results import load_mystran_results
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        self._update_status(
+            f"MYSTRAN finished in {run.wall_time:.1f}s "
+            f"(exit code {run.return_code}).")
+
+        # Always try to load results -- the user expectation is "click
+        # Run, see results". Status of the parse + the run folder are
+        # surfaced together in a single post-run dialog below.
+        bundle = None
+        if mystran_settings.get('auto_load_results', True):
+            bundle = load_mystran_results(run)
+            if bundle and self._bundle_has_data(bundle):
+                self._consume_mystran_bundle(bundle, run)
+                self._mystran_results_loaded_msg = (
+                    f"Loaded {self._bundle_disp_count(bundle):,} "
+                    f"displacements ({run.results_source.upper()} source).")
+            elif bundle is not None:
+                # Bundle parsed but empty -- treat as failure visually.
+                self._mystran_results_loaded_msg = (
+                    "Results file parsed but contained NO displacement "
+                    "data. MYSTRAN likely aborted with errors -- see "
+                    "the ERR file below.")
+            else:
+                self._mystran_results_loaded_msg = (
+                    "No OP2 or F06 results file found in the run folder.")
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished runs before
+        # load_mystran_results() sets this field, so the on-disk
+        # run_meta.json shows "results_source": null until we re-save
+        # here. Affects Analysis History display.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        else:
+            self._mystran_results_loaded_msg = (
+                "Auto-load is disabled in Preferences → MYSTRAN.")
+
+        self._show_mystran_summary(run, bundle)
+
+    def _bundle_has_data(self, bundle):
+        """True iff the bundle contains at least one non-empty
+        displacement / eigenvalue / eigenvector entry."""
+        for sc in (bundle.get('subcases') or {}).values():
+            if sc.get('displacements'):
+                return True
+            if sc.get('eigenvalues'):
+                return True
+            if sc.get('eigenvectors'):
+                return True
+        return False
+
+    def _bundle_disp_count(self, bundle):
+        return sum(len(sc.get('displacements', {}))
+                   for sc in (bundle.get('subcases') or {}).values())
+
+    def _show_mystran_summary(self, run, bundle):
+        """Single post-run dialog: where the files are, MYSTRAN ERR
+        contents (truncated), and an Open Folder button.
+
+        Replaces the v5.0.0-first-cut behaviour where a successful exit
+        code but no parsed results left the user staring at an
+        unchanged viewport with no idea where to look.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+            QPlainTextEdit, QFrame, QDialogButtonBox,
+        )
+        from PySide6.QtGui import QFont
+
+        run_dir = Path(run.bdf_path).parent if run.bdf_path else None
+        err_path = (Path(run.bdf_path).with_suffix('.ERR')
+                    if run.bdf_path else None)
+        err_text = ""
+        if err_path and err_path.exists():
+            try:
+                err_text = err_path.read_text(
+                    encoding='utf-8', errors='replace')
+            except Exception:
+                err_text = ""
+        # Count MYSTRAN-level errors in the ERR for the banner.
+        n_err = err_text.upper().count("*ERROR")
+        n_warn = err_text.upper().count("*WARNING")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("MYSTRAN run summary")
+        dlg.setMinimumSize(760, 480)
+
+        layout = QVBoxLayout(dlg)
+
+        # ---- Banner ----
+        has_data = bool(bundle) and self._bundle_has_data(bundle)
+        if has_data and n_err == 0:
+            banner_text = (
+                f"<b>Run successful.</b> {self._mystran_results_loaded_msg}")
+            banner_style = (
+                "background-color: #a6e3a1; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        elif has_data:
+            banner_text = (
+                f"<b>Run produced results, with {n_err} MYSTRAN error(s).</b> "
+                f"{self._mystran_results_loaded_msg} Inspect the ERR "
+                f"file below before trusting these numbers.")
+            banner_style = (
+                "background-color: #f9e2af; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        else:
+            banner_text = (
+                f"<b>MYSTRAN exited cleanly but produced no result data.</b><br>"
+                f"{n_err} error(s), {n_warn} warning(s) in the ERR file. "
+                f"{self._mystran_results_loaded_msg}")
+            banner_style = (
+                "background-color: #f38ba8; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        banner = QLabel(banner_text)
+        banner.setStyleSheet(banner_style)
+        banner.setWordWrap(True)
+        layout.addWidget(banner)
+
+        # ---- File summary ----
+        files_box = QLabel(
+            f"<b>Run folder:</b> <code>{run_dir}</code><br>"
+            f"<b>BDF:</b> <code>{Path(run.bdf_path).name if run.bdf_path else '-'}</code> | "
+            f"<b>F06:</b> <code>{Path(run.f06_path).name if run.f06_path else '(none)'}</code> | "
+            f"<b>OP2:</b> <code>{Path(run.op2_path).name if run.op2_path else '(none)'}</code>"
+        )
+        files_box.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; "
+            "padding: 6px 0;")
+        files_box.setWordWrap(True)
+        layout.addWidget(files_box)
+
+        # ---- ERR contents ----
+        layout.addWidget(QLabel("<b>MYSTRAN .ERR file:</b>"))
+        err_view = QPlainTextEdit()
+        err_view.setReadOnly(True)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.Monospace)
+        err_view.setFont(mono)
+        if err_text:
+            # Truncate very long ERR files so the dialog stays usable.
+            if len(err_text) > 20_000:
+                err_view.setPlainText(
+                    err_text[:20_000]
+                    + "\n\n[... truncated; open the file to see the rest ...]")
+            else:
+                err_view.setPlainText(err_text)
+        else:
+            err_view.setPlainText("(No ERR file produced.)")
+        layout.addWidget(err_view, 1)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep)
+
+        # ---- Buttons ----
+        button_row = QHBoxLayout()
+        if run_dir is not None:
+            open_btn = QPushButton("Open Run Folder")
+            open_btn.clicked.connect(lambda: self._open_folder(run_dir))
+            button_row.addWidget(open_btn)
+            open_err_btn = QPushButton("Open .ERR")
+            open_err_btn.setEnabled(bool(err_path and err_path.exists()))
+            open_err_btn.clicked.connect(lambda: self._open_folder(err_path))
+            button_row.addWidget(open_err_btn)
+            open_f06_btn = QPushButton("Open .F06")
+            open_f06_btn.setEnabled(
+                bool(run.f06_path and Path(run.f06_path).exists()))
+            open_f06_btn.clicked.connect(
+                lambda: self._open_folder(run.f06_path))
+            button_row.addWidget(open_f06_btn)
+        button_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dlg.exec()
+
+    def _open_folder(self, path):
+        """Open a folder (or file's parent) in the host file manager."""
+        import subprocess, sys
+        p = Path(path)
+        target = str(p if p.is_dir() else p.parent)
+        try:
+            if sys.platform == 'win32':
+                if p.is_file():
+                    # Open the file in its default app.
+                    os.startfile(str(p))
+                else:
+                    os.startfile(target)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', target])
+            else:
+                subprocess.Popen(['xdg-open', target])
+        except Exception:
+            pass
+
+    def _on_mystran_failed(self, msg):
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        # Build a MystranRun-like stub from any partial info we have.
+        run = getattr(self._solver_worker, '_run', None)
+        if run is not None:
+            self._mystran_results_loaded_msg = (
+                "MYSTRAN reported a non-zero exit code.")
+            self._show_mystran_summary(run, None)
+        else:
+            QMessageBox.critical(self, "MYSTRAN run failed", msg)
+        self._update_status("MYSTRAN run failed.", is_error=True)
+
+    def _on_mystran_cancelled(self):
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        self._update_status("MYSTRAN run cancelled.", is_error=False)
+
+    def _consume_mystran_bundle(self, bundle, run):
+        """Push a MYSTRAN result bundle into the existing OP2 plumbing.
+
+        Mirrors the data shape of ``model.load_op2_results`` so all the
+        existing Color-By-Results / Animation / Vector-Overlay paths
+        work unchanged.
+        """
+        self.op2_results = bundle
+        self._update_results_status(run, bundle)
+        # Trigger the same downstream that the OP2 menu item uses.
+        try:
+            self._on_results_changed()
+        except Exception:
+            pass
+        # Auto-open Result Browser if configured.
+        from node_runner.solve import mystran_settings
+        if mystran_settings.get('auto_open_browser', True):
+            try:
+                if getattr(self, '_result_browser_dock', None) is None:
+                    self._build_result_browser_dock()
+                if self._result_browser_dock is not None:
+                    self._result_browser_dock.show()
+                    self._result_browser_dock.raise_()
+            except Exception:
+                pass
+
+    def _update_results_status(self, run, bundle):
+        """Refresh the status-bar Results segment."""
+        if not hasattr(self, '_status_results_lbl'):
+            return
+        n_subcases = len(bundle.get('subcases', {}))
+        n_disp = sum(
+            len(sc.get('displacements', {}))
+            for sc in bundle.get('subcases', {}).values())
+        src = (run.results_source or "?").upper()
+        sol_label = {101: "SOL 1", 103: "SOL 3", 105: "SOL 5"}.get(
+            run.sol, f"SOL {run.sol}")
+        self._status_results_lbl.setText(
+            f"Results: {sol_label} ({src}) | "
+            f"{n_subcases} subcase{'s' if n_subcases != 1 else ''} | "
+            f"{n_disp:,} disp")
 
     def _create_default_analysis_set(self):
         """Create a default analysis set from legacy fields (sol_type, subcases, eigrl_cards)."""

@@ -29,8 +29,16 @@ extract the outer surface of solids.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pyvista as pv
+
+try:  # v5.0.0 item 1: diagnostic timers are gated on NR_PROFILE=1.
+    from node_runner.profiling import perf_event as _perf_event
+except Exception:  # pragma: no cover
+    def _perf_event(*_a, **_kw):
+        pass
 
 # Element-type metadata. Maps the elem.type string seen on the pyNastran
 # card object to:
@@ -60,7 +68,17 @@ ETYPE_INFO = {
 
 # kinds we render as shells (1 in the is_shell flag, used for surface
 # normals / lighting in the plotter).
-SHELL_KINDS = {'shell', 'shear'}
+#
+# v5.0.0 item 11c (shell-bucket split): the legacy single 'shell' kind
+# mixed 4-node (CQUAD4 / CMEMBRAN) and 3-node (CTRIA3) cells in the
+# same bucket. With max_n=4 and CTRIA3 having actual_n=3 the
+# `(actual_n == max_n).all()` check failed and the entire bucket fell
+# through to a Python row-by-row loop -- ~11 s on a 2.4M-cell deck.
+# The split partitions shells by n_nodes so each sub-bucket is
+# uniform-width and goes through the vectorized block-stack path.
+# Both sub-kinds remain shells for is_shell=1 purposes (downstream
+# lighting / extract_cells / slicing only reads the binary flag).
+SHELL_KINDS = {'shell', 'shell_q4', 'shell_tri3', 'shear'}
 
 # v3.3.0: tree-grouping maps. These used to be local dicts inside
 # MainWindow._populate_tree (which iterated every element twice to
@@ -205,8 +223,16 @@ def build_element_arrays_vectorized(
     # Pre-sort element IDs by kind. RBE2/RBE3 are rigid; we record
     # their node usage but don't render them as cells (MainWindow has
     # a dedicated _create_rbe_actors path).
+    #
+    # v5.0.0 item 11c: 'shell' is split into uniform-width sub-buckets
+    # so the vectorized block-stack path engages instead of the Python
+    # row-by-row fallback. shell_q4 holds 4-node (CQUAD4, CMEMBRAN);
+    # shell_tri3 holds 3-node (CTRIA3). 'shell' remains in the dicts
+    # as a back-compat placeholder (always empty, always 0); a
+    # synthetic 'shell' aggregate is emitted in the perf event below.
     buckets_by_kind = {
-        'shell': [], 'shear': [], 'solid': [], 'beam': [],
+        'shell': [], 'shell_q4': [], 'shell_tri3': [],
+        'shear': [], 'solid': [], 'beam': [],
         'rod': [], 'bush': [], 'gap': [],
     }
     # Per-bucket parallel lists: eids, pids, etype, node-id rows (each
@@ -215,15 +241,23 @@ def build_element_arrays_vectorized(
     pid_by_kind = {k: [] for k in buckets_by_kind}
     etype_by_kind = {k: [] for k in buckets_by_kind}
     nodes_by_kind = {k: [] for k in buckets_by_kind}
-    nodes_per_kind = {  # max nodes per cell within each kind
-        'shell': 0, 'shear': 0, 'solid': 0, 'beam': 0,
-        'rod': 0, 'bush': 0, 'gap': 0,
-    }
+    nodes_per_kind = {k: 0 for k in buckets_by_kind}
 
     processed = 0
     progress_every = max(50_000, n_total // 50)
+
+    # v5.0.0 item 1: per-kind wall-time + element-count attribution for the
+    # element-dict iteration loop. The dominant kind on production decks is the lever
+    # for the v5.1 real fix.
+    _iter_t0 = time.perf_counter()
+    kind_walltime: dict = {k: 0.0 for k in buckets_by_kind}
+    kind_count: dict = {k: 0 for k in buckets_by_kind}
+    kind_count['rigid_or_other'] = 0
+    kind_walltime['rigid_or_other'] = 0.0
+
     for elem_dict in elem_dicts:
         for eid, elem in elem_dict.items():
+            _t_elem = time.perf_counter()
             etype = getattr(elem, 'type', None)
             if etype is None:
                 continue
@@ -240,9 +274,15 @@ def build_element_arrays_vectorized(
                 except (AttributeError, TypeError):
                     pass
                 processed += 1
+                kind_count['rigid_or_other'] += 1
+                kind_walltime['rigid_or_other'] += (
+                    time.perf_counter() - _t_elem)
                 continue
             info = ETYPE_INFO.get(etype)
             if info is None:
+                kind_count['rigid_or_other'] += 1
+                kind_walltime['rigid_or_other'] += (
+                    time.perf_counter() - _t_elem)
                 continue
             n_nodes = info['n_nodes']
             try:
@@ -256,6 +296,19 @@ def build_element_arrays_vectorized(
             if len(row) < 2:
                 continue
             kind = info['kind']
+            # v5.0.0 item 11c: route shell elements into uniform-width
+            # sub-buckets so the vectorized block-stack composes in
+            # numpy rather than falling through to the Python row-by-row
+            # loop. Solid is left alone -- collapsed CHEXA/CTETRA forms
+            # do trigger the ragged path occasionally but the row count
+            # is bounded (~6k on production decks) so the cost is
+            # negligible. Only shells were a problem (2.4M rows).
+            if kind == 'shell':
+                if len(row) == 4:
+                    kind = 'shell_q4'
+                elif len(row) == 3:
+                    kind = 'shell_tri3'
+                # else: leave as 'shell' (unexpected, but defensive)
             eid_by_kind[kind].append(eid)
             pid_by_kind[kind].append(getattr(elem, 'pid', 0))
             etype_by_kind[kind].append(etype)
@@ -264,11 +317,36 @@ def build_element_arrays_vectorized(
             nodes_used.update(row)
 
             processed += 1
+            kind_count[kind] += 1
+            kind_walltime[kind] += time.perf_counter() - _t_elem
             if progress is not None and processed % progress_every == 0:
                 try:
                     progress(processed, n_total, kind)
                 except Exception:
                     pass
+
+    _iter_total_s = time.perf_counter() - _iter_t0
+    try:
+        # v5.0.0 item 11c: synthesize a 'shell' aggregate (shell_q4 +
+        # shell_tri3) in the kind_walltime / kind_count dicts so
+        # downstream log-grep queries comparing old vs new builds
+        # continue to find a 'shell' entry. The legacy 'shell' bucket
+        # itself is always empty after the split.
+        shell_total_wall = (kind_walltime.get('shell_q4', 0.0)
+                            + kind_walltime.get('shell_tri3', 0.0))
+        shell_total_count = (kind_count.get('shell_q4', 0)
+                             + kind_count.get('shell_tri3', 0))
+        _perf_event(
+            'scene_build', 'kind_iteration_walltime',
+            wall_s=round(_iter_total_s, 3),
+            n_total=n_total,
+            kind_walltime={k: round(v, 3) for k, v in kind_walltime.items()},
+            kind_count=kind_count,
+            shell_total_wall_s=round(shell_total_wall, 3),
+            shell_total_count=shell_total_count,
+        )
+    except Exception:
+        pass
 
     # Build VTK cells per kind. The cells array format is:
     #   [n0, idx0_0, idx0_1, ..., n1, idx1_0, idx1_1, ...]
@@ -284,10 +362,16 @@ def build_element_arrays_vectorized(
 
     sorted_nid_arr = np.asarray(sorted_node_ids, dtype=np.int64)
 
-    for kind in ('shell', 'shear', 'solid', 'beam', 'rod', 'bush', 'gap'):
+    # v5.0.0 item 11c: 'shell' kept in the iteration tuple for safety
+    # (always empty after the split routes elements into shell_q4 /
+    # shell_tri3) so any defensive lookup of nodes_by_kind['shell'] in
+    # downstream code returns an empty list rather than KeyError.
+    for kind in ('shell', 'shell_q4', 'shell_tri3', 'shear',
+                 'solid', 'beam', 'rod', 'bush', 'gap'):
         rows = nodes_by_kind[kind]
         if not rows:
             continue
+        _t_kind = time.perf_counter()
         # All rows in a kind should have the same length (n_nodes)
         # because each ETYPE_INFO entry pins it. Sanity-pad if a
         # collapsed solid produced a shorter row.
@@ -304,9 +388,10 @@ def build_element_arrays_vectorized(
         flat_raw = raw.ravel()
         flat_idx = np.searchsorted(sorted_nid_arr, flat_raw).reshape(
             len(rows), max_n)
+        uniform = bool((actual_n == max_n).all())
         # Compose the VTK cells block. For uniform-width rows this is
         # one column of n_nodes + n_nodes columns of indices.
-        if (actual_n == max_n).all():
+        if uniform:
             block = np.empty((len(rows), max_n + 1), dtype=np.int64)
             block[:, 0] = max_n
             block[:, 1:] = flat_idx
@@ -326,6 +411,16 @@ def build_element_arrays_vectorized(
         etype_all.append(np.asarray(etype_by_kind[kind], dtype=object))
         is_shell_all.append(np.full(
             len(rows), 1 if kind in SHELL_KINDS else 0, dtype=np.int8))
+        # v5.0.0 item 1: per-kind cell-composition timer so the v5.1
+        # fix can target the dominant kind precisely.
+        try:
+            _perf_event(
+                'scene_build', f'compose_{kind}',
+                wall_s=round(time.perf_counter() - _t_kind, 3),
+                n_rows=len(rows), max_n=int(max_n), uniform=uniform,
+            )
+        except Exception:
+            pass
 
     if cells_all:
         cells = np.concatenate(cells_all)

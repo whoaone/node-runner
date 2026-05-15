@@ -115,6 +115,17 @@ class ExportDefaultsDialog(QDialog):
         header.setWordWrap(True)
         layout.addWidget(header)
 
+        # v5.0.0 item 6: surface the current default prominently inside the
+        # dialog now that the status-bar "Export: ..." label is gone.
+        current_label_text = FORMAT_LABELS.get(self._selected_format, self._selected_format)
+        self._current_label = QLabel(
+            f"<b>Current default:</b> {current_label_text}"
+        )
+        self._current_label.setStyleSheet(
+            "color: #a6e3a1; font-size: 12px; padding: 4px 0;"
+        )
+        layout.addWidget(self._current_label)
+
         group_box = QGroupBox()
         group_layout = QVBoxLayout(group_box)
         self._button_group = QButtonGroup(self)
@@ -153,6 +164,10 @@ class ExportDefaultsDialog(QDialog):
     def _on_radio_toggled(self, key, checked):
         if checked:
             self._selected_format = key
+            if hasattr(self, '_current_label') and self._current_label is not None:
+                self._current_label.setText(
+                    f"<b>Current default:</b> {FORMAT_LABELS.get(key, key)}"
+                )
 
     @property
     def selected_format(self):

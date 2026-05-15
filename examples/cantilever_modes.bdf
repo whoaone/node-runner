@@ -1,0 +1,69 @@
+$ ----------------------------------------------------------------------
+$ Cantilever beam -- SOL 103 (Normal Modes)
+$
+$ Same geometry / material as cantilever_beam.bdf. Extracts the first
+$ five modes via Lanczos (EIGRL). Useful for verifying MYSTRAN's
+$ eigenvalue extractor and the Animation Timeline workflow on a small
+$ deck.
+$
+$ Analytical first bending frequency (Euler-Bernoulli):
+$   f_1 = (1.875)^2 / (2*pi*L^2) * sqrt(E*I / (rho*A))
+$   for L=10, I=0.0833 in^4, E=9.9e6, rho=0.098 lbm/in^3 / 386.4 in/s^2
+$   rho_mass = 0.098 / 386.4 = 2.537e-4 slinch/in^3
+$   f_1 ~ 81 Hz   (Mode 1 cycles should land around this)
+$
+$ The MIN4T QUAD shell formulation is not used (this is a beam-only
+$ model); SOLLIB / QUAD4TYP PARAMs that Node Runner injects are
+$ harmless here.
+$ ----------------------------------------------------------------------
+SOL 103
+CEND
+TITLE = Cantilever beam - SOL 103 (normal modes)
+SUBCASE 1
+  METHOD = 100
+  SPC = 1
+  DISPLACEMENT(PRINT,PLOT) = ALL
+BEGIN BULK
+$
+PARAM,WTMASS,2.588-3
+$
+$ -------- Material --------
+MAT1           1  9.9+6          .33    .098
+$
+$ -------- Property --------
+PBARL,1,1,,BAR
+,1.,1.
+$
+$ -------- Nodes --------
+GRID           1              0.      0.      0.
+GRID           2              1.      0.      0.
+GRID           3              2.      0.      0.
+GRID           4              3.      0.      0.
+GRID           5              4.      0.      0.
+GRID           6              5.      0.      0.
+GRID           7              6.      0.      0.
+GRID           8              7.      0.      0.
+GRID           9              8.      0.      0.
+GRID          10              9.      0.      0.
+GRID          11             10.      0.      0.
+$
+$ -------- Elements --------
+CBAR           1       1       1       2      0.      1.      0.
+CBAR           2       1       2       3      0.      1.      0.
+CBAR           3       1       3       4      0.      1.      0.
+CBAR           4       1       4       5      0.      1.      0.
+CBAR           5       1       5       6      0.      1.      0.
+CBAR           6       1       6       7      0.      1.      0.
+CBAR           7       1       7       8      0.      1.      0.
+CBAR           8       1       8       9      0.      1.      0.
+CBAR           9       1       9      10      0.      1.      0.
+CBAR          10       1      10      11      0.      1.      0.
+$
+$ -------- Constraint (root clamped) --------
+SPC1           1  123456       1
+$
+$ -------- Eigenvalue extraction (first 5 modes, Lanczos) --------
+$ EIGRL,SID,V1,V2,ND
+EIGRL        100      0.   2000.       5
+$
+ENDDATA

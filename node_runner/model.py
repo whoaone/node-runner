@@ -321,12 +321,19 @@ class NastranModelGenerator:
         except Exception as e:
             raise RuntimeError(f"pyNastran failed to parse BDF: {e}")
 
-    def _write_bdf(self, output_path, field_format='short'):
+    def _write_bdf(self, output_path, field_format='short', target='generic',
+                   **target_options):
         """Write the model as a Nastran BDF in the requested field format.
 
         field_format: 'short' (size=8), 'long' (size=16), or 'free' (comma).
         For 'free', pyNastran's BDF.write_bdf is invoked at size=8 and the
         resulting file is post-processed in place by `_convert_bdf_to_free`.
+
+        target: 'generic' (default; current MSC/NX-compatible export) or
+        'mystran'. The MYSTRAN target applies a translation layer
+        before the write (drop MSC/NX-only PARAMs, drop unsupported
+        cards, inject MYSTRAN-required PARAMs). target_options forwards
+        kwargs to the translator: sollib, quad4typ, wtmass, grdpnt.
 
         v3.2.2: if the model was imported through the streaming reader
         and any analysis-only cards (TEMP, TLOAD, etc.) were stripped
@@ -336,6 +343,22 @@ class NastranModelGenerator:
         """
         if field_format not in FIELD_FORMATS:
             field_format = 'short'
+
+        # v5.0.0 item 14: MYSTRAN target applies a translation layer
+        # and writes via the existing pyNastran path internally.
+        if target == 'mystran':
+            from node_runner.solve.mystran_export import (
+                translate_for_mystran)
+            translate_for_mystran(
+                self.model, output_path,
+                field_format=field_format,
+                sollib=target_options.get('sollib', 'IntMKL'),
+                quad4typ=target_options.get('quad4typ', 'MIN4T'),
+                wtmass=target_options.get('wtmass'),
+                grdpnt=target_options.get('grdpnt'),
+            )
+            # The translator wrote the file already; nothing else to do.
+            return
 
         if field_format == 'long':
             self.model.write_bdf(output_path, size=16, is_double=False)
@@ -4331,14 +4354,14 @@ class NastranModelGenerator:
             mb_total = total_bytes / 1e6 if total_bytes else mb_so_far
             indent = '  ' * min(depth, 4)
             _emit('inline',
-                  f"Stage 2/4: Reading include files - "
+                  f"Stage 3/6: Reading include files - "
                   f"{indent}{os.path.basename(path)} "
                   f"({inline_state['count']} / {len(files)} files, "
                   f"{mb_so_far:.1f} / {mb_total:.1f} MB)",
                   min(0.25, frac))
 
         _emit('inline',
-              f"Stage 2/4: Reading {len(files)} include files "
+              f"Stage 3/6: Reading {len(files)} include files "
               f"({total_bytes / 1e6:.1f} MB total) into a single buffer...",
               0.02)
         text, missing_inline = NastranModelGenerator._inline_includes(
@@ -4360,7 +4383,7 @@ class NastranModelGenerator:
         # trips intact.
         from node_runner.skip_cards import strip_analysis_only_cards
         _emit('parse',
-              label='Stage 2b/4: Stripping analysis-only cards',
+              label='Stage 4/6: Stripping analysis-only cards',
               detail='Looking for thermal loads, function tables, '
                      'optimization cards...',
               frac=0.24)
@@ -4383,7 +4406,7 @@ class NastranModelGenerator:
             top3 = ', '.join(
                 f'{n}: {c:,}' for n, c in _skip_counts.most_common(3))
             _emit('parse',
-                  label='Stage 2b/4: Analysis-only cards stashed',
+                  label='Stage 4/6: Analysis-only cards stashed',
                   detail=(f"Skipped {total_skipped:,} analysis-only cards "
                           f"({top3}). Will be written back on export."),
                   frac=0.25)
@@ -4461,7 +4484,7 @@ class NastranModelGenerator:
         )
         if skip_whole_strict:
             _emit('parse',
-                  f"Stage 3/4: Big deck detected, skipping whole-deck strict "
+                  f"Stage 5/6: Big deck detected, skipping whole-deck strict "
                   f"- {approx_card_count:,} cards, {flat_mb:.1f} MB. "
                   f"{last_file_detail}"
                   f"Going straight to chunked-strict (whole-deck would "
@@ -4470,7 +4493,7 @@ class NastranModelGenerator:
                   0.26)
         else:
             _emit('parse',
-                  f"Stage 3/4: Parsing flat deck strictly "
+                  f"Stage 5/6: Parsing flat deck strictly "
                   f"- {approx_card_count:,} cards, {flat_mb:.1f} MB. "
                   f"{last_file_detail}"
                   f"Window will appear frozen for this step.",
@@ -4508,14 +4531,14 @@ class NastranModelGenerator:
             # ---- Chunked-strict (always reached for big decks) ----
             if strict_fail_reason:
                 _emit('parse',
-                      f"Stage 4/4: Chunked-strict parse "
+                      f"Stage 5/6: Chunked-strict parse "
                       f"- whole-deck strict failed: {strict_fail_reason}. "
                       f"Splitting into ~8k-card chunks. Bad chunks fall "
                       f"back to lenient automatically.",
                       0.26)
             else:
                 _emit('parse',
-                      f"Stage 4/4: Chunked-strict parse "
+                      f"Stage 5/6: Chunked-strict parse "
                       f"- {approx_card_count:,} cards in ~8k-card chunks. "
                       f"Bad chunks fall back to lenient automatically.",
                       0.26)
@@ -4554,7 +4577,7 @@ class NastranModelGenerator:
                     eta_s = (total - done) / rate
 
                 _emit('parse',
-                      label='Stage 4/4: Chunked-strict parse',
+                      label='Stage 5/6: Chunked-strict parse',
                       frac=min(0.98, frac),
                       source_file=src,
                       card_type=card_name,
@@ -4608,7 +4631,7 @@ class NastranModelGenerator:
                     span = 0.72
                     frac = base + span * (idx / float(total))
                     _emit('parse',
-                          label='Stage 4/4: Lenient card-by-card',
+                          label='Stage 5/6: Lenient card-by-card',
                           frac=min(0.98, frac),
                           card_type=card_name,
                           line_number=line_number,

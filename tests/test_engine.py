@@ -620,7 +620,7 @@ class TestChunkedCrossRefs:
 
     def test_finalize_for_viewer_handles_dangling_rid(self, tmp_path):
         """v3.3.0: a coord whose rid references a coord not in the deck
-        must not raise. The user hit this on FUSE-XWFF_04A: CORD2R
+        must not raise. The user hit this on a production deck: CORD2R
         cid=920000 rid=200000, but 200000 was never defined.
 
         Expected: rid_ref falls back to basic, a warning is recorded

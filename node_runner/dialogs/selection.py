@@ -208,7 +208,7 @@ class EntitySelectionBar(QDialog):
         self._list_widget = QListWidget()
         self._list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._list_widget.setMinimumWidth(160)
-        self._list_widget.setMinimumHeight(110)
+        self._list_widget.setMinimumHeight(75)
         body.addWidget(self._list_widget, 1)
 
         # ----- RIGHT COLUMN: 3x3 button grid (v3.3.0) -----
@@ -399,6 +399,11 @@ class EntitySelectionBar(QDialog):
         self._paste_shortcut = QShortcut(
             QKeySequence.Paste, self, activated=self._paste_selection)
         self._paste_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
+
+        # v5.0.0: shorter default vertical size. List min-height was
+        # already cut to 75; resize() enforces a compact starting height
+        # the user can still drag larger via the bottom edge.
+        self.resize(self.sizeHint().width(), 260)
 
     # ------------------------------------------------------------------
     # Pick menu builder
