@@ -32,7 +32,7 @@ File → New → New Material → **Load…** → "Al 6061-T6 sheet/plate".
 
 ## Why these specific decks?
 
-- **Cantilever** is the textbook validation case — every FE textbook
+- **Cantilever** is the textbook validation case. every FE textbook
   has the closed-form for it. If MYSTRAN's tip deflection doesn't land
   near 0.0404 in on `cantilever_beam.bdf` something is wrong with the
   integration, not your real model.
@@ -44,6 +44,6 @@ File → New → New Material → **Load…** → "Al 6061-T6 sheet/plate".
 - **Modes deck** validates the Lanczos extractor (EIGRL). First five
   cycles should be sub-1000 Hz for this geometry.
 - **RBE2 spider** exercises the mixed-shell mesh path that v5.0.0
-  split into `shell_q4` and `shell_tri3` buckets — both element types
+  split into `shell_q4` and `shell_tri3` buckets. both element types
   appear in `current_grid.cell_data['type']` after import and both go
   through their own uniform-width vectorized compose path.

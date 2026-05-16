@@ -27,7 +27,7 @@ python -m pytest tests --cov=node_runner --cov-report=term-missing
 
 ## What's NOT covered automatically
 
-- Visual rendering (Femap-style point clouds, Gaussian-mapper-related issues)
+- Visual rendering (professional point clouds, Gaussian-mapper-related issues)
 - Real interactive workflows: cross-section scrubbing, probe-on-hover, animation playback
 - OP2 reader against an actual `.op2` file (we have synthetic data only)
 - 1M-node performance and UI responsiveness during scene build

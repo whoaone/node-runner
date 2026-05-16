@@ -3763,7 +3763,7 @@ class AddRsplineCommand(Command):
 
 
 class ConvertUnitsCommand(Command):
-    """Femap-style multi-factor unit conversion.
+    """professional multi-factor unit conversion.
 
     Snapshots all node positions, properties, materials, and load values,
     then applies the user's length / force / mass scale factors. Stress,

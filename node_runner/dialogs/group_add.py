@@ -1,4 +1,4 @@
-"""v3.4.0 (item 7): Femap-style tabbed Add-to-Group / Remove-from-Group
+"""v3.4.0 (item 7): professional tabbed Add-to-Group / Remove-from-Group
 dialog.
 
 The dialog lets the user push a set of IDs into a group's per-entity

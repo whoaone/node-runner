@@ -1,6 +1,6 @@
 """Cross-section / clipping plane controller and plane definitions.
 
-Femap-style "chop the model and look inside" feature, implemented at the
+professional "chop the model and look inside" feature, implemented at the
 VTK mapper level so it costs next to nothing at render time and works
 uniformly across every actor in the scene (skins, beams, nodes, ghost
 overlays, selection highlights).

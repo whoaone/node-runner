@@ -16,7 +16,7 @@ Units (all entries):
     Temp:     degF
 
 These are US customary, matching the user's aerospace Nastran workflow
-(Femap is unitless; we do not convert). The picker dialog surfaces these
+(no unit conversion is performed). The picker dialog surfaces these
 units on every load to force the user to confirm their model is in
 matching units before populating MAT1/MAT8 fields.
 """

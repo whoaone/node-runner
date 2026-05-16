@@ -36,7 +36,7 @@ from node_runner.dialogs.geometry import (
     CreateGeometrySurfaceDialog, MeshCurveDialog, MeshSurfaceDialog,
 )
 from node_runner.dialogs.export import (
-    ExportOptionsDialog, ExportDefaultsDialog, UnitsDialog, SaveBdfDialog,
+    ExportOptionsDialog, ExportDefaultsDialog, UnitsDialog, SaveBdfDialog, SaveBdfDialog,
 )
 from node_runner.dialogs.command_palette import (
     CommandPaletteDialog, install_command_palette_shortcut,
@@ -55,6 +55,7 @@ from node_runner.dialogs.loads_extra import (
     CreateRsplineDialog, CreateBoltDialog,
 )
 from node_runner.dialogs.result_browser import (
-    ResultBrowserDock, AnimationTimelineWidget, VectorOverlayWidget,
+    ResultBrowserPanel, ResultBrowserDock,
+    AnimationTimelineWidget, VectorOverlayWidget,
 )
 from node_runner.dialogs.units_conversion import UnitConversionDialog

@@ -1,6 +1,6 @@
 """Tools > Convert Units... dialog.
 
-Femap-style: the model is unitless, but you can ask the tool to rescale
+professional: the model is unitless, but you can ask the tool to rescale
 every relevant card by a set of factors (length, force, mass).
 Stress, density, and moment factors are derived from those three:
 

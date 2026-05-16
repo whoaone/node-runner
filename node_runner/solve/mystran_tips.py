@@ -2,7 +2,7 @@
 
 Central registry so the wording stays consistent between Preferences,
 the Run dialog, the status bar, and the menu items. Every string is
-written for an FEA user who knows MSC Nastran or Femap but has never
+written for an FEA user who knows MSC Nastran but has never
 touched MYSTRAN -- the tooltips explicitly call out where MYSTRAN
 differs from the MSC/NX dialect.
 
@@ -19,15 +19,16 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 
 SOL_101 = (
-    "<b>SOL 101 — Linear Static</b><br>"
+    "<b>SOL 101. Linear Static</b><br>"
     "Apply loads, get nodal displacements + element stresses. "
-    "Same meaning as <i>MSC Nastran SOL 101</i> and Femap's "
-    "<i>Analysis Type: Static</i>. "
+    "Same meaning as <i>MSC Nastran SOL 101</i>. "
+    "Equivalent to the <i>Static</i> analysis type in common "
+    "pre/post tools. "
     "Use for sizing, stress checks, deflection limits."
 )
 
 SOL_103 = (
-    "<b>SOL 103 — Normal Modes</b><br>"
+    "<b>SOL 103. Normal Modes</b><br>"
     "Eigenvalue extraction: natural frequencies + mode shapes "
     "(no loads). Same as <i>MSC SOL 103</i>. "
     "Requires an EIGRL card (handled automatically when you pick "
@@ -35,7 +36,7 @@ SOL_103 = (
 )
 
 SOL_105 = (
-    "<b>SOL 105 — Linear Buckling</b><br>"
+    "<b>SOL 105. Linear Buckling</b><br>"
     "Critical-load eigenvalue extraction. Same as <i>MSC SOL 105</i>. "
     "Needs <b>both</b> a static load case <b>and</b> a buckling "
     "extractor (EIGRL). The eigenvalue λ multiplied by the applied "
@@ -56,16 +57,16 @@ SOLS_NOT_SUPPORTED = (
 # ---------------------------------------------------------------------------
 
 SOLLIB = (
-    "<b>SOLLIB</b> — solver library for the K·x = F system.<br>"
+    "<b>SOLLIB</b>. solver library for the K·x = F system.<br>"
     "• <b>SPARSE</b>: scales to large DOF, low memory. Recommended.<br>"
     "• <b>BANDED</b>: faster for tiny tightly-banded decks; blows up "
     "on production-size models.<br>"
-    "<i>NOT</i> the same as MSC's IntMKL/LAPACK selector — MYSTRAN's "
+    "<i>NOT</i> the same as MSC's IntMKL/LAPACK selector. MYSTRAN's "
     "only two options are SPARSE and BANDED."
 )
 
 QUAD4TYP = (
-    "<b>QUAD4TYP</b> — CQUAD4 shell element formulation.<br>"
+    "<b>QUAD4TYP</b>. CQUAD4 shell element formulation.<br>"
     "• <b>MIN4T</b>: Mindlin–Reissner <i>with</i> transverse shear "
     "(recommended for most structural work).<br>"
     "• <b>MIN4</b>: Mindlin without transverse shear (thin shells; "
@@ -75,7 +76,7 @@ QUAD4TYP = (
 )
 
 WTMASS = (
-    "<b>WTMASS</b> — weight-to-mass conversion factor.<br>"
+    "<b>WTMASS</b>. weight-to-mass conversion factor.<br>"
     "If your model density is in <b>weight</b> units (lbm/in³, "
     "kg/mm³), set WTMASS = 1/g so MYSTRAN converts to mass units. "
     "Common values:<br>"
@@ -86,7 +87,7 @@ WTMASS = (
 )
 
 GRDPNT = (
-    "<b>GRDPNT</b> — grid point id for mass-properties summary.<br>"
+    "<b>GRDPNT</b>. grid point id for mass-properties summary.<br>"
     "MYSTRAN computes rigid-body inertia about this grid and writes "
     "it to the <code>G R I D   P O I N T   W E I G H T   G E N E R A T O R</code> "
     "section of the F06. Use 0 to summarize about the origin. "
@@ -94,7 +95,7 @@ GRDPNT = (
 )
 
 EPSIL = (
-    "<b>EPSIL</b> — numerical singularity tolerance (advanced).<br>"
+    "<b>EPSIL</b>. numerical singularity tolerance (advanced).<br>"
     "Node Runner does <b>not</b> inject this automatically: MYSTRAN's "
     "syntax is two-field (<code>PARAM,EPSIL,&lt;eqn_set_id&gt;,&lt;tol&gt;</code>) "
     "and pyNastran's writer doesn't reproduce that shape. If you "
@@ -117,7 +118,7 @@ ANALYSIS_SET = (
 OUTPUT_DISP = (
     "<b>DISPLACEMENT</b> output request.<br>"
     "Per-node 6-DOF displacement vector. Always on for SOL 101/103/105 "
-    "— this is the data that drives Color-By-Results contours and "
+    ". this is the data that drives Color-By-Results contours and "
     "the Animation timeline."
 )
 
@@ -166,14 +167,14 @@ KEEP_INTERMEDIATES = (
     "<b>Keep intermediate files</b><br>"
     "When ON: MYSTRAN's working files (.L1*, .OP2, .ERR) stay in the "
     "run folder. When OFF: only BDF + F06 + log are kept. "
-    "Recommend ON while you're learning MYSTRAN — the .ERR file is "
+    "Recommend ON while you're learning MYSTRAN. the .ERR file is "
     "essential for diagnosing failed runs."
 )
 
 AUTO_LOAD_RESULTS = (
     "<b>Auto-load results</b><br>"
     "When a run finishes, automatically parse the OP2/F06 and push "
-    "results into the Result Browser. Mirrors Femap's "
+    "results into the Result Browser. Provides "
     "<i>Read Results on Analyze</i>."
 )
 
@@ -197,7 +198,7 @@ EXE_PATH = (
     "PATH and common install locations "
     "(<code>C:\\MYSTRAN\\mystran.exe</code>, "
     "<code>/usr/local/bin/mystran</code>, etc.). "
-    "Node Runner does not bundle MYSTRAN — download it from "
+    "Node Runner does not bundle MYSTRAN. download it from "
     "the upstream project."
 )
 
@@ -210,7 +211,7 @@ ANALYSIS_RUN_MENU = (
     "<b>Run Analysis (MYSTRAN)…</b>   (Ctrl+R)<br>"
     "Pre-flight scan, then translate + solve via the configured "
     "MYSTRAN binary, then auto-load results. The MYSTRAN equivalent "
-    "of Femap's <i>Analyze</i> button."
+    "of MSC Nastran's analysis runner."
 )
 
 ANALYSIS_HISTORY_MENU = (

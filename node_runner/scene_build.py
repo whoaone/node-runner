@@ -23,7 +23,7 @@ The vectorized path:
 
 The display-LOD helper (apply_display_lod) is what we hand to
 plotter.add_mesh; the underlying current_grid keeps every cell for
-picking. Femap-style: above 500k elements we stride-sample shells and
+picking. professional: above 500k elements we stride-sample shells and
 extract the outer surface of solids.
 """
 
@@ -456,7 +456,7 @@ def apply_display_lod(grid, threshold=500_000, target_shells=200_000):
     The returned grid is what we hand to plotter.add_mesh. The original
     ``grid`` stays untouched and is what the picker / queries use.
 
-    Rules (Femap-style):
+    Rules (professional):
       * If grid.n_cells <= threshold: return grid unchanged (no LOD).
       * Otherwise:
           - For shell/quad/tria cells, stride-sample so the count is

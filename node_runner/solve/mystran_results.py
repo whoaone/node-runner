@@ -198,7 +198,7 @@ def _op2_object_to_bundle(op2, filepath: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # MYSTRAN's F06 uses "D I S P L A C E M E N T S" (trailing S).
-# MSC/Femap uses "D I S P L A C E M E N T   V E C T O R". Accept either
+# MSC Nastran uses "D I S P L A C E M E N T   V E C T O R". Accept either
 # so the parser also handles hand-crafted MSC-style fixtures.
 _F06_DISP_HEADER = re.compile(
     r"D\s*I\s*S\s*P\s*L\s*A\s*C\s*E\s*M\s*E\s*N\s*T\s*"
@@ -240,7 +240,7 @@ _F = r"[-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?"
 #       1        0  0.0           0.0          -6.181010E-04  0.0    ...
 #    Field 2 is the integer coord-system id (0 = global).
 #
-# 2) MSC/Femap: "<GID>  G  <T1>  <T2>  <T3>  <R1>  <R2>  <R3>"
+# 2) MSC Nastran: "<GID>  G  <T1>  <T2>  <T3>  <R1>  <R2>  <R3>"
 #       1       G   1.234567E-04  ...
 #    Field 2 is the literal letter "G" marking grid type (vs "S" for
 #    scalar point).

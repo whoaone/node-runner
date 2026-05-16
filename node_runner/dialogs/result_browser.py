@@ -1,13 +1,18 @@
-"""Theme B: Result browser dock and supporting widgets.
+"""Theme B: Result browser panel/dock and supporting widgets.
 
 Hosts:
-  * `ResultTableModel` - QAbstractTableModel backed by numpy arrays for
+  * ``ResultTableModel`` - QAbstractTableModel backed by numpy arrays for
     fast scrolling on huge OP2 results.
-  * `ResultBrowserDock` - the right-side dock with sortable table tabs
-    for nodal and element results plus a built-in expression bar.
-  * `AnimationTimelineWidget` - play/pause/scrub timeline for mode
+  * ``ResultBrowserPanel`` - the table-tab body (Nodes / Elements with an
+    expression bar). v5.1.2 extracted this out of the QDockWidget so it
+    can be hosted directly inside the Results sidebar tab.
+  * ``ResultBrowserDock`` - thin QDockWidget shim that wraps a
+    ``ResultBrowserPanel`` for back-compat with any external callers /
+    tests that import the dock class. v5.1.2 stopped instantiating this
+    in mainwindow; it lives on only as a fallback.
+  * ``AnimationTimelineWidget`` - play/pause/scrub timeline for mode
     shapes, replacing the old GIF-export-only flow.
-  * `VectorOverlayWidget` - checkboxes to toggle displacement /
+  * ``VectorOverlayWidget`` - checkboxes to toggle displacement /
     principal stress / reaction-force arrows on the 3D view.
 
 These are pure Qt widgets - all model mutation goes through the
@@ -93,17 +98,21 @@ class ResultTableModel(QAbstractTableModel):
 
 
 # ---------------------------------------------------------------------------
-# Result browser dock
+# Result browser panel (Nodes / Elements tables + expression bar)
 # ---------------------------------------------------------------------------
 
-class ResultBrowserDock(QDockWidget):
-    """Sortable result table + expression bar, dockable on the main window.
+class ResultBrowserPanel(QWidget):
+    """Sortable result table + expression bar.
+
+    v5.1.2 extracted out of ``ResultBrowserDock`` so the same body can
+    be hosted inside the Results sidebar tab (the new home for all
+    results UX) without forcing a QDockWidget wrapper.
 
     Signals
     -------
     entity_picked : (entity_type, entity_id)
-        Emitted when a row's "Zoom to" button is clicked or a row is
-        double-clicked. ``entity_type`` is 'Node' or 'Element'.
+        Emitted when a row is double-clicked. ``entity_type`` is 'Node'
+        or 'Element'.
     expression_changed : str
         Emitted when the expression input loses focus or the user
         presses Enter.
@@ -113,12 +122,10 @@ class ResultBrowserDock(QDockWidget):
     expression_changed = Signal(str)
 
     def __init__(self, parent=None):
-        super().__init__("Results", parent)
-        self.setObjectName("ResultBrowserDock")
-        self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
-
-        wrapper = QWidget(); layout = QVBoxLayout(wrapper)
-        layout.setContentsMargins(6, 6, 6, 6); layout.setSpacing(6)
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         # Expression bar
         expr_row = QHBoxLayout()
@@ -143,9 +150,6 @@ class ResultBrowserDock(QDockWidget):
         self.tabs.addTab(self.node_view, "Nodes")
         self.tabs.addTab(self.elem_view, "Elements")
         layout.addWidget(self.tabs, 1)
-
-        self.setWidget(wrapper)
-        self.hide()  # only show when results loaded
 
         # Models
         self._node_model = ResultTableModel(['NID'], {'NID': np.array([])}, id_column='NID', parent=self)
@@ -201,6 +205,13 @@ class ResultBrowserDock(QDockWidget):
         self._elem_model = ResultTableModel(columns, arrays, id_column='EID', parent=self)
         self._set_model(self.elem_view, self._elem_model)
 
+    def clear(self):
+        """Reset both tables to empty single-column models."""
+        self._node_model = ResultTableModel(['NID'], {'NID': np.array([])}, id_column='NID', parent=self)
+        self._elem_model = ResultTableModel(['EID'], {'EID': np.array([])}, id_column='EID', parent=self)
+        self._set_model(self.node_view, self._node_model)
+        self._set_model(self.elem_view, self._elem_model)
+
     def select_node(self, nid: int):
         row = self._node_model.row_of_id(nid)
         if row is None:
@@ -224,6 +235,68 @@ class ResultBrowserDock(QDockWidget):
         proxy_idx = proxy.mapFromSource(self._elem_model.index(row, 0))
         self.elem_view.selectRow(proxy_idx.row())
         self.elem_view.scrollTo(proxy_idx)
+
+
+# ---------------------------------------------------------------------------
+# Result browser dock (back-compat shim around ResultBrowserPanel)
+# ---------------------------------------------------------------------------
+
+class ResultBrowserDock(QDockWidget):
+    """Back-compat shim for callers/tests that still expect a QDockWidget.
+
+    v5.1.2: MainWindow no longer instantiates this -- the Results sidebar
+    tab embeds a ``ResultBrowserPanel`` directly. This class is kept as
+    a thin wrapper so external code (and the test_ui back-compat case)
+    that imports ``ResultBrowserDock`` continues to work.
+    """
+
+    entity_picked = Signal(str, int)
+    expression_changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__("Results", parent)
+        self.setObjectName("ResultBrowserDock")
+        self.setAllowedAreas(Qt.RightDockWidgetArea | Qt.LeftDockWidgetArea)
+        self._panel = ResultBrowserPanel(self)
+        self._panel.entity_picked.connect(self.entity_picked.emit)
+        self._panel.expression_changed.connect(self.expression_changed.emit)
+        self.setWidget(self._panel)
+        self.hide()  # only show when results loaded
+
+    # Expose the legacy attribute names that older code touched directly
+    # so a drop-in replacement keeps working.
+    @property
+    def expression_edit(self):
+        return self._panel.expression_edit
+
+    @property
+    def tabs(self):
+        return self._panel.tabs
+
+    @property
+    def node_view(self):
+        return self._panel.node_view
+
+    @property
+    def elem_view(self):
+        return self._panel.elem_view
+
+    # --- public API used by MainWindow (forwards to the panel) ---
+
+    def update_nodal_results(self, columns: list[str], arrays: dict):
+        self._panel.update_nodal_results(columns, arrays)
+
+    def update_element_results(self, columns: list[str], arrays: dict):
+        self._panel.update_element_results(columns, arrays)
+
+    def clear(self):
+        self._panel.clear()
+
+    def select_node(self, nid: int):
+        self._panel.select_node(nid)
+
+    def select_element(self, eid: int):
+        self._panel.select_element(eid)
 
 
 # ---------------------------------------------------------------------------

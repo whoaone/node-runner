@@ -6,7 +6,7 @@ the user filter and select a preset material from
 selected material dict; the caller is expected to (a) show the unit
 confirmation banner and (b) populate the MAT1 / MAT8 form fields.
 
-Femap parity: the source units are surfaced both in the table header
+Convention: the source units are surfaced both in the table header
 AND in the confirmation banner, because the app itself is unitless and
 US aerospace work almost always uses psi / lbm / in / degF rather than
 the SI defaults that many tools assume.

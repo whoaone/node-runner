@@ -355,27 +355,27 @@ class TestMultiLineInclude:
         m, lenient = NastranModelGenerator._read_bdf_robust(str(main))
         assert len(m.nodes) == 1
 
-    def test_alllods_bdf_style_2line_include(self, tmp_path):
-        """The exact 2-line form seen in user's LD2.5.1.8/LOAD/AllLoads.bdf:
+    def test_two_line_include_with_backslash_split(self, tmp_path):
+        """The 2-line INCLUDE form that aerospace decks use to keep the
+        path under MSC Nastran's 72-column field limit:
 
            INCLUDE '..\\LOAD\\EXT\\
-           LD2-DLL-Entry_E0att009cA1XA_..bdf'
+           included_card_set.bdf'
 
         Line 1 opens the quote and ends mid-path (after a backslash
         separator). Line 2 starts at column 1 with the filename and
-        closes the quote. Many real aerospace decks use this form so
-        the path stays under MSC Nastran's 72-column field limit.
+        closes the quote.
         """
         (tmp_path / 'LOAD' / 'EXT').mkdir(parents=True)
         (tmp_path / 'EXEC').mkdir()
         target = (tmp_path / 'LOAD' / 'EXT' /
-                  'LD2-DLL-Entry_E0att009cA1XA.bdf')
+                  'included_card_set.bdf')
         target.write_text('GRID,999,,1.0,2.0,3.0\n')
         main = tmp_path / 'EXEC' / 'main.bdf'
         main.write_text(
             "BEGIN BULK\n"
             "INCLUDE '..\\LOAD\\EXT\\\n"
-            "LD2-DLL-Entry_E0att009cA1XA.bdf'\n"
+            "included_card_set.bdf'\n"
             "ENDDATA\n"
         )
         m, lenient = NastranModelGenerator._read_bdf_robust(str(main))

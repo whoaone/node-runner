@@ -1,4 +1,4 @@
-"""Tests for the v3.3.0 Femap-style signed-bucket EntitySelectionBar.
+"""Tests for the v3.3.0 professional signed-bucket EntitySelectionBar.
 
 The bucket is a list of (mode, start, end, step) entries. Each entry's
 label is signed:
@@ -104,7 +104,7 @@ def test_delete_row_undoes_pick(bar):
 
 
 def test_bucket_display_signs(bar):
-    """Visible labels in the QListWidget use the Femap-style signed
+    """Visible labels in the QListWidget use the professional signed
     triplet (or short single-ID form)."""
     bar._append_entry('+', 1, 10, 2)   # "1, 10, 2"
     bar._append_entry('-', 8, 8, 1)    # "-8"
@@ -234,7 +234,7 @@ def test_visibility_filter_still_drops_dangling(qapp):
 
 
 def test_paste_via_internal_helper_into_bucket(qapp):
-    """Item 1+2: clipboard text in Femap range format gets parsed and
+    """Item 1+2: clipboard text in a professional FEA tool range format gets parsed and
     added to the bucket. This exercises the same code path that the
     Ctrl+V QShortcut and the Pick > Paste menu trigger."""
     from PySide6.QtWidgets import QApplication

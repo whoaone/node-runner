@@ -1,11 +1,11 @@
-"""v3.5.0 (item 2): Femap-style Load Combination edit dialog.
+"""v3.5.0 (item 2): professional Load Combination edit dialog.
 
 A Nastran LOAD card combines multiple load sets with scale factors:
 
     LOAD,sid,S,S1,L1,S2,L2,...
 
 where `S` is the overall scale and each `(Si, Li)` pair multiplies
-load set `Li` by `Si`. Femap exposes this through "Model > Load >
+load set `Li` by `Si`. Common tools expose this through "Model > Load >
 Combine" with a (scale, SID) row editor.
 
 This dialog mirrors that UI:

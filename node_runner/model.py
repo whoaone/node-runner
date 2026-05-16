@@ -3696,7 +3696,7 @@ class NastranModelGenerator:
            stripped. A leading '+' or '*' continuation marker is also
            stripped.
 
-        3. **Unclosed-quote continuation** (seen from some Femap
+        3. **Unclosed-quote continuation** (seen from some tool-generated
            exports and hand-edited decks):
               INCLUDE 'this/is/a/long
                        /path/file.bdf'
@@ -4345,7 +4345,7 @@ class NastranModelGenerator:
         # MainWindow LenientImportReportDialog already knows how to
         # display SkippedCard entries, so the user sees something like:
         #
-        #   line 0  CHUNK-IN-Wing_SE_Complete.pch  ...real reason...
+        #   line 0  CHUNK-IN-Example_Bulk.pch  ...real reason...
         #
         # in the post-import skipped-cards report.
         for src_key, reason in first_failure_per_file.items():
@@ -5498,6 +5498,80 @@ def load_op2_results(filepath):
                             'min_principal': float(row[6]) if len(row) > 6 else 0.0,
                             'von_mises': float(row[7]) if len(row) > 7 else 0.0,
                         }
+
+        # --- CBAR / CBEAM stress (v5.2.1 Round-3) ---
+        # MYSTRAN writes element stress tables for line elements that
+        # pyNastran exposes as op2.cbar_stress / op2.cbeam_stress. Each
+        # row carries (axial, sa1..sa4, sa_max, sa_min, sb1..sb4,
+        # sb_max, sb_min) or a similar layout. We collapse to a single
+        # 'von_mises' value = max abs combined stress so the existing
+        # "Stress - von Mises" dropdown entry works on beam-only decks.
+        for line_attr in ('cbar_stress', 'cbeam_stress',
+                          'cbar_force', 'cbeam_force'):
+            line_dict = getattr(op2, line_attr, {})
+            if sc_id not in line_dict:
+                continue
+            try:
+                obj = line_dict[sc_id]
+                eids_arr = obj.element if hasattr(obj, 'element') \
+                    else obj.element_node[:, 0]
+                op2_data = obj.data
+                last = op2_data[-1]
+                headers = (getattr(obj, 'headers', None)
+                           or (obj.get_headers()
+                               if hasattr(obj, 'get_headers') else [])
+                           or [])
+                headers_list = list(headers)
+
+                def _col(row, name, _h=headers_list):
+                    try:
+                        i = _h.index(name)
+                    except (ValueError, AttributeError):
+                        return None
+                    if i < len(row):
+                        return float(row[i])
+                    return None
+
+                is_force = 'force' in line_attr
+                for i, raw_eid in enumerate(eids_arr):
+                    eid = int(raw_eid)
+                    row = last[i]
+                    entry = sc_data['stresses'].get(eid, {})
+                    if not is_force:
+                        candidates = []
+                        for nm in ('axial', 'sa_max', 'sa_min', 'sb_max',
+                                   'sb_min', 'smax', 'smin'):
+                            v = _col(row, nm)
+                            if v is not None:
+                                entry[nm] = v
+                                candidates.append(abs(v))
+                        if candidates:
+                            entry['von_mises'] = max(candidates)
+                            entry.setdefault(
+                                'max_principal',
+                                max(entry.get('sa_max', 0.0),
+                                    entry.get('sb_max', 0.0),
+                                    entry.get('axial', 0.0)))
+                            entry.setdefault(
+                                'min_principal',
+                                min(entry.get('sa_min', 0.0),
+                                    entry.get('sb_min', 0.0),
+                                    entry.get('axial', 0.0)))
+                        sc_data['stresses'][eid] = entry
+                    else:
+                        forces_dict = entry.setdefault('_forces', {})
+                        for nm in ('axial', 'shear1', 'shear2', 'torque',
+                                   'bending_moment_a1', 'bending_moment_a2',
+                                   'bending_moment_b1', 'bending_moment_b2'):
+                            v = _col(row, nm)
+                            if v is not None:
+                                forces_dict[nm] = v
+                        sc_data['stresses'][eid] = entry
+            except Exception:
+                # Defensive: pyNastran's per-element-type column layout
+                # is fragile across versions. Drop the table on any
+                # unexpected shape rather than crashing the loader.
+                pass
 
         # --- Element Strains (Theme B6) ---
         sc_data['strains'] = {}

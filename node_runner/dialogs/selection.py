@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QActionGroup, QFont, QShortcut, QKeySequence
 
 
 # ---------------------------------------------------------------------------
-# EntitySelectionBar - Femap-style floating selection window (v3.3.0)
+# EntitySelectionBar - professional floating selection window (v3.3.0)
 # ---------------------------------------------------------------------------
 #
 #  Layout (3-column):
@@ -42,7 +42,7 @@ class _RangeEntry:
 
     Attributes:
         mode:  '+', '-', or 'x'  (add / remove / exclude)
-        start, end, step:        the Femap-style range tuple. For a
+        start, end, step:        the professional range tuple. For a
                                  single ID, start == end and step == 1.
         label:                   display string with sign prefix.
         ids:                     cached frozenset of integer IDs the
@@ -72,7 +72,7 @@ class _RangeEntry:
 
 
 class EntitySelectionBar(QDialog):
-    """Femap-style entity selection window - floating, movable, non-modal."""
+    """professional entity selection window - floating, movable, non-modal."""
 
     request_show_selection = QtCore.Signal(str, list)
     request_picking_mode = QtCore.Signal(str, bool)

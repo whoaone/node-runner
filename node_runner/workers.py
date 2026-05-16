@@ -33,6 +33,15 @@ def _stage(n: int, title: str) -> str:
     """Format a stage label using the unified denominator."""
     return f"Stage {n}/{_N_IMPORT_STAGES}: {title}"
 
+# v5.0.0 item 5: single source of truth for the import-progress stage
+# denominator. Update here when adding or removing a stage.
+_N_IMPORT_STAGES = 6
+
+
+def _stage(n: int, title: str) -> str:
+    """Format a stage label using the unified denominator."""
+    return f"Stage {n}/{_N_IMPORT_STAGES}: {title}"
+
 
 class BdfReadWorker(QObject):
     """Run NastranModelGenerator's robust read in a background thread.

@@ -32,6 +32,15 @@ def pytest_configure(config):
     )
 
 
+def pytest_configure(config):
+    """Register custom markers so unknown-mark warnings don't fire."""
+    config.addinivalue_line(
+        "markers",
+        "mystran_e2e: end-to-end MYSTRAN runs (requires the binary; "
+        "skipped by default).",
+    )
+
+
 @pytest.fixture
 def tiny_gen():
     """A 4-node planar quad + a 2-node beam + 1 mat + 2 props."""

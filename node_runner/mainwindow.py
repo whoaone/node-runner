@@ -13,6 +13,7 @@ import copy
 from pyvistaqt import QtInteractor
 
 from PySide6 import QtCore, QtGui
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QMessageBox, QFormLayout, QGroupBox, QFrame,
@@ -101,6 +102,23 @@ class _ClickableLabel(QLabel):
         super().mousePressEvent(ev)
 
 
+# v5.0.0 item 10: tiny clickable QLabel for status-bar hints. Emits
+# a `clicked` signal on mouse press so we can wire it to an existing
+# action callback (e.g. command palette). Kept inline here so it lives
+# next to the only consumer in `_build_status_widgets`.
+class _ClickableLabel(QLabel):
+    clicked = QtCore.Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(QtCore.Qt.PointingHandCursor)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(ev)
+
+
 # v4.0.11 (Fix C): module-level Nastran-type ↔ category lookup tables.
 # Pre-built per-category actors at viewer-build time are named
 # `cat_<NTYPE>` and toggled via these mappings.
@@ -153,6 +171,17 @@ _NTYPE_TO_SHAPE_CATEGORY: dict[str, str] = {
 # handles it (e.g., 'quality' / 'results' which depend on external
 # data flow).
 _PRE_BUILT_SUPPORTED_COLOR_MODES: frozenset = frozenset({'type', 'property'})
+
+
+# v5.2.0 item 43: human-friendly suffix for the active data conversion
+# mode shown in the scalar-bar title. ``average`` is the default and
+# stays unannotated.
+_CONV_LABEL: dict = {
+    'average':  'avg',
+    'no_avg':   'no avg',
+    'max_node': 'max@node',
+    'min_node': 'min@node',
+}
 
 
 class SelectionOverlay:
@@ -295,6 +324,12 @@ class SelectionOverlay:
 
 
 class MainWindow(QMainWindow):
+    # v5.2.0 item 45: signal emitted whenever the viewport selection
+    # changes. The Data Table dialog (Tools -> Data Table) subscribes
+    # to live-sync its rows. Payload: (kind, ids) where kind is
+    # 'Node' or 'Element'.
+    selection_changed = Signal(str, list)
+
     def __init__(self):
         super().__init__()
         from node_runner import __version__ as _nr_version
@@ -383,7 +418,7 @@ class MainWindow(QMainWindow):
         self._visible_spc_sids: set = set()
         # v4.0.14 (Fix C v2): pre-built per-Nastran-type actors,
         # redesigned after v4.0.11 was reverted. Built from the FULL
-        # `current_grid` (not the LOD'd `current_display_grid` —
+        # `current_grid` (not the LOD'd `current_display_grid`.
         # that was the v4.0.11 visual regression: ~10% of plates
         # showed because the LOD shell-stride sampler reduces shells
         # to 200k and drops RBE2/RBE3 entirely). With current_grid:
@@ -392,6 +427,13 @@ class MainWindow(QMainWindow):
         # PID/MID/isolate/hidden_groups force fall-through to legacy
         # _rebuild_plot via `_using_legacy_mesh`.
         self._category_actors: dict = {}
+        # v5.0.0 item 11a: per-cell visibility via vtkGhostType cell-data
+        # on each `cat_<ntype>` actor's underlying grid. Sub-100 ms PID
+        # and MID toggles flip these bits in-place; the legacy
+        # _rebuild_plot path no longer engages for plain PID/MID filters.
+        self._category_actor_grids: dict = {}
+        self._hidden_pids: set = set()
+        self._hidden_mids: set = set()
         # v5.0.0 item 11a: per-cell visibility via vtkGhostType cell-data
         # on each `cat_<ntype>` actor's underlying grid. Sub-100 ms PID
         # and MID toggles flip these bits in-place; the legacy
@@ -413,7 +455,7 @@ class MainWindow(QMainWindow):
         self._export_format = _settings.value("export/default_format", "short")
         if self._export_format not in ("short", "long", "free"):
             self._export_format = "short"
-        # Node Runner is intentionally unitless (Femap-style). The "units"
+        # Node Runner is intentionally unitless (professional). The "units"
         # value is just a free-text label shown in the status bar so you
         # remember which unit system you've been working in. To actually
         # rescale model values, use Tools > Convert Units.
@@ -538,7 +580,7 @@ class MainWindow(QMainWindow):
         groups_layout.setContentsMargins(4, 4, 4, 4)
         groups_layout.setSpacing(4)
 
-        # v3.4.0 item 7: Femap-style top toolbar (two rows). All
+        # v3.4.0 item 7: professional top toolbar (two rows). All
         # buttons that used to live below the group list move up here.
         tb_row1 = QHBoxLayout(); tb_row1.setSpacing(3)
         for label, slot, tip in (
@@ -948,7 +990,13 @@ class MainWindow(QMainWindow):
         anim_layout.addWidget(self.anim_export_gif_btn)
         results_layout.addRow("Animate:", anim_widget)
         display_tab_layout.addWidget(self.results_widget)
+        # v5.2.0 item 47: the legacy "Results" QGroupBox in the Display
+        # tab is kept as a hidden state holder -- the combos still feed
+        # _update_plot_visibility, but the new Post-Processing Toolbox
+        # (Results sidebar tab) is the visible interface. Hide
+        # permanently so the user never sees both UIs at once.
         self.results_widget.setVisible(False)
+        self._legacy_results_widget_hidden = True
         self.results_subcase_combo.currentIndexChanged.connect(self._on_results_changed)
         self.results_type_combo.currentIndexChanged.connect(self._on_results_type_changed)
         self.results_component_combo.currentIndexChanged.connect(self._on_results_changed)
@@ -974,31 +1022,46 @@ class MainWindow(QMainWindow):
         # ─── v5.1.0 item 25: Results sidebar tab ────────────────────
         from node_runner.dialogs.results_tab import ResultsTab
         self.results_tab = ResultsTab(self)
-        # Wire its signals into MainWindow handlers (built below).
-        self.results_tab.request_contour.connect(
-            self._on_results_request_contour)
-        self.results_tab.request_vector.connect(
-            self._on_results_request_vector)
-        self.results_tab.request_deform.connect(
-            self._on_results_request_deform)
-        self.results_tab.request_animate.connect(
-            self._on_results_request_animate)
-        self.results_tab.copy_values.connect(self._on_results_copy_values)
-        self.results_tab.color_range_changed.connect(
-            self._on_results_color_range_changed)
+        # v5.2.0 item 42: new Post-Processing Toolbox signal API.
+        # ----- Selection -----
+        self.results_tab.output_set_changed.connect(
+            self._on_results_output_set_changed)
+        # v5.3.2 item 67: single Output Vector dropdown. Drives both
+        # the contour render AND the deformation (deformation always
+        # uses the displacement triplet from the same subcase).
+        self.results_tab.output_vector_changed.connect(
+            self._on_results_output_vector_changed)
+        # ----- Deform -----
+        self.results_tab.deform_style_changed.connect(
+            self._on_results_deform_style_changed)
+        self.results_tab.deform_scale_changed.connect(
+            self._on_results_deform_scale_changed)
+        self.results_tab.animation_settings_changed.connect(
+            self._on_results_animation_settings_changed)
+        self.results_tab.show_undeformed_ref_changed.connect(
+            self._on_results_show_undeformed_ref_changed)
+        # ----- Contour -----
+        self.results_tab.contour_style_changed.connect(
+            self._on_results_contour_style_changed)
+        self.results_tab.data_conversion_changed.connect(
+            self._on_results_data_conversion_changed)
         self.results_tab.levels_changed.connect(
             self._on_results_levels_changed)
+        self.results_tab.palette_changed.connect(
+            self._on_results_palette_changed)
+        self.results_tab.color_range_changed.connect(
+            self._on_results_color_range_changed)
         self.results_tab.markers_changed.connect(
             self._on_results_markers_changed)
         self.results_tab.element_labels_changed.connect(
             self._on_results_element_labels_changed)
-        self.results_tab.deformation_changed.connect(
-            self._on_results_deformation_changed)
-        self.results_tab.open_animation_dock.connect(
-            self._on_results_open_animation_dock)
-        self.results_tab.open_vector_dock.connect(
-            self._on_results_open_vector_dock)
         self.sidebar_tabs.addTab(self.results_tab, "Results")
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'built', version='v5.2.0',
+                       n_sections=len(self.results_tab.sections))
+        except Exception:
+            pass
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background('#1e1e2e')
@@ -1068,6 +1131,56 @@ class MainWindow(QMainWindow):
         # tabifies alongside Results / Animation / Vectors. Build it
         # lazily after the result browser dock so we can tabify.
         self._cross_section_dock = None
+        # v5.0.0 item 3: floating Define-Plane panel replaces the dock.
+        self._clipping_panel = None
+        # v5.0.0 items 17/18: MYSTRAN solver worker + progress dialog
+        # references kept here so they can be GC'd cleanly after a run.
+        self._solver_worker = None
+        self._solver_dialog = None
+        # v5.1.0 item 25: Results sidebar tab state. Defaults match the
+        # widget defaults so initial behaviour is "auto range, no
+        # markers, no element labels".
+        self._results_user_auto_range = True
+        self._results_user_vmin = 0.0
+        self._results_user_vmax = 1.0
+        self._results_n_levels = 9
+        self._results_show_min_marker = False
+        self._results_show_max_marker = False
+        self._results_show_element_labels = False
+        self._results_element_labels_top_n = 0
+        # v5.3.2 item 67: single Output Vector state. Drives both the
+        # contour render and the deformation (deformation reads the
+        # displacement triplet from the active subcase).
+        self._output_vector_kind = 'displacement'
+        self._output_vector_component = 'Magnitude'
+        self._output_vector_mode_idx = -1
+        # v5.3.2 item 69: scalar bar position lives in QSettings now,
+        # set via File > Preferences. Read on each render via
+        # ``_build_scalar_bar_kw``.
+        from PySide6.QtCore import QSettings
+        try:
+            _s = QSettings("NodeRunner", "NodeRunner")
+            self._results_bar_orientation = str(
+                _s.value("results/bar_orientation", "right", type=str))
+        except Exception:
+            self._results_bar_orientation = "right"
+        # v5.2.0 item 42: Post-Processing Toolbox state.
+        # v5.3.3: defaults match the a professional FEA tool "None - Model Only" model.
+        # Deform stays undeformed and contour stays off until the user
+        # explicitly engages either. This stops a Deform-Style toggle
+        # from also painting a contour the user never asked for.
+        self._results_deform_style = 'undeformed'      # undeformed|deformed|animate
+        self._results_scale_mode = 'pct'               # pct | actual
+        self._results_scale_value = 10.0
+        self._results_show_undeformed_ref = False
+        self._results_contour_style = 'none'           # none|filled|filled_edges|bands
+        self._results_data_conversion = 'average'      # average|no_avg|max_node|min_node
+        self._results_palette = 'jet'
+        # v5.2.0 item 44: animation state extensions.
+        self._anim_mode = 'sine'                       # 'sine' or 'modes'
+        self._anim_n_frames = 20
+        self._anim_delay_ms = 40
+        self._anim_through_modes_current = 0
         # v5.0.0 item 3: floating Define-Plane panel replaces the dock.
         self._clipping_panel = None
         # v5.0.0 items 17/18: MYSTRAN solver worker + progress dialog
@@ -1212,7 +1325,7 @@ class MainWindow(QMainWindow):
         # v4.0.10 hotfix: wire the loads-tab tree's itemChanged signal.
         # Pre-v4.0.10 this connection didn't exist, so clicking a
         # load_set / constraint_set checkbox visually toggled the
-        # checkbox but fired NO Python handler — no visibility update.
+        # checkbox but fired NO Python handler. no visibility update.
         # Confirmed via v4.0.9 profile log
         # (profile_20260513_135348.log): zero fast_path.load_set_toggle
         # events despite the user clicking load_sets. v4.0.5's
@@ -1274,7 +1387,7 @@ class MainWindow(QMainWindow):
         # tree_widget only. Pre-v4.0.5 we ALSO installed it on the
         # viewport. The v4.0.4 log showed Qt's `itemPressed` /
         # `itemClicked` / `itemChanged` signals all dead while
-        # `itemSelectionChanged` worked — a known PySide6 pattern
+        # `itemSelectionChanged` worked. a known PySide6 pattern
         # for "event filter on QAbstractItemView's viewport breaks
         # the view's mousePressEvent dispatch". v4.0.5 bisects by
         # removing the viewport filter.
@@ -1415,6 +1528,13 @@ class MainWindow(QMainWindow):
         load_results_action = QAction("Load Results (&OP2)...", self)
         load_results_action.triggered.connect(self._load_results_dialog)
         file_menu.addAction(load_results_action)
+        # v5.2.2 issue 5: detach the current results bundle without
+        # unloading the model.
+        detach_results_action = QAction("Detach Results", self)
+        detach_results_action.setStatusTip(
+            "Clear the loaded results bundle but keep the model open.")
+        detach_results_action.triggered.connect(self._detach_results)
+        file_menu.addAction(detach_results_action)
 
         file_menu.addSeparator()
         save_conf_action = QAction("Save Fuselage Config...", self)
@@ -1729,7 +1849,7 @@ class MainWindow(QMainWindow):
         sol_105_action.setToolTip(_stips.SOL_105)
         sol_106_action = QAction("SOL 106 - Nonlinear Static", self, checkable=True)
         sol_106_action.setToolTip(
-            "<b>SOL 106 — Nonlinear Static</b><br>"
+            "<b>SOL 106. Nonlinear Static</b><br>"
             "Iterative nonlinear (large-deformation, material "
             "nonlinearity, contact). <b>NOT supported by MYSTRAN.</b> "
             "Selecting this will cause MYSTRAN pre-flight to block "
@@ -1804,6 +1924,15 @@ class MainWindow(QMainWindow):
         measure_angle_action.triggered.connect(self._measure_angle)
         tools_menu.addAction(measure_angle_action)
         tools_menu.addSeparator()
+        # v5.2.0 item 45: Data Table dialog (professional post-processing
+        # data table that live-syncs with the viewport selection).
+        data_table_action = QAction("Data Table…", self)
+        data_table_action.setStatusTip(
+            "Open the post-processing data table. Live-syncs with "
+            "viewport selection.")
+        data_table_action.triggered.connect(self._open_data_table_dialog)
+        tools_menu.addAction(data_table_action)
+        tools_menu.addSeparator()
         find_replace_action = QAction("Find/Replace Property/Material...", self)
         find_replace_action.triggered.connect(self._open_find_replace_dialog)
         tools_menu.addAction(find_replace_action)
@@ -1829,7 +1958,7 @@ class MainWindow(QMainWindow):
         self.command_palette_action.triggered.connect(self._open_command_palette)
         tools_menu.addAction(self.command_palette_action)
         tools_menu.addSeparator()
-        # Femap-style unit conversion - the tool itself is unitless, but
+        # professional unit conversion - the tool itself is unitless, but
         # this rescales the whole model by user-supplied factors.
         convert_units_action = QAction("Convert Units...", self)
         convert_units_action.triggered.connect(self._open_convert_units_dialog)
@@ -1875,7 +2004,7 @@ class MainWindow(QMainWindow):
         group_by_prop_action.triggered.connect(self._group_by_property)
         groups_menu.addAction(group_by_prop_action)
 
-        # ─── v5.0.0 item 2: Femap-inspired View menu reorganization ───
+        # ─── v5.0.0 item 2: professional View menu reorganization ───
         view_menu = menu_bar.addMenu("&View")
 
         find_entities_action = QAction("Find Entities...", self)
@@ -1998,6 +2127,25 @@ class MainWindow(QMainWindow):
         self.show_free_edges_action.toggled.connect(
             self._toggle_free_edges_visibility)
         annotations_menu.addAction(self.show_free_edges_action)
+        # v5.2.0 item 46: displacement vector arrows toggle. Replaces
+        # the removed Vectors sub-tab in the Results sidebar.
+        self.show_disp_vectors_action = QAction(
+            "Show Displacement Vectors", self, checkable=True, checked=False)
+        self.show_disp_vectors_action.toggled.connect(
+            lambda on: self._on_vector_overlay_toggled('disp', bool(on)))
+        annotations_menu.addAction(self.show_disp_vectors_action)
+        # SPC reaction force arrows (orange) -- complementary to disp.
+        self.show_reac_vectors_action = QAction(
+            "Show Reaction Vectors", self, checkable=True, checked=False)
+        self.show_reac_vectors_action.toggled.connect(
+            lambda on: self._on_vector_overlay_toggled('reac', bool(on)))
+        annotations_menu.addAction(self.show_reac_vectors_action)
+        # In-plane principal stress arrows (red).
+        self.show_principal_vectors_action = QAction(
+            "Show Principal Stress Vectors", self, checkable=True, checked=False)
+        self.show_principal_vectors_action.toggled.connect(
+            lambda on: self._on_vector_overlay_toggled('prin', bool(on)))
+        annotations_menu.addAction(self.show_principal_vectors_action)
 
         view_menu.addSeparator()
 
@@ -2059,7 +2207,7 @@ class MainWindow(QMainWindow):
         self.adaptive_lod_action.setChecked(self._adaptive_lod_enabled)
         self.adaptive_lod_action.toggled.connect(self._toggle_adaptive_lod)
         settings_menu.addAction(self.adaptive_lod_action)
-        # v3.2.0: element-level LOD threshold (Femap-style).
+        # v3.2.0: element-level LOD threshold (professional).
         elem_lod_action = QAction("Element LOD Threshold...", self)
         elem_lod_action.triggered.connect(self._open_elem_lod_dialog)
         settings_menu.addAction(elem_lod_action)
@@ -2204,12 +2352,12 @@ class MainWindow(QMainWindow):
     _LOD_DISPLAY_TARGET = 10_000       # target display size after stride
 
     def _add_node_cloud(self, node_points, name='nodes_actor'):
-        """Render a node cloud as small fixed-pixel-size markers (Femap style).
+        """Render a node cloud as small fixed-pixel-size markers (professional).
 
         Each node is drawn as a flat anti-aliased screen-space point of size
         ``self.node_size`` PIXELS - the size never grows or shrinks with the
         camera distance. This matches how professional FEA preprocessors
-        (Femap, Patran, HyperMesh) render nodes: they stay as crisp markers
+        (Patran, HyperMesh) render nodes: they stay as crisp markers
         you can read past, instead of expanding into a fuzzy "cloud" when
         you zoom out on a large model.
 
@@ -2333,6 +2481,11 @@ class MainWindow(QMainWindow):
         # _on_mystran_results_loaded / _update_results_status. Empty
         # string when no results are loaded.
         self._status_results_lbl = QLabel("")
+        try:
+            from node_runner.solve import mystran_tips as _mtips
+            self._status_results_lbl.setToolTip(_mtips.STATUS_RESULTS)
+        except Exception:
+            pass
         try:
             from node_runner.solve import mystran_tips as _mtips
             self._status_results_lbl.setToolTip(_mtips.STATUS_RESULTS)
@@ -2542,51 +2695,28 @@ class MainWindow(QMainWindow):
         dlg = CommandPaletteDialog(registry, parent=self)
         dlg.exec()
 
-    # --- Theme B: result browser dock + probe + expression contour ---
+    # --- Theme B: result browser + probe + expression contour ---
     def _build_result_browser_dock(self):
-        """Construct the right-side Results dock (hidden until OP2 loads)."""
-        from node_runner.dialogs import (
-            ResultBrowserDock, AnimationTimelineWidget, VectorOverlayWidget,
-        )
-        self._result_browser_dock = ResultBrowserDock(self)
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self._result_browser_dock)
-        self._result_browser_dock.entity_picked.connect(self._on_result_entity_picked)
-        self._result_browser_dock.expression_changed.connect(self._on_expression_changed)
-
-        # Animation timeline widget (added to the dock's titlebar/footer area
-        # by stacking it as a separate dock just below).
-        self._anim_timeline_widget = AnimationTimelineWidget(self)
-        self._anim_timeline_widget.phase_changed.connect(self._on_timeline_phase_changed)
-        anim_dock = QDockWidget("Animation", self)
-        anim_dock.setObjectName("AnimationDock")
-        anim_dock.setWidget(self._anim_timeline_widget)
-        anim_dock.hide()
-        self._anim_dock = anim_dock
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, anim_dock)
-        # Tabbed with the result browser by default.
-        self.tabifyDockWidget(self._result_browser_dock, anim_dock)
-
-        # Vector overlay widget similarly tabbed.
-        self._vector_overlay_widget = VectorOverlayWidget(self)
-        self._vector_overlay_widget.overlay_toggled.connect(self._on_vector_overlay_toggled)
-        self._vector_overlay_widget.scale_changed.connect(self._on_vector_overlay_scale)
-        vec_dock = QDockWidget("Vectors", self)
-        vec_dock.setObjectName("VectorDock")
-        vec_dock.setWidget(self._vector_overlay_widget)
-        vec_dock.hide()
-        self._vector_dock = vec_dock
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, vec_dock)
-        self.tabifyDockWidget(self._result_browser_dock, vec_dock)
+        """v5.2.0 item 47: no-op stub. Results UI now lives in the
+        Post-Processing Toolbox (results_tab.py); tabular workflow
+        moved to Tools -> Data Table. Method kept so initUI's call
+        site continues to compile.
+        """
+        self._result_browser_dock = None
+        self._anim_dock = None
+        self._vector_dock = None
+        self._anim_timeline_widget = None
+        self._vector_overlay_widget = None
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results', 'dock.eliminated',
+                       reason='v5.2.0_toolbox')
+        except Exception:
+            pass
 
     def _show_result_panels(self, on: bool):
-        """Show/hide the Theme B docks based on whether an OP2 is loaded."""
-        for d in (self._result_browser_dock, self._anim_dock, self._vector_dock):
-            if d is None:
-                continue
-            if on:
-                d.show()
-            else:
-                d.hide()
+        """v5.2.0: no-op for back-compat -- the v3.x docks no longer exist."""
+        return
 
     def _populate_result_browser(self):
         """Push current OP2 + model data into the result browser table model."""
@@ -2830,7 +2960,12 @@ class MainWindow(QMainWindow):
             return
         sc_id = self._current_subcase_id_for_results()
         sc = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
-        scale = self._vector_overlay_widget.scale_spin.value()
+        # v5.2.0 item 46: the v3.x VectorOverlayWidget is gone -- use a
+        # sensible auto-scale (5% of bbox) instead of reading a widget.
+        try:
+            scale = float(self._vector_overlay_widget.scale_spin.value())  # type: ignore[union-attr]
+        except Exception:
+            scale = 0.05
         diag = max(self.current_grid.length, 1e-6) if self.current_grid is not None else 1.0
         length = scale * diag
 
@@ -2938,16 +3073,20 @@ class MainWindow(QMainWindow):
         self._request_render()
 
     def _on_vector_overlay_scale(self, _new_scale):
-        # Re-issue all currently-on overlays so their length scale updates.
-        if self._vector_overlay_widget is None:
-            return
-        for key in ('disp', 'prin', 'reac'):
-            cb = getattr(self._vector_overlay_widget, f"check_{key}")
-            if cb.isChecked():
-                self._on_vector_overlay_toggled(key, True)
+        # v5.2.0 item 46: the v3.x VectorOverlayWidget is gone; this
+        # hook stays for back-compat but no longer reads widget state.
+        # The View menu toggle drives the arrows directly.
+        return
 
     def _on_timeline_phase_changed(self, phase: float):
         """User scrubbed/played the animation timeline. Update mode-shape phase."""
+        # v5.1.2 item 39: any animation interaction should engage
+        # Results mode so the user sees motion instead of a static
+        # mesh. Cheap no-op if already in results mode.
+        try:
+            self._ensure_results_mode_active(trigger='animate')
+        except Exception:
+            pass
         self._anim_phase = float(phase) * 2 * math.pi
         # Reuse existing animation tick logic
         self._on_animation_tick()
@@ -3067,7 +3206,7 @@ class MainWindow(QMainWindow):
 
     # --- Phase 4 toggles ---
     def _open_convert_units_dialog(self):
-        """Tools > Convert Units... - run a Femap-style multi-factor scaling."""
+        """Tools > Convert Units... - run a professional multi-factor scaling."""
         if not self.current_generator:
             QMessageBox.warning(self, "No Model",
                                 "Open or create a model before converting units.")
@@ -4396,7 +4535,7 @@ class MainWindow(QMainWindow):
         </p>
         <p>
             Node Runner sits in the gap between heavyweight commercial
-            packages (Patran, Femap, HyperMesh) and manual text editing of
+            packages (Patran, HyperMesh) and manual text editing of
             BDF files. It offers a graphical, interactive experience without
             the licensing cost, installation complexity, or learning curve
             of the full-featured tools &mdash; while still being far more
@@ -4452,7 +4591,7 @@ class MainWindow(QMainWindow):
             <tr><td><b>Solver Support:</b></td>
                 <td>Output is compatible with <b>MSC Nastran</b>,
                     <b>Siemens NX Nastran</b>, and the open-source
-                    <b>MYSTRAN</b> solver (new in v5.0.0 — see the
+                    <b>MYSTRAN</b> solver (new in v5.0.0. see the
                     integration block below). No solver-specific
                     extensions are used in the generic export
                     target.</td></tr>
@@ -4466,7 +4605,57 @@ class MainWindow(QMainWindow):
         <div class="section">
         <p>
             v5.1.0 turns the existing pre/solve/post baseline into a
-            full Femap-class workflow:
+            full full FEA workflow:
+        </p>
+        <table>
+        <tr><td><b>Results tab:</b></td>
+            <td>A fifth sidebar tab with a tree of subcases &rarr;
+                output vectors &rarr; components. Right-click for
+                <i>Contour / Vector / Apply as deformed shape /
+                Animate / Copy values to CSV</i>. Controls panel below
+                the tree: Auto/Manual color range, level count
+                (2&ndash;32), Show Min/Max Markers, Show Element Value
+                Labels (with top-N filter), deformed-shape toggle and
+                scale.</td></tr>
+        <tr><td><b>AnalysisSet scope:</b></td>
+            <td>AnalysisSets now carry a <i>solver_target</i> (MYSTRAN /
+                MSC / NX / Generic), a <i>group_target</i>, explicit
+                LOAD / SPC SID white-lists, and a per-set field
+                format. <i>Analysis &rarr; Run Analysis (MYSTRAN)</i>
+                requires an active set so the scope is always
+                explicit. Right-click an AnalysisSet on the sidebar
+                for <i>Run / Export / Set Active / Edit / Duplicate /
+                Delete</i>.</td></tr>
+        <tr><td><b>Scoped exports:</b></td>
+            <td>Exports and MYSTRAN runs build a shallow-copy of the
+                BDF scoped to the active AnalysisSet (group + load +
+                SPC filtering + auto-collected dependencies) so the
+                resulting deck is self-consistent. Source model is
+                never mutated.</td></tr>
+        <tr><td><b>Save BDF redesign:</b></td>
+            <td><i>File &rarr; Save BDF&hellip;</i> is now a single
+                richer dialog: output path, solver target, field
+                format, scope picker, and an embedded
+                <code>$ NR-META v1</code> metadata block (groups + tree
+                state) that survives a MSC/NX/MYSTRAN round-trip as
+                ordinary Nastran comments. Sidecar <code>.nrmeta</code>
+                file available as an opt-in.</td></tr>
+        <tr><td><b>Groups carry dependencies:</b></td>
+            <td>Right-click a group &rarr; <i>Collect Dependencies</i>
+                auto-fills the group's <i>properties / materials /
+                coords</i> from the elements it contains. Required for
+                the new group-scoped exports.</td></tr>
+        </table>
+        </div>
+
+        <!-- ============================================================ -->
+        <h3>Post-Processing + Scoped Analysis <span class="tag">new in v5.1.0</span></h3>
+        <!-- ============================================================ -->
+
+        <div class="section">
+        <p>
+            v5.1.0 turns the existing pre/solve/post baseline into a
+            full full FEA workflow:
         </p>
         <table>
         <tr><td><b>Results tab:</b></td>
@@ -4564,7 +4753,7 @@ class MainWindow(QMainWindow):
             <td>Every MYSTRAN-specific control (SOLLIB, QUAD4TYP,
                 WTMASS, output requests, SOL radio, etc.) carries a
                 hover tip that cross-references the MSC Nastran or
-                Femap equivalent.</td></tr>
+                common-tool equivalent.</td></tr>
         <tr><td><b>Analysis history:</b></td>
             <td><i>Analysis &rarr; Analysis History</i>&hellip; browses
                 prior runs in the scratch directory; double-click
@@ -5158,6 +5347,10 @@ class MainWindow(QMainWindow):
         # so the About dialog never drifts from the package version.
         text = text.replace("__NR_VERSION__", _nr_version)
 
+        # v5.0.0 item 21: substitute the version tag from __version__
+        # so the About dialog never drifts from the package version.
+        text = text.replace("__NR_VERSION__", _nr_version)
+
         dialog = QDialog(self)
         dialog.setWindowTitle(title)
         layout = QVBoxLayout(dialog)
@@ -5335,7 +5528,7 @@ class MainWindow(QMainWindow):
         self.groups_list.blockSignals(False)
 
     def _open_group_add_dialog(self, mode='add'):
-        """v3.4.0 item 7: open the tabbed Femap-style Add/Remove dialog
+        """v3.4.0 item 7: open the tabbed professional Add/Remove dialog
         for the currently-highlighted group."""
         from node_runner.dialogs.group_add import GroupAddDialog
 
@@ -6041,7 +6234,7 @@ class MainWindow(QMainWindow):
 
         Pre-v3.4.0 groups were ``{gid, nodes, elements}``. We now also
         track properties / materials / coords so a group can express
-        Femap-style multi-entity membership. Older code paths that read
+        professional multi-entity membership. Older code paths that read
         only nodes/elements still work because the new fields default
         to empty lists."""
         return {
@@ -6059,6 +6252,12 @@ class MainWindow(QMainWindow):
         nids = group_data.get("nodes", [])
         self._current_selection_eids = list(eids)
         self._current_selection_nids = list(nids)
+        # v5.2.0 item 45: keep Data Table live-sync working.
+        try:
+            self.selection_changed.emit('Element', list(eids))
+            self.selection_changed.emit('Node', list(nids))
+        except Exception:
+            pass
         if eids:
             self._highlight_entities('Element', eids)
         elif nids:
@@ -6549,7 +6748,7 @@ class MainWindow(QMainWindow):
         left_face  = QPolygonF([vul, vctr, vbot, vll])    # Y+ face → "right" view
         right_face = QPolygonF([vur, vlr, vbot, vctr])    # X+ face → "front" view
 
-        # v4.0.1: 3 hidden cube faces — opposite each visible face, all
+        # v4.0.1: 3 hidden cube faces. opposite each visible face, all
         # meeting at the front-bottom-left cube corner (which projects
         # to the same screen point as the back-top-right: vctr). These
         # are rendered with a dashed outline + lower alpha so the user
@@ -6956,6 +7155,33 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _project_point_scalars_to_subgrid(self, full_scalars, sub_grid):
+        """v5.2.1 item 50: map a full-grid per-node scalar array onto a
+        sub-grid produced by ``extract_cells``.
+
+        ``extract_cells`` attaches a ``vtkOriginalPointIds`` array to
+        the sub-grid that lists the original-grid point indices for
+        each retained point. We index ``full_scalars`` through that
+        mapping so the sub-grid receives a scalar of the right length
+        and ordering -- avoiding the off-by-one trap of naive
+        ``full_scalars[:sub_grid.n_points]``.
+        """
+        import numpy as _np
+        if full_scalars is None or sub_grid is None or sub_grid.n_points == 0:
+            return None
+        try:
+            orig_ids = sub_grid.point_data.get('vtkOriginalPointIds')
+        except Exception:
+            orig_ids = None
+        if orig_ids is None:
+            n = min(sub_grid.n_points, len(full_scalars))
+            out = _np.zeros(sub_grid.n_points, dtype=float)
+            out[:n] = _np.asarray(full_scalars, dtype=float)[:n]
+            return out
+        idx = _np.asarray(orig_ids, dtype=_np.int64)
+        idx = _np.clip(idx, 0, len(full_scalars) - 1)
+        return _np.asarray(full_scalars, dtype=float)[idx]
+
     def _attach_per_cell_rgb_for_property_mode(self, grid):
         """v4.0.17: vectorized per-cell RGB lookup for
         ``color_mode='property'``. Writes a ``'cell_rgb'`` uint8
@@ -6967,7 +7193,7 @@ class MainWindow(QMainWindow):
         Replaces the v4.0.5-era
         ``scalars='PID' + cmap + categories=True`` pattern. That
         pattern rendered the same PID with DIFFERENT colors
-        across actors with different unique-PID sets — PyVista's
+        across actors with different unique-PID sets. PyVista's
         categorical LUT appears to do range-normalized
         positional mapping rather than value-keyed lookup, so PID
         1234 in pids=[100..1234] mapped to the LAST cmap slot
@@ -7027,7 +7253,7 @@ class MainWindow(QMainWindow):
 
         Geometry: pv.Arrow (shaft + tip cone) merged with a second
         pv.Cone behind the first tip. Both are pure-triangle
-        PolyDatas — no tube() filter (which caused the v4.0.11/12
+        PolyDatas. no tube() filter (which caused the v4.0.11/12
         SEGFAULTs in vtkGlyph3D). The merge of two pure-triangle
         PolyDatas reliably produces a clean PolyData.
 
@@ -7035,7 +7261,7 @@ class MainWindow(QMainWindow):
         - v4.0.5: `fwd.merge(back)` symmetric ←→ double-arrow. Right-
           hand rule was ambiguous (axis encoded but not direction).
         - v4.0.11/12: composite (arrow + 270° tube-arc curl + tangent
-          cone). Crashed in vtkGlyph3D — `tube()` produces cells
+          cone). Crashed in vtkGlyph3D. `tube()` produces cells
           the glyph filter can't reliably handle.
         - v4.0.13 (this): arrow + second cone at +X end. Simplest
           possible composite that's directional and visually distinct
@@ -7518,6 +7744,28 @@ class MainWindow(QMainWindow):
 
     # ─── F16: Find/Replace Property/Material ─────────────────────────────
 
+    def _open_data_table_dialog(self):
+        """v5.2.0 item 45: open (or focus) the professional Data Table."""
+        try:
+            from node_runner.dialogs.data_table import DataTableDialog
+            if getattr(self, '_data_table_dialog', None) is None:
+                self._data_table_dialog = DataTableDialog(self)
+            self._data_table_dialog.show()
+            self._data_table_dialog.raise_()
+            self._data_table_dialog.activateWindow()
+            try:
+                from node_runner.profiling import perf_event
+                perf_event(
+                    'data_table', 'open',
+                    n_selected_nids=len(
+                        getattr(self, '_current_selection_nids', []) or []),
+                    n_selected_eids=len(
+                        getattr(self, '_current_selection_eids', []) or []))
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.critical(self, "Data Table failed", str(e))
+
     def _open_find_replace_dialog(self):
         if not self.current_generator or not self.current_generator.model.elements:
             QMessageBox.warning(self, "No Model", "Please load a model with elements first.")
@@ -7603,6 +7851,18 @@ class MainWindow(QMainWindow):
                        to=payload.get('brightness_mode', 'Normal'))
         except Exception:
             pass
+        # v5.3.2 item 69: scalar bar position preference.
+        new_orient = payload.get('results_bar_orientation', 'right')
+        if new_orient not in ('right', 'bottom'):
+            new_orient = 'right'
+        self._results_bar_orientation = new_orient
+        # Re-render the results pipeline so the bar moves immediately.
+        if self.color_mode == 'results':
+            try:
+                self._clear_scalar_bars()
+                self._on_results_changed()
+            except Exception:
+                pass
         if self.current_generator:
             self._update_viewer(self.current_generator, reset_camera=False)
         self._update_status("Preferences applied - viewer updated.")
@@ -7630,7 +7890,7 @@ class MainWindow(QMainWindow):
             self._update_status(f"Created LOAD combination SID {params['sid']}.")
 
     def _edit_load_combination(self, combo_sid):
-        """v3.5.0 item 2: open the Femap-style edit dialog on an
+        """v3.5.0 item 2: open the professional edit dialog on an
         existing load combination. Tab + Model tree refresh on accept."""
         if not self.current_generator:
             return
@@ -8280,11 +8540,19 @@ class MainWindow(QMainWindow):
             self._current_selection_nids = list(entity_ids) if entity_ids else []
         elif entity_type == 'Element':
             self._current_selection_eids = list(entity_ids) if entity_ids else []
+        # v5.2.0 item 45: notify subscribers (Data Table dialog) that
+        # the live selection changed.
+        try:
+            self.selection_changed.emit(
+                entity_type, list(entity_ids) if entity_ids else [])
+        except Exception:
+            pass
 
-        # Theme B3: sync to result browser. When a single entity is highlighted
-        # and the dock is up, scroll the matching row into view + select it.
+        # Theme B3: sync to result browser. When a single entity is
+        # highlighted, scroll the matching row into view + select it.
+        # v5.1.2: the tables now live inside the Results sidebar tab;
+        # no need to gate by .isVisible() since it's always available.
         if (self._result_browser_dock is not None
-                and self._result_browser_dock.isVisible()
                 and entity_ids and len(entity_ids) == 1):
             try:
                 if entity_type == 'Node':
@@ -8776,7 +9044,7 @@ class MainWindow(QMainWindow):
                     if it.value().data(0, QtCore.Qt.UserRole) == data_tuple]
         hits = index.get(key)
         if hits is None:
-            # Real miss — key isn't in the index. Could indicate a
+            # Real miss. key isn't in the index. Could indicate a
             # caller asking for an item that doesn't exist (normal)
             # OR a stale index (bug). Log a sample so we can spot
             # patterns.
@@ -8864,7 +9132,7 @@ class MainWindow(QMainWindow):
         """v4.0.4 (Stage Q): mirror of ``_build_tree_item_index`` but
         for the LOADS tab tree (``loads_tab_tree``). Required because
         all ``load_set`` / ``constraint_set`` UserRole keys live in
-        that tree, not the model tree — pre-v4.0.4 we were querying
+        that tree, not the model tree. pre-v4.0.4 we were querying
         the wrong tree and getting [] for every lookup.
         """
         from node_runner.profiling import perf_event
@@ -9191,7 +9459,7 @@ class MainWindow(QMainWindow):
 
         Items added since snapshot use whatever default the build set;
         items removed since snapshot are silently dropped. Signals must
-        be blocked by the caller during clear/rebuild — restore itself
+        be blocked by the caller during clear/rebuild. restore itself
         sets check state via ``setCheckState`` which can fire
         ``itemChanged``; callers that care should block.
 
@@ -9771,14 +10039,14 @@ class MainWindow(QMainWindow):
                    checkable=bool(item.flags() & QtCore.Qt.ItemIsUserCheckable))
         # v4.0.6 (auto-toggle disabled): the v4.0.2 Stage E auto-toggle
         # caused a double-fire when the user clicked the checkbox
-        # itself — Qt emits itemChanged (toggling once), THEN emits
+        # itself. Qt emits itemChanged (toggling once), THEN emits
         # itemClicked which entered this branch and toggled again,
         # leaving the visual state unchanged but firing TWO visibility
         # updates. The fix is to leave the click alone: itemChanged
         # fires natively on checkbox clicks (now that v4.0.5 removed
         # the viewport eventFilter that was blocking it). The
         # "click-on-label-doesn't-toggle" UX issue is acceptable for
-        # now — the user can click the checkbox directly. Diagnostic
+        # now. the user can click the checkbox directly. Diagnostic
         # logging stays so we can still see clicks in the log.
 
     def _handle_tree_item_pressed(self, item, column):
@@ -9818,7 +10086,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _handle_tree_item_changed(self, item, column):
-        # v4.0.4 (Stage R): stdout sentinel — fires unconditionally so
+        # v4.0.4 (Stage R): stdout sentinel. fires unconditionally so
         # we know whether Qt is dispatching the slot at all, even when
         # NR_PROFILE is unset. Visible in dev runs via `python -u run.py`
         # or in a console-attached build.
@@ -10118,7 +10386,7 @@ class MainWindow(QMainWindow):
             loads_root = QTreeWidgetItem(tree, [f"Load Sets ({n_loads} entries)"])
             loads_root.setData(0, QtCore.Qt.UserRole, ('loads_root',))
             # v4.0.9: PySide6 6.x default flags include ItemIsUserCheckable
-            # (flags=61). The header rows shouldn't be checkable — clear the
+            # (flags=61). The header rows shouldn't be checkable. clear the
             # bit so they look like proper section headers.
             loads_root.setFlags(loads_root.flags() & ~QtCore.Qt.ItemIsUserCheckable)
             _w_perf_event('top_row_flags', 'after_loads_root_create',
@@ -10145,7 +10413,7 @@ class MainWindow(QMainWindow):
                 # [] for every load_set, so every SID was effectively
                 # invisible. Stage Q routed the lookup to the correct
                 # tree, exposing the fact that the build-time default
-                # was Checked — which, on a large production deck (1,962 SIDs / 512k
+                # was Checked. which, on a large production deck (1,962 SIDs / 512k
                 # entries), made the post-parse pass build glyph
                 # geometry for every load entry. Default Unchecked
                 # matches the user's expected UX ("loads/constraints
@@ -10189,7 +10457,7 @@ class MainWindow(QMainWindow):
                     [f"SID {sid}: SPC ({len(all_nodes)} Nodes)"])
                 set_item.setFlags(
                     set_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                # v4.0.5b: default OFF — same rationale as load_set
+                # v4.0.5b: default OFF. same rationale as load_set
                 # above. Constraint glyph geometry only builds when
                 # the user explicitly turns on a SID.
                 set_item.setCheckState(0, QtCore.Qt.Unchecked)
@@ -10392,7 +10660,7 @@ class MainWindow(QMainWindow):
             add_action = menu.addAction("Add Combination...")
             add_action.triggered.connect(self._create_load_combination)
         elif kind == 'load_combo':
-            # v3.5.0 item 2: full Femap-style context menu
+            # v3.5.0 item 2: full professional context menu
             # (Edit / Copy / Rename / Delete).
             combo_sid = data[1]
             edit_action = menu.addAction(f"Edit Combination SID {combo_sid}...")
@@ -11300,7 +11568,7 @@ class MainWindow(QMainWindow):
 
         v4.0.3 (Stage K): also catch every event reaching tree_widget
         (and its viewport) when profiling is enabled. Pure diagnostic
-        — we never consume the event. Lets us prove or disprove
+       . we never consume the event. Lets us prove or disprove
         whether user clicks even reach Qt before reaching our slots.
         """
         # v4.0.3 (Stage K) / v4.0.4 (Stage R): tree-widget click trace.
@@ -11338,7 +11606,7 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
 
-                    # v4.0.4 (Stage R) — for MouseButtonPress on the
+                    # v4.0.4 (Stage R). for MouseButtonPress on the
                     # viewport, log full tree state to nail down why
                     # itemChanged/itemClicked don't fire.
                     extra = {}
@@ -11559,7 +11827,11 @@ class MainWindow(QMainWindow):
         is_quality_mode = (mode == "quality")
         is_results_mode = (mode == "results")
         self.quality_widget.setVisible(is_quality_mode)
-        self.results_widget.setVisible(is_results_mode and self.op2_results is not None)
+        # v5.2.0 item 47: the legacy results_widget stays hidden -- the
+        # Post-Processing Toolbox (Results sidebar tab) is the canonical
+        # UI now. The widget itself still exists as a state holder.
+        if not getattr(self, '_legacy_results_widget_hidden', False):
+            self.results_widget.setVisible(is_results_mode and self.op2_results is not None)
 
         if is_quality_mode and self.current_generator:
             # Populate the dropdown with available metrics the first time
@@ -11582,7 +11854,7 @@ class MainWindow(QMainWindow):
         # v4.0.14 (Fix C v2): coexistence with pre-built per-category
         # actors. When pre-built actors exist AND no cell-level
         # filter is active (visibility_mask is all-True), skip the
-        # legacy shells/beams extract+split+add — the pre-built
+        # legacy shells/beams extract+split+add. the pre-built
         # actors already render the mesh at full density. When a
         # filter IS active, hide pre-built actors and add legacy
         # filtered shells/beams. The user's category toggle on the
@@ -11624,7 +11896,34 @@ class MainWindow(QMainWindow):
             if nodes_item_list[0].checkState(0) == QtCore.Qt.Checked:
                 nodes_visible = True
 
-        if nodes_visible and self.current_grid and self.current_grid.n_points > 0:
+        # v5.2.1 Round-2 fix: predict whether the deformation block
+        # later in this method will re-issue the node cloud at deformed
+        # positions. If yes, skip the early draw -- otherwise the user
+        # sees the cloud snap from undeformed-to-deformed within a
+        # single render frame on each animation tick (perceived as a
+        # flicker against the bars).
+        _will_deform_nodes = False
+        try:
+            if (self.color_mode == 'results'
+                    and getattr(self, 'op2_results', None) is not None
+                    and hasattr(self, 'results_type_combo')
+                    and self.results_type_combo.currentText() in (
+                        'Displacement', 'Eigenvector')):
+                if getattr(self, '_anim_override_scale', None) is not None:
+                    _will_deform_nodes = abs(self._anim_override_scale) > 1e-30
+                else:
+                    try:
+                        _ds = float(self.deformation_scale_input.text() or 0)
+                    except (ValueError, AttributeError):
+                        _ds = 0.0
+                    _will_deform_nodes = _ds != 0.0
+        except Exception:
+            _will_deform_nodes = False
+
+        if (nodes_visible
+                and self.current_grid
+                and self.current_grid.n_points > 0
+                and not _will_deform_nodes):
             node_points = self.current_grid.points
             if self.current_node_ids_sorted and (
                 (hasattr(self, '_isolate_mode') and self._isolate_mode) or
@@ -11717,7 +12016,7 @@ class MainWindow(QMainWindow):
                 # factor) are identical across many consecutive clicks
                 # when the user is toggling unrelated things like loads
                 # or coord systems. Cache key is (id(current_grid),
-                # n_cells, EID-array hash, shrink) — invalidates
+                # n_cells, EID-array hash, shrink). invalidates
                 # automatically when _update_viewer runs (new
                 # current_grid) or the user filters by PID/Type/Material
                 # (different EID set). Hashing the EID array is ~2 ms;
@@ -11829,10 +12128,128 @@ class MainWindow(QMainWindow):
                 if beams.n_cells > 0:
                     self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
             elif self.color_mode == "results" and self.op2_results:
+                # v5.3.0 item 60: capture animation-tick context so the
+                # catchers downstream can be cross-referenced against
+                # the actor_snapshot events.
+                _anim_tick = getattr(self, '_anim_tick_counter', -1)
+                _anim_active = bool(getattr(self, '_anim_timer', None)
+                                    and self._anim_timer.isActive())
+                # v5.2.1 Round-3 fix: the legacy contour code at
+                # lines 12084/12113/12146/12213 references
+                # ``model.elements`` but ``model`` was never defined
+                # in this scope -- a latent bug that only fires on
+                # beam-only decks (the shells branch happens to be a
+                # dead path for those decks). Assign it once here.
+                model = (self.current_generator.model
+                         if self.current_generator is not None else None)
                 sc_id = self.results_subcase_combo.currentData()
                 sc_data = self.op2_results['subcases'].get(sc_id, {}) if sc_id is not None else {}
                 result_type = self.results_type_combo.currentText()
                 component = self.results_component_combo.currentText()
+                # v5.2.2 issue 3: honor the Contour Style dropdown.
+                # The four styles map to add_mesh kwargs:
+                #   filled        -> style='surface',   show_edges=False
+                #   filled_edges  -> style='surface',   show_edges=True
+                #   bands         -> n_colors=<levels>  (discrete LUT)
+                #   none          -> short-circuit to solid type-color
+                # v5.3.2 item 67: deformation always uses the
+                # displacement triplet from the current subcase --
+                # regardless of which Output Vector the user picked.
+                # Independent of contour entirely. If the active
+                # vector is an eigenvector mode, use that mode's
+                # displacement; otherwise use 'displacements'.
+                if self._anim_override_scale is not None:
+                    _deform_scale = self._anim_override_scale
+                else:
+                    try:
+                        _deform_scale = float(self.deformation_scale_input.text() or 0)
+                    except ValueError:
+                        _deform_scale = 0.0
+                _dvkind = getattr(self, '_output_vector_kind', 'displacement')
+                _dvmode = int(getattr(self, '_output_vector_mode_idx', -1))
+                _deform_data = None
+                if _deform_scale != 0:
+                    if _dvkind == 'eigenvector':
+                        eigs = sc_data.get('eigenvectors') or []
+                        if 0 <= _dvmode < len(eigs):
+                            _deform_data = eigs[_dvmode] or {}
+                    else:
+                        # Default deformation source = displacements.
+                        # Applies even when the user picked a stress
+                        # vector for contour -- the deformation is the
+                        # geometric displacement.
+                        _deform_data = sc_data.get('displacements') or {}
+                if _deform_data:
+                    # v5.2.1 item 49: deep-copy before mutating points.
+                    import time as _time
+                    _t0 = _time.perf_counter()
+                    grid_to_render = grid_to_render.copy(deep=True)
+                    try:
+                        from node_runner.profiling import perf_event
+                        perf_event('results', 'deform_grid_copied',
+                                   wall_s=round(_time.perf_counter() - _t0, 4),
+                                   n_points=int(grid_to_render.n_points))
+                    except Exception:
+                        pass
+                    _deformed_points = grid_to_render.points.copy()
+                    for _i, _nid in enumerate(self.current_node_ids_sorted):
+                        _vals = _deform_data.get(_nid)
+                        if _vals and _i < len(_deformed_points):
+                            _deformed_points[_i] += np.array(_vals[:3]) * _deform_scale
+                    grid_to_render.points = _deformed_points
+                    shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
+                    beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
+                    try:
+                        if nodes_visible and len(_deformed_points) > 0:
+                            self._add_node_cloud(_deformed_points, name='nodes_actor')
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event('results', 'node_cloud',
+                                           points_source='deformed',
+                                           n=int(len(_deformed_points)))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                _cstyle = getattr(self, '_results_contour_style', 'none')
+                if _cstyle == 'none':
+                    # v5.3.1 item 62: render property RGB on the
+                    # (possibly deformed) sub-grids. Deformation was
+                    # already applied above; here we just paint colour.
+                    self._clear_scalar_bars()
+                    if shells.n_cells > 0:
+                        self._attach_per_cell_rgb_for_property_mode(shells)
+                        self.plotter.add_mesh(
+                            shells, scalars='cell_rgb', rgb=True,
+                            show_scalar_bar=False, **shell_kw)
+                    if beams.n_cells > 0:
+                        self._attach_per_cell_rgb_for_property_mode(beams)
+                        self.plotter.add_mesh(
+                            beams, scalars='cell_rgb', rgb=True,
+                            show_scalar_bar=False, **beam_kw)
+                    if self.show_beam_sections_check.isChecked() and self.current_generator:
+                        self._render_beam_sections()
+                    self.plotter.render()
+                    return
+                # Apply the contour style by overriding shell_kw /
+                # beam_kw before any add_mesh call below uses them.
+                if _cstyle == 'filled_edges':
+                    shell_kw['show_edges'] = True
+                elif _cstyle == 'filled':
+                    shell_kw['show_edges'] = False
+                # 'bands' is handled later via n_colors on the mapper.
+                _bands_n_colors = (int(getattr(self, '_results_n_levels', 9))
+                                   if _cstyle == 'bands' else None)
+                # v5.3.1 item 65: sweep ghost scalar bars before adding
+                # the fresh one. Without this, switching Contour Vector
+                # accumulates one bar per title we've ever rendered.
+                self._clear_scalar_bars()
+                # v5.3.1 item 64: scalar-bar kwargs built from the
+                # user's selected orientation preference (Right vertical
+                # or Bottom horizontal). Title carries a newline so the
+                # top tick doesn't overlap (item 63).
+                _scalar_bar_kw = self._build_scalar_bar_kw()
 
                 if result_type in ("Displacement", "Eigenvector", "SPC Forces"):
                     key_map = {"Displacement": "displacements",
@@ -11865,7 +12282,28 @@ class MainWindow(QMainWindow):
                             deform_scale = float(self.deformation_scale_input.text() or 0)
                         except ValueError:
                             deform_scale = 0.0
-                    if deform_scale != 0 and result_type in ("Displacement", "Eigenvector"):
+                    # v5.3.0 item 59: deformation is now applied
+                    # earlier in this method using the DEFORM VECTOR
+                    # (independent of result_type). The block below is
+                    # kept as a no-op fallback for cases where the
+                    # deform vector wasn't applicable.
+                    if False and deform_scale != 0 and result_type in ("Displacement", "Eigenvector"):
+                        # v5.2.1 item 49: deep-copy before mutating points.
+                        # Without this, ``grid_to_render.points = deformed_points``
+                        # mutates ``self.current_grid.points`` in place (the
+                        # else branch at line ~11788 assigned grid_to_render
+                        # = current_grid by reference). That made the model
+                        # compound on every toggle.
+                        import time as _time
+                        _t0 = _time.perf_counter()
+                        grid_to_render = grid_to_render.copy(deep=True)
+                        try:
+                            from node_runner.profiling import perf_event
+                            perf_event('results', 'deform_grid_copied',
+                                       wall_s=round(_time.perf_counter() - _t0, 4),
+                                       n_points=int(grid_to_render.n_points))
+                        except Exception:
+                            pass
                         disp_data = data_dict
                         deformed_points = grid_to_render.points.copy()
                         for i, nid in enumerate(self.current_node_ids_sorted):
@@ -11875,24 +12313,161 @@ class MainWindow(QMainWindow):
                         grid_to_render.points = deformed_points
                         shells = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 1)
                         beams = grid_to_render.extract_cells(grid_to_render.cell_data['is_shell'] == 0)
+                        # v5.2.1 item 51: the early node-cloud draw
+                        # (line ~11760) used undeformed current_grid
+                        # points and is now stale. Re-issue with the
+                        # deformed points so the dots ride the bars.
+                        try:
+                            if nodes_visible and len(deformed_points) > 0:
+                                # Honor any isolate/hide filtering by
+                                # re-using the same mask logic. For the
+                                # common all-visible case just pass the
+                                # full deformed point set.
+                                self._add_node_cloud(
+                                    deformed_points, name='nodes_actor')
+                                try:
+                                    from node_runner.profiling import perf_event
+                                    perf_event(
+                                        'results', 'node_cloud',
+                                        points_source='deformed',
+                                        n=int(len(deformed_points)))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
 
                     self.current_grid.point_data['result_scalars'] = point_scalars
+                    # v5.2.0 item 43: data conversion + palette.
+                    cmap_name = getattr(self, '_results_palette', 'jet')
+                    conv_mode = getattr(self, '_results_data_conversion', 'average')
                     if shells.n_cells > 0:
-                        shell_scalars = np.zeros(shells.n_cells)
-                        for i, eid in enumerate(shells.cell_data['EID']):
-                            elem = model.elements.get(eid) or model.rigid_elements.get(eid)
-                            if elem:
-                                node_ids_elem = elem.nodes
-                                vals_list = [data_dict.get(nid) for nid in node_ids_elem if data_dict.get(nid)]
-                                if vals_list:
-                                    if component == "Magnitude":
-                                        shell_scalars[i] = np.mean([np.linalg.norm(v[:3]) for v in vals_list])
-                                    elif comp_idx is not None:
-                                        shell_scalars[i] = np.mean([v[comp_idx] for v in vals_list])
-                        self.plotter.add_mesh(shells, scalars=shell_scalars, cmap='jet',
-                                              scalar_bar_args={'title': f"{result_type} - {component}"}, **shell_kw)
+                        from node_runner.results_conversion import (
+                            convert_nodal_data)
+                        # Build cell_node_ids list for the visible shells.
+                        cell_node_ids = []
+                        for eid in shells.cell_data['EID']:
+                            elem = (model.elements.get(int(eid))
+                                    or model.rigid_elements.get(int(eid)))
+                            cell_node_ids.append(
+                                np.asarray(elem.nodes if elem else [],
+                                           dtype=np.int64))
+                        # Need the point_scalars restricted to the shells'
+                        # extracted point set, but extract_cells preserves
+                        # original points so passing the full nodal array
+                        # paired with the original sorted node IDs works.
+                        node_ids_sorted = np.asarray(
+                            self.current_node_ids_sorted, dtype=np.int64)
+                        point_scalars_shells, cell_scalars_shells = (
+                            convert_nodal_data(
+                                point_scalars, node_ids_sorted, conv_mode,
+                                cell_node_ids))
+                        # v5.3.2 item 70: title now has a trailing blank
+                        # line so VTK reserves extra vertical space
+                        # between the title block and the top tick.
+                        title = f"{result_type}\n{component}\n"
+                        if conv_mode != 'average':
+                            title = (f"{result_type}\n{component}\n"
+                                     f"({_CONV_LABEL.get(conv_mode, conv_mode)})\n")
+                        # v5.3.1 item 65: explicit clim so changing
+                        # vector / data conversion actually refreshes
+                        # the scalar bar range. Honors the user's
+                        # Auto-Range checkbox.
+                        _user_auto = getattr(self, '_results_user_auto_range', True)
+                        if _user_auto:
+                            _clim_disp = None  # PyVista auto-computes
+                        else:
+                            _clim_disp = (float(self._results_user_vmin),
+                                          float(self._results_user_vmax))
+                        _add_kw = {
+                            'cmap': cmap_name,
+                            'n_colors': (_bands_n_colors or 256),
+                            'scalar_bar_args': {
+                                'title': title,
+                                'n_labels': (_bands_n_colors + 1
+                                             if _bands_n_colors else 5),
+                                **_scalar_bar_kw},
+                        }
+                        if _clim_disp is not None:
+                            _add_kw['clim'] = _clim_disp
+                        if cell_scalars_shells is not None:
+                            self.plotter.add_mesh(
+                                shells, scalars=cell_scalars_shells,
+                                **_add_kw, **shell_kw)
+                        else:
+                            # Average path: project to per-cell mean so the
+                            # legacy shell mapping stays cell-scalar based.
+                            shell_scalars = np.zeros(shells.n_cells)
+                            for i, eid in enumerate(shells.cell_data['EID']):
+                                elem = (model.elements.get(eid)
+                                        or model.rigid_elements.get(eid))
+                                if elem:
+                                    node_ids_elem = elem.nodes
+                                    vals_list = [data_dict.get(nid)
+                                                 for nid in node_ids_elem
+                                                 if data_dict.get(nid)]
+                                    if vals_list:
+                                        if component == "Magnitude":
+                                            shell_scalars[i] = np.mean(
+                                                [np.linalg.norm(v[:3])
+                                                 for v in vals_list])
+                                        elif comp_idx is not None:
+                                            shell_scalars[i] = np.mean(
+                                                [v[comp_idx] for v in vals_list])
+                            self.plotter.add_mesh(
+                                shells, scalars=shell_scalars,
+                                **_add_kw, **shell_kw)
                     if beams.n_cells > 0:
-                        self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+                        # v5.2.1 Round-2 fix: use cell_data scalars
+                        # (mean of 2 corner nodes per bar) instead of
+                        # point_data. PyVista's render_lines_as_tubes
+                        # mode -- on by default in beam_kw -- extrudes
+                        # line cells into 3D tube surfaces, and the
+                        # tube filter doesn't pass point arrays
+                        # through cleanly. Cell scalars survive the
+                        # extrusion. Wrap in try/except + telemetry so
+                        # any future regression here is loud, not silent.
+                        try:
+                            cell_scalars_beams = np.zeros(beams.n_cells, dtype=float)
+                            for i, eid in enumerate(beams.cell_data['EID']):
+                                elem = (model.elements.get(int(eid))
+                                        or model.rigid_elements.get(int(eid)))
+                                if elem is None:
+                                    continue
+                                vals_list = []
+                                for nid in elem.nodes:
+                                    v = data_dict.get(nid)
+                                    if not v:
+                                        continue
+                                    if component == "Magnitude" and len(v) >= 3:
+                                        vals_list.append(
+                                            (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5)
+                                    elif comp_idx is not None and comp_idx < len(v):
+                                        vals_list.append(float(v[comp_idx]))
+                                if vals_list:
+                                    cell_scalars_beams[i] = (
+                                        sum(vals_list) / len(vals_list))
+                            self.plotter.add_mesh(
+                                beams, scalars=cell_scalars_beams,
+                                **_add_kw, **beam_kw)
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event('results', 'beam_contour',
+                                           applied=True,
+                                           n_cells=int(beams.n_cells))
+                            except Exception:
+                                pass
+                        except Exception as _beam_exc:
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event('results', 'beam_contour_failed',
+                                           err=str(_beam_exc)[:200])
+                            except Exception:
+                                pass
+                            # Fall back to solid color so bars still show.
+                            self.plotter.add_mesh(
+                                beams,
+                                color=self.type_color_map["Beams"],
+                                **beam_kw)
 
                 elif result_type == "Stress":
                     stress_data = sc_data.get("stresses", {})
@@ -11902,16 +12477,122 @@ class MainWindow(QMainWindow):
                         "XX": "oxx", "YY": "oyy", "XY": "txy",
                     }
                     comp_key = comp_key_map.get(component, "von_mises")
+                    cmap_name = getattr(self, '_results_palette', 'jet')
+                    conv_mode = getattr(self, '_results_data_conversion', 'average')
 
                     if shells.n_cells > 0:
-                        scalars = np.zeros(shells.n_cells)
-                        for i, eid in enumerate(shells.cell_data['EID']):
-                            elem_stress = stress_data.get(int(eid), {})
-                            scalars[i] = elem_stress.get(comp_key, 0.0)
-                        self.plotter.add_mesh(shells, scalars=scalars, cmap='jet',
-                                              scalar_bar_args={'title': f"Stress - {component}"}, **shell_kw)
+                        from node_runner.results_conversion import (
+                            convert_element_data)
+                        # Build the eid -> value dict from stress data
+                        # (filtered to our visible cell EIDs).
+                        cell_eids = np.asarray(
+                            shells.cell_data['EID'], dtype=np.int64)
+                        elem_vals = {int(eid): float(
+                            stress_data.get(int(eid), {}).get(comp_key, 0.0))
+                            for eid in cell_eids}
+                        # Cell -> nodes connectivity, needed for averaging
+                        # paths.
+                        cell_node_ids = []
+                        for eid in cell_eids:
+                            elem = (model.elements.get(int(eid))
+                                    or model.rigid_elements.get(int(eid)))
+                            cell_node_ids.append(
+                                np.asarray(elem.nodes if elem else [],
+                                           dtype=np.int64))
+                        node_ids_sorted = np.asarray(
+                            self.current_node_ids_sorted, dtype=np.int64)
+                        point_scalars_s, cell_scalars_s = convert_element_data(
+                            elem_vals, conv_mode, cell_eids, cell_node_ids,
+                            node_ids_sorted, n_points=self.current_grid.n_points)
+                        # v5.3.2 item 70: trailing blank line for
+                        # title breathing room.
+                        title = f"Stress\n{component}\n"
+                        if conv_mode != 'no_avg':
+                            title = (f"Stress\n{component}\n"
+                                     f"({_CONV_LABEL.get(conv_mode, conv_mode)})\n")
+                        # v5.3.1 item 65: explicit clim + scalar bar
+                        # refresh on every stress render too.
+                        _user_auto = getattr(self, '_results_user_auto_range', True)
+                        if _user_auto:
+                            _clim_stress = None
+                        else:
+                            _clim_stress = (float(self._results_user_vmin),
+                                            float(self._results_user_vmax))
+                        _add_kw = {
+                            'cmap': cmap_name,
+                            'n_colors': (_bands_n_colors or 256),
+                            'scalar_bar_args': {
+                                'title': title,
+                                'n_labels': (_bands_n_colors + 1
+                                             if _bands_n_colors else 5),
+                                **_scalar_bar_kw},
+                        }
+                        if _clim_stress is not None:
+                            _add_kw['clim'] = _clim_stress
+                        if point_scalars_s is not None:
+                            # v5.3.3 fix 2: attach the scalar array to
+                            # the SHELLS sub-grid directly. The prior
+                            # code attached to ``current_grid`` but
+                            # ``extract_cells`` returns a NEW grid that
+                            # doesn't share its point_data dict -- so
+                            # PyVista's ``scalars='stress_point_scalars'``
+                            # lookup on shells silently failed and the
+                            # whole mesh rendered with no scalars
+                            # (invisible). Map full-grid scalars onto
+                            # the shells sub-grid via the helper.
+                            shell_pts_scalars = self._project_point_scalars_to_subgrid(
+                                point_scalars_s, shells)
+                            if shell_pts_scalars is not None:
+                                shells.point_data['stress_point_scalars'] = shell_pts_scalars
+                                self.plotter.add_mesh(
+                                    shells, scalars='stress_point_scalars',
+                                    **_add_kw, **shell_kw)
+                            else:
+                                # Fallback to a per-cell mean if the
+                                # projection failed.
+                                self.plotter.add_mesh(
+                                    shells, scalars=cell_scalars_s,
+                                    **_add_kw, **shell_kw)
+                        else:
+                            self.plotter.add_mesh(
+                                shells, scalars=cell_scalars_s,
+                                **_add_kw, **shell_kw)
                     if beams.n_cells > 0:
-                        self.plotter.add_mesh(beams, color=self.type_color_map["Beams"], **beam_kw)
+                        # v5.2.1 Round-2 fix: cell_data scalars on
+                        # bars so render_lines_as_tubes works. Bar
+                        # stress per-cell comes from looking up the
+                        # element's stress dict directly (CBEAM/CBAR
+                        # stresses are element-centered, same as shells).
+                        try:
+                            cell_scalars_beams_s = np.zeros(
+                                beams.n_cells, dtype=float)
+                            for i, eid in enumerate(beams.cell_data['EID']):
+                                s = stress_data.get(int(eid), {}) or {}
+                                cell_scalars_beams_s[i] = float(
+                                    s.get(comp_key, 0.0))
+                            self.plotter.add_mesh(
+                                beams, scalars=cell_scalars_beams_s,
+                                **_add_kw, **beam_kw)
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event('results', 'beam_contour',
+                                           applied=True,
+                                           n_cells=int(beams.n_cells),
+                                           kind='stress')
+                            except Exception:
+                                pass
+                        except Exception as _beam_exc:
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event('results', 'beam_contour_failed',
+                                           err=str(_beam_exc)[:200],
+                                           kind='stress')
+                            except Exception:
+                                pass
+                            self.plotter.add_mesh(
+                                beams,
+                                color=self.type_color_map["Beams"],
+                                **beam_kw)
                 else:
                     # Fallback: property coloring (v4.0.17 per-cell RGB).
                     if shells.n_cells > 0:
@@ -12477,7 +13158,7 @@ class MainWindow(QMainWindow):
         ``_update_plot_visibility`` so the per-SID fast path in
         ``_handle_tree_item_changed`` can build glyphs for a single
         SID without iterating all 1,962. The lazily-built per-SID
-        data actors (``force_actors_{sid}`` etc.) must already exist —
+        data actors (``force_actors_{sid}`` etc.) must already exist.
         callers are responsible for calling
         ``_ensure_load_actor_for_sid(sid)`` first.
         """
@@ -12669,7 +13350,7 @@ class MainWindow(QMainWindow):
         """v4.0.9: O(1) per-SID visibility update. Returns True on
         success so the caller can skip the full
         ``_update_plot_visibility`` cycle (~4-5 s on a large production deck). Returns
-        False on any failure — caller MUST fall through to the full
+        False on any failure. caller MUST fall through to the full
         cycle so the user never sees a stale scene.
 
         Safe to skip the full cycle because load_set / constraint_set
@@ -12713,11 +13394,11 @@ class MainWindow(QMainWindow):
     # v4.0.14 (Fix C v2): pre-built per-Nastran-type actors.
     # Redesigned after v4.0.11 was reverted in v4.0.12. Key
     # differences from v4.0.11:
-    #   1. Build from current_grid (full mesh) — not LOD'd display_grid.
+    #   1. Build from current_grid (full mesh). not LOD'd display_grid.
     #      Restores full visual density on Plates and brings RBE2/RBE3
     #      into the dict so the Rigid spider can toggle correctly.
     #   2. RBE spider visibility derived from the Rigid checkbox state
-    #      directly (not target_states.get) — defensive against
+    #      directly (not target_states.get). defensive against
     #      `_category_actors` not containing every ntype.
     #   3. Same filter-mode coexistence pattern as v4.0.11 (legacy
     #      _rebuild_plot path triggered when PID/MID/isolate active;
@@ -12728,7 +13409,7 @@ class MainWindow(QMainWindow):
         element type present in ``self.current_grid`` (the full,
         non-LOD'd mesh). Category checkbox toggles in the model tree
         (Plates, Beams, Solids, etc.) become ``actor.SetVisibility``
-        calls — sub-100 ms on a large production deck — bypassing the legacy
+        calls. sub-100 ms on a large production deck. bypassing the legacy
         ``_rebuild_plot`` extract_cells + split + compute_normals
         chain.
 
@@ -12802,7 +13483,7 @@ class MainWindow(QMainWindow):
                         # across actors because PyVista's
                         # `categories=True` is range-positional, not
                         # value-keyed). Same PID, same color, every
-                        # render — across all actors and all rebuilds.
+                        # render. across all actors and all rebuilds.
                         if (build_color_mode == 'property'
                                 and 'PID' in slice_render.cell_data):
                             self._attach_per_cell_rgb_for_property_mode(
@@ -12902,7 +13583,7 @@ class MainWindow(QMainWindow):
         """v4.0.14: O(N_categories) visibility update for a category
         (by_type or by_shape) checkbox click. Returns True if all
         per-type actors resolve from category state alone; False if
-        any falls into cell-level filter territory — caller falls
+        any falls into cell-level filter territory. caller falls
         through to legacy ``_rebuild_plot``.
 
         Differs from v4.0.11: rbe_actors visibility is derived from
@@ -12932,7 +13613,7 @@ class MainWindow(QMainWindow):
                 actor.SetVisibility(new_vis)
                 n_changed += 1
         # Hide any legacy shells/beams actors that may remain from a
-        # prior filter cycle. v4.0.15 fix: do NOT hide nodes_actor —
+        # prior filter cycle. v4.0.15 fix: do NOT hide nodes_actor.
         # it's the user-controlled Nodes display, not a filter-cycle
         # leftover. The v4.0.14 version was hiding it on every
         # category toggle so the first click made nodes disappear
@@ -13200,6 +13881,10 @@ class MainWindow(QMainWindow):
                         np.linalg.norm(np.array(load.xyz) * load.mag))
                 elif t == 'PLOAD4':
                     all_pressure_mags.append(abs(load.pressures[0]))
+                elif t == 'PLOAD2':
+                    # v5.2.2 issue 1: same magnitude treatment as PLOAD4.
+                    all_pressure_mags.append(
+                        abs(float(getattr(load, 'pressure', 0.0))))
         self.load_scaling_info['force_max_mag'] = (
             float(np.max(all_force_mags)) if all_force_mags else 0.0)
         self.load_scaling_info['moment_max_mag'] = (
@@ -13281,6 +13966,21 @@ class MainWindow(QMainWindow):
                 p_pts.append(cell_centers[idx_arr])
                 p_vecs.append(cell_normals[idx_arr]
                               * float(load.pressures[0]))
+            elif t == 'PLOAD2':
+                # v5.2.2 issue 1: PLOAD2 is the uniform-pressure-on-2D-
+                # element card. Same visual treatment as PLOAD4 but the
+                # pressure value is a scalar attribute, not a list.
+                eids = getattr(load, 'eids', None) or []
+                if not eids:
+                    continue
+                idxs = [eid_to_idx.get(int(e)) for e in eids]
+                idxs = [i for i in idxs if i is not None]
+                if not idxs:
+                    continue
+                idx_arr = np.asarray(idxs, dtype=np.int64)
+                pressure = float(getattr(load, 'pressure', 0.0))
+                p_pts.append(cell_centers[idx_arr])
+                p_vecs.append(cell_normals[idx_arr] * pressure)
 
         if f_pts:
             actor = pv.PolyData(np.asarray(f_pts))
@@ -13356,7 +14056,7 @@ class MainWindow(QMainWindow):
         New path: vectorized via ``np.searchsorted`` against
         ``self.current_node_ids_sorted`` + array indexing into
         ``self.current_grid.points``. The first pass (~46k iterations)
-        only gathers NIDs into Python lists — no per-leg `get_position`
+        only gathers NIDs into Python lists. no per-leg `get_position`
         calls. The second pass is pure numpy.
 
         Legacy fallback retained as
@@ -13515,7 +14215,7 @@ class MainWindow(QMainWindow):
             poly.point_data['colors'] = point_colors
             poly.cell_data['EID'] = spoke_eids_arr
 
-        # Sanity assertion — if anything is off, we want to know in
+        # Sanity assertion. if anything is off, we want to know in
         # the log rather than producing a silently-wrong actor.
         if poly.n_points != 2 * n_valid or poly.n_cells != n_valid:
             perf_event('rbe', 'mismatch',
@@ -14381,7 +15081,7 @@ class MainWindow(QMainWindow):
                 # v4.0.6: skip the no-op remove_actor when the glyph
                 # doesn't exist. On production-deck (1,962 SIDs × 3 types = 5,886
                 # remove_actor calls per visibility cycle), most are
-                # no-ops — but each one still walks PyVista's internal
+                # no-ops. but each one still walks PyVista's internal
                 # actor list. The membership check is O(1) on the
                 # plotter.actors dict.
                 if glyph_name in self.plotter.actors:
@@ -14410,7 +15110,7 @@ class MainWindow(QMainWindow):
                         # ``_exc.__class__.__name__`` instead of
                         # ``type(_exc).__name__``.)
                         from node_runner.profiling import perf_event
-                        # v4.0.12 (Bug 4 fix): two-tier fallback —
+                        # v4.0.12 (Bug 4 fix): two-tier fallback.
                         # composite first, plain pv.Arrow on
                         # composite-side failure. Same pattern as the
                         # _build_load_glyphs_for_sid path. Keep this
@@ -15212,11 +15912,15 @@ class MainWindow(QMainWindow):
             self._update_status(f"Created EIGRL SID {params['sid']} (ND={params['nd']})")
 
     def _open_analysis_set_manager(self):
-        """Open the Analysis Set Manager dialog."""
+        """Open the Analysis Set Manager dialog.
+
+        v5.3.0 item 53: no longer auto-creates a "Default" AnalysisSet
+        when none exist. The Manager opens empty; the user clicks
+        ``New`` to create one explicitly. This matches common-tool behavior
+        (no implicit/punch set) and removes the silent default that
+        was leaking into Run Analysis dialogs.
+        """
         from node_runner.dialogs.analysis import AnalysisSetManagerDialog, AnalysisSet
-        # Auto-create a default set if none exist
-        if not self.analysis_sets:
-            self._create_default_analysis_set()
 
         model = self.current_generator.model if self.current_generator else None
         dialog = AnalysisSetManagerDialog(
@@ -15241,10 +15945,19 @@ class MainWindow(QMainWindow):
             self._populate_tree()
 
     def _open_output_requests_dialog(self):
-        """Open the quick Output Requests dialog for the active analysis set."""
+        """Open the quick Output Requests dialog for the active analysis set.
+
+        v5.3.0 item 53: no longer auto-creates a Default set. If the
+        user has none defined, point them at the Manager.
+        """
         from node_runner.dialogs.analysis import OutputRequestsDialog, AnalysisSet
         if not self.analysis_sets:
-            self._create_default_analysis_set()
+            QMessageBox.information(
+                self, "No AnalysisSet Defined",
+                "No AnalysisSet exists yet. Open the Analysis Set "
+                "Manager (Analysis -> Analysis Set Manager…) and click "
+                "New to create one before editing output requests.")
+            return
 
         active = self.analysis_sets.get(self.active_analysis_set_id)
         if not active:
@@ -15318,7 +16031,7 @@ class MainWindow(QMainWindow):
         v5.1.0 item 26: requires an active AnalysisSet. The set drives
         what gets exported (scope/group/load/SPC filtering via
         scope.py) and what shows up in the deck's case-control block.
-        Femap parity -- you can't just "run a model"; you run an
+        common convention -- you can't just "run a model"; you run an
         analysis set.
         """
         if not self.current_generator or not self.current_generator.model:
@@ -15499,6 +16212,66 @@ class MainWindow(QMainWindow):
             else:
                 self._mystran_results_loaded_msg = (
                     "No OP2 or F06 results file found in the run folder.")
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished runs before
+        # load_mystran_results() sets this field, so the on-disk
+        # run_meta.json shows "results_source": null until we re-save
+        # here. Affects Analysis History display.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished runs before
+        # load_mystran_results() sets this field, so the on-disk
+        # run_meta.json shows "results_source": null until we re-save
+        # here. Affects Analysis History display.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished runs before
+        # load_mystran_results() sets this field, so the on-disk
+        # run_meta.json shows "results_source": null until we re-save
+        # here. Affects Analysis History display.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished happens before
+        # load_mystran_results() can set this field, so the on-disk
+        # run_meta.json reads "results_source": null until we re-save
+        # here. Affects Analysis History display + downstream tooling.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished happens before
+        # load_mystran_results() can set this field, so the on-disk
+        # run_meta.json reads "results_source": null until we re-save
+        # here. Affects Analysis History display + downstream tooling.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
+        # v5.0.0 item 20: persist the final results_source. The first
+        # save_meta() inside SolverRunWorker._on_finished happens before
+        # load_mystran_results() can set this field, so the on-disk
+        # run_meta.json reads "results_source": null until we re-save
+        # here. Affects Analysis History display + downstream tooling.
+        try:
+            if run.bdf_path:
+                run.save_meta(Path(run.bdf_path).parent)
+        except Exception:
+            pass
         else:
             # v5.1.1 item 30: this branch belongs to the outer
             # `if mystran_settings.get('auto_load_results', True):`
@@ -15748,14 +16521,28 @@ class MainWindow(QMainWindow):
         work unchanged.
         """
         self.op2_results = bundle
+        # v5.2.1 item 49: snapshot the undeformed bbox diagonal now so
+        # ``_sync_deform_scale_to_widget`` has a stable reference even
+        # if downstream rendering ever leaks a deformed grid back into
+        # ``current_grid`` (it shouldn't anymore -- see Item 49 fix --
+        # but the snapshot makes the %-of-model math reproducible).
+        try:
+            if self.current_grid is not None and self.current_grid.n_points > 0:
+                b = self.current_grid.bounds
+                self._undeformed_bbox_diag = (
+                    (b[1] - b[0]) ** 2
+                    + (b[3] - b[2]) ** 2
+                    + (b[5] - b[4]) ** 2) ** 0.5
+            else:
+                self._undeformed_bbox_diag = 0.0
+        except Exception:
+            self._undeformed_bbox_diag = 0.0
         self._update_results_status(run, bundle)
         # Make the legacy results sidebar widget visible + populate its
         # subcase / type / component combos. Without this the v3.0.0
         # color-by-results path doesn't know which scalar to pull.
-        try:
-            self.results_widget.setVisible(True)
-        except Exception:
-            pass
+        # v5.2.0: the legacy results_widget stays HIDDEN; it acts as a
+        # state holder only. The Results sidebar tab is the visible UI.
         try:
             self._populate_results_combos()
         except Exception:
@@ -15771,28 +16558,513 @@ class MainWindow(QMainWindow):
             self._populate_result_browser()
         except Exception:
             pass
+        # v5.1.2 item 36: populate the Results sidebar tab tree
+        # unconditionally, regardless of color_mode. Without this the
+        # tree stays blank until the user manually flips Color By ->
+        # Results, which fragments the "results loaded" UX.
+        try:
+            if hasattr(self, 'results_tab'):
+                self.results_tab.populate_from_results(
+                    bundle, file_label=self._results_tab_file_label())
+        except Exception:
+            pass
+        # Focus the Results sidebar tab now that it has content.
+        try:
+            if hasattr(self, 'sidebar_tabs') and hasattr(self, 'results_tab'):
+                self.sidebar_tabs.setCurrentWidget(self.results_tab)
+        except Exception:
+            pass
         # Trigger the same downstream that the OP2 menu item uses.
         try:
             self._on_results_changed()
         except Exception:
             pass
-        # Auto-open Result Browser if configured.
-        from node_runner.solve import mystran_settings
-        if mystran_settings.get('auto_open_browser', True):
-            try:
-                if getattr(self, '_result_browser_dock', None) is None:
-                    self._build_result_browser_dock()
-                if self._result_browser_dock is not None:
-                    self._result_browser_dock.show()
-                    self._result_browser_dock.raise_()
-            except Exception:
-                pass
-        # Also surface the three v3.0.x result panels (browser /
-        # animation / vector) as a tabified group on the right.
+        # v5.1.2 item 37: the right-side Result Browser / Animation /
+        # Vector docks were eliminated -- all three panels now live in
+        # the Results sidebar tab as sub-tabs and are always visible
+        # there. The legacy ``mystran/auto_open_browser`` QSettings key
+        # is retained for back-compat but is no longer read here.
+
+    def _update_results_status(self, run, bundle):
+        """Refresh the status-bar Results segment."""
+        if not hasattr(self, '_status_results_lbl'):
+            return
+        n_subcases = len(bundle.get('subcases', {}))
+        n_disp = sum(
+            len(sc.get('displacements', {}))
+            for sc in bundle.get('subcases', {}).values())
+        src = (run.results_source or "?").upper()
+        sol_label = {101: "SOL 1", 103: "SOL 3", 105: "SOL 5"}.get(
+            run.sol, f"SOL {run.sol}")
+        self._status_results_lbl.setText(
+            f"Results: {sol_label} ({src}) | "
+            f"{n_subcases} subcase{'s' if n_subcases != 1 else ''} | "
+            f"{n_disp:,} disp")
+
+    # ─── v5.0.0 items 17/18: MYSTRAN run flow ─────────────────────────
+    def _configure_mystran(self):
+        """Analysis -> Configure MYSTRAN…: open Preferences on the MYSTRAN tab."""
+        from node_runner.dialogs.preferences import (
+            PreferencesDialog, save_preferences, load_preferences)
+        current = load_preferences()
+        dlg = PreferencesDialog(current, self)
+        # Try to switch to the MYSTRAN tab.
         try:
-            self._show_result_panels(True)
+            for i in range(dlg._tabs.count()):
+                if dlg._tabs.tabText(i) == "MYSTRAN":
+                    dlg._tabs.setCurrentIndex(i)
+                    break
         except Exception:
             pass
+        if dlg.exec() == QDialog.Accepted:
+            save_preferences(dlg.result_payload())
+            self._update_status("MYSTRAN preferences saved.")
+
+    def _open_analysis_history(self):
+        """Analysis -> Analysis History…"""
+        from node_runner.dialogs.solver_run import AnalysisHistoryDialog
+        from node_runner.solve import mystran_settings
+        dlg = AnalysisHistoryDialog(mystran_settings.get_scratch_root(),
+                                    parent=self)
+        dlg.reload_requested.connect(self._on_mystran_history_reload)
+        dlg.exec()
+
+    def _on_mystran_history_reload(self, run):
+        """User picked a prior run from the history dialog. Re-load
+        its results into the current model.
+        """
+        try:
+            from node_runner.solve.mystran_results import load_mystran_results
+            bundle = load_mystran_results(run)
+            if bundle is None:
+                QMessageBox.warning(
+                    self, "Analysis History",
+                    "Couldn't load OP2 or F06 from that run folder.")
+                return
+            self._consume_mystran_bundle(bundle, run)
+            # v5.0.0 item 20: update the persisted results_source so a
+            # prior run that previously read "null" now records the
+            # source that actually loaded (OP2 vs F06).
+            try:
+                if run.bdf_path:
+                    run.save_meta(Path(run.bdf_path).parent)
+            except Exception:
+                pass
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Analysis History",
+                f"Failed to reload that run: {exc}")
+
+    def _run_mystran(self):
+        """Analysis -> Run Analysis (MYSTRAN)…: pre-flight -> run-options
+        -> solver progress -> auto-load results.
+
+        v5.1.0 item 26: requires an active AnalysisSet. The set drives
+        what gets exported (scope/group/load/SPC filtering via
+        scope.py) and what shows up in the deck's case-control block.
+        common convention -- you can't just "run a model"; you run an
+        analysis set.
+        """
+        if not self.current_generator or not self.current_generator.model:
+            QMessageBox.warning(
+                self, "Run MYSTRAN",
+                "Open or create a model first.")
+            return
+
+        # v5.1.0 item 26: block-with-pointer when no AnalysisSet is
+        # active. The user goes to AnalysisSet Manager to create or
+        # pick one -- we no longer silently run the full model.
+        active_set = (self.analysis_sets or {}).get(
+            self.active_analysis_set_id)
+        if active_set is None:
+            ret = QMessageBox.question(
+                self, "Run requires an active AnalysisSet",
+                "MYSTRAN runs need an active AnalysisSet so the scope "
+                "(group target, load/SPC SIDs, solver target) is "
+                "explicit.\n\nOpen the AnalysisSet Manager now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret == QMessageBox.Yes:
+                self._open_analysis_set_manager()
+                active_set = (self.analysis_sets or {}).get(
+                    self.active_analysis_set_id)
+            if active_set is None:
+                self._update_status(
+                    "MYSTRAN run cancelled -- no active AnalysisSet.")
+                return
+        # Confirm the AnalysisSet's solver target is MYSTRAN.
+        target = getattr(active_set, 'solver_target', 'MYSTRAN')
+        if target != 'MYSTRAN':
+            ret = QMessageBox.question(
+                self, "AnalysisSet target mismatch",
+                f"Active AnalysisSet '{active_set.name}' has "
+                f"solver_target='{target}', not MYSTRAN. Run anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                return
+
+        # Verify MYSTRAN binary is configured.
+        from node_runner.solve import mystran_settings
+        from node_runner.solve.mystran_runner import (
+            discover_mystran_executable)
+        exe = discover_mystran_executable()
+        if not exe:
+            ret = QMessageBox.question(
+                self, "MYSTRAN not configured",
+                "I couldn't find the MYSTRAN executable. Configure it now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret == QMessageBox.Yes:
+                self._configure_mystran()
+                exe = discover_mystran_executable()
+            if not exe:
+                return
+
+        # Open Run-options dialog.
+        from node_runner.dialogs.solver_run import (
+            RunMystranDialog, MystranPreflightDialog, SolverProgressDialog)
+        run_dlg = RunMystranDialog(self, parent=self)
+        if run_dlg.exec() != QDialog.Accepted:
+            return
+        opts = run_dlg.get_options()
+
+        # v5.1.0 item 26: build the scoped model for pre-flight + export.
+        from node_runner.scope import scope_model_to_analysis_set
+        try:
+            scoped_model, scope_report = scope_model_to_analysis_set(
+                self.current_generator.model, active_set,
+                groups=self.groups)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Scoping failed",
+                f"Could not scope model to AnalysisSet '{active_set.name}': "
+                f"{exc}")
+            return
+
+        # Pre-flight (on the scoped model so users see only relevant
+        # blocking issues).
+        from node_runner.solve.mystran_preflight import scan_for_mystran
+        report = scan_for_mystran(scoped_model, sol=opts.get('sol'))
+        pf_dlg = MystranPreflightDialog(report, parent=self)
+        if pf_dlg.exec() != QDialog.Accepted:
+            return
+
+        # Export deck to working dir. Run-folder name carries the
+        # AnalysisSet name so Analysis History distinguishes sets.
+        safe_setname = ''.join(c if c.isalnum() or c in '-_' else '_'
+                                for c in active_set.name)[:32]
+        working_dir = Path(opts['working_dir'])
+        # Replace the trailing timestamp-only folder with one that
+        # also carries the set name.
+        if safe_setname and not working_dir.name.endswith(safe_setname):
+            working_dir = working_dir.with_name(
+                f"{working_dir.name}_{safe_setname}")
+        working_dir.mkdir(parents=True, exist_ok=True)
+        bdf_stem = Path(self._loaded_filepath).stem if self._loaded_filepath \
+            else "untitled"
+        bdf_path = working_dir / f"{bdf_stem}.bdf"
+        try:
+            self.current_generator._write_bdf(
+                str(bdf_path),
+                field_format=getattr(
+                    active_set, 'field_format', 'short'),
+                target='mystran',
+                analysis_set=active_set,
+                groups=self.groups,
+                sollib=mystran_settings.get('default_sollib'),
+                quad4typ=mystran_settings.get('default_quad4typ'),
+                wtmass=mystran_settings.get('default_wtmass'),
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export failed",
+                f"Could not write MYSTRAN BDF: {exc}")
+            return
+
+        # Status line tells the user exactly what got scoped in.
+        self._update_status(
+            f"Running '{active_set.name}': "
+            f"{scope_report.n_elements_kept:,} elements, "
+            f"{scope_report.n_loads_kept} load SID(s), "
+            f"{scope_report.n_spcs_kept} SPC SID(s)"
+            + (f" (group: {scope_report.group_target})"
+               if scope_report.group_target else ""))
+
+        # Launch SolverRunWorker.
+        from node_runner.solve.mystran_runner import SolverRunWorker
+        self._solver_worker = SolverRunWorker(self)
+        self._solver_dialog = SolverProgressDialog(bdf_path.name, parent=self)
+        self._solver_worker.progress.connect(
+            self._solver_dialog.update_progress)
+        self._solver_worker.finished.connect(self._on_mystran_finished)
+        self._solver_worker.failed.connect(self._on_mystran_failed)
+        self._solver_worker.cancelled.connect(self._on_mystran_cancelled)
+        self._solver_dialog.cancel_requested.connect(
+            self._solver_worker.cancel)
+        self._solver_dialog.start_timer()
+        self._solver_dialog.show()
+        self._solver_worker.start(
+            bdf_path=bdf_path,
+            exe_path=exe,
+            output_dir=working_dir,
+            sol=opts.get('sol', 101),
+            analysis_set_name=active_set.name,
+        )
+
+    def _on_mystran_finished(self, run):
+        """Solver completed cleanly. Auto-load results per preference,
+        then show a single summary dialog that says where the files
+        landed and surfaces any MYSTRAN-level errors from the ERR file.
+        """
+        from node_runner.solve import mystran_settings
+        from node_runner.solve.mystran_results import load_mystran_results
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        self._update_status(
+            f"MYSTRAN finished in {run.wall_time:.1f}s "
+            f"(exit code {run.return_code}).")
+
+        # Always try to load results -- the user expectation is "click
+        # Run, see results". Status of the parse + the run folder are
+        # surfaced together in a single post-run dialog below.
+        bundle = None
+        if mystran_settings.get('auto_load_results', True):
+            bundle = load_mystran_results(run)
+            if bundle and self._bundle_has_data(bundle):
+                self._consume_mystran_bundle(bundle, run)
+                self._mystran_results_loaded_msg = (
+                    f"Loaded {self._bundle_disp_count(bundle):,} "
+                    f"displacements ({run.results_source.upper()} source).")
+            elif bundle is not None:
+                # Bundle parsed but empty -- treat as failure visually.
+                self._mystran_results_loaded_msg = (
+                    "Results file parsed but contained NO displacement "
+                    "data. MYSTRAN likely aborted with errors -- see "
+                    "the ERR file below.")
+            else:
+                self._mystran_results_loaded_msg = (
+                    "No OP2 or F06 results file found in the run folder.")
+        else:
+            self._mystran_results_loaded_msg = (
+                "Auto-load is disabled in Preferences → MYSTRAN.")
+
+        self._show_mystran_summary(run, bundle)
+
+    def _bundle_has_data(self, bundle):
+        """True iff the bundle contains at least one non-empty
+        displacement / eigenvalue / eigenvector entry."""
+        for sc in (bundle.get('subcases') or {}).values():
+            if sc.get('displacements'):
+                return True
+            if sc.get('eigenvalues'):
+                return True
+            if sc.get('eigenvectors'):
+                return True
+        return False
+
+    def _bundle_disp_count(self, bundle):
+        return sum(len(sc.get('displacements', {}))
+                   for sc in (bundle.get('subcases') or {}).values())
+
+    def _show_mystran_summary(self, run, bundle):
+        """Single post-run dialog: where the files are, MYSTRAN ERR
+        contents (truncated), and an Open Folder button.
+
+        Replaces the v5.0.0-first-cut behaviour where a successful exit
+        code but no parsed results left the user staring at an
+        unchanged viewport with no idea where to look.
+        """
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+            QPlainTextEdit, QFrame, QDialogButtonBox,
+        )
+        from PySide6.QtGui import QFont
+
+        run_dir = Path(run.bdf_path).parent if run.bdf_path else None
+        err_path = (Path(run.bdf_path).with_suffix('.ERR')
+                    if run.bdf_path else None)
+        err_text = ""
+        if err_path and err_path.exists():
+            try:
+                err_text = err_path.read_text(
+                    encoding='utf-8', errors='replace')
+            except Exception:
+                err_text = ""
+        # Count MYSTRAN-level errors in the ERR for the banner.
+        n_err = err_text.upper().count("*ERROR")
+        n_warn = err_text.upper().count("*WARNING")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("MYSTRAN run summary")
+        dlg.setMinimumSize(760, 480)
+
+        layout = QVBoxLayout(dlg)
+
+        # ---- Banner ----
+        has_data = bool(bundle) and self._bundle_has_data(bundle)
+        if has_data and n_err == 0:
+            banner_text = (
+                f"<b>Run successful.</b> {self._mystran_results_loaded_msg}")
+            banner_style = (
+                "background-color: #a6e3a1; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        elif has_data:
+            banner_text = (
+                f"<b>Run produced results, with {n_err} MYSTRAN error(s).</b> "
+                f"{self._mystran_results_loaded_msg} Inspect the ERR "
+                f"file below before trusting these numbers.")
+            banner_style = (
+                "background-color: #f9e2af; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        else:
+            banner_text = (
+                f"<b>MYSTRAN exited cleanly but produced no result data.</b><br>"
+                f"{n_err} error(s), {n_warn} warning(s) in the ERR file. "
+                f"{self._mystran_results_loaded_msg}")
+            banner_style = (
+                "background-color: #f38ba8; color: #1e1e2e; "
+                "padding: 10px; border-radius: 4px; font-size: 13px;")
+        banner = QLabel(banner_text)
+        banner.setStyleSheet(banner_style)
+        banner.setWordWrap(True)
+        layout.addWidget(banner)
+
+        # ---- File summary ----
+        files_box = QLabel(
+            f"<b>Run folder:</b> <code>{run_dir}</code><br>"
+            f"<b>BDF:</b> <code>{Path(run.bdf_path).name if run.bdf_path else '-'}</code> | "
+            f"<b>F06:</b> <code>{Path(run.f06_path).name if run.f06_path else '(none)'}</code> | "
+            f"<b>OP2:</b> <code>{Path(run.op2_path).name if run.op2_path else '(none)'}</code>"
+        )
+        files_box.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; "
+            "padding: 6px 0;")
+        files_box.setWordWrap(True)
+        layout.addWidget(files_box)
+
+        # ---- ERR contents ----
+        layout.addWidget(QLabel("<b>MYSTRAN .ERR file:</b>"))
+        err_view = QPlainTextEdit()
+        err_view.setReadOnly(True)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.Monospace)
+        err_view.setFont(mono)
+        if err_text:
+            # Truncate very long ERR files so the dialog stays usable.
+            if len(err_text) > 20_000:
+                err_view.setPlainText(
+                    err_text[:20_000]
+                    + "\n\n[... truncated; open the file to see the rest ...]")
+            else:
+                err_view.setPlainText(err_text)
+        else:
+            err_view.setPlainText("(No ERR file produced.)")
+        layout.addWidget(err_view, 1)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        layout.addWidget(sep)
+
+        # ---- Buttons ----
+        button_row = QHBoxLayout()
+        # v5.1.1 item 33: in-dialog Load Results button so the user
+        # always has a one-click path to import what MYSTRAN just
+        # produced, regardless of the auto-load Preference.
+        load_btn = QPushButton("Load Results")
+        load_btn.setToolTip(
+            "Parse the OP2 / F06 from this run and feed the results "
+            "into the Result Browser. Same as auto-load when that "
+            "Preference is on.")
+        # Disable when there's nothing to load.
+        can_load = bool(
+            (run.op2_path and Path(run.op2_path).exists())
+            or (run.f06_path and Path(run.f06_path).exists())
+        )
+        load_btn.setEnabled(can_load)
+        load_btn.clicked.connect(
+            lambda: self._load_results_from_run_summary(run, dlg))
+        button_row.addWidget(load_btn)
+        if run_dir is not None:
+            open_btn = QPushButton("Open Run Folder")
+            open_btn.clicked.connect(lambda: self._open_folder(run_dir))
+            button_row.addWidget(open_btn)
+            open_err_btn = QPushButton("Open .ERR")
+            open_err_btn.setEnabled(bool(err_path and err_path.exists()))
+            open_err_btn.clicked.connect(lambda: self._open_folder(err_path))
+            button_row.addWidget(open_err_btn)
+            open_f06_btn = QPushButton("Open .F06")
+            open_f06_btn.setEnabled(
+                bool(run.f06_path and Path(run.f06_path).exists()))
+            open_f06_btn.clicked.connect(
+                lambda: self._open_folder(run.f06_path))
+            button_row.addWidget(open_f06_btn)
+        button_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dlg.exec()
+
+    def _load_results_from_run_summary(self, run, dlg):
+        """v5.1.1 item 33: handler for the Load Results button on the
+        post-run summary dialog. Calls the same MYSTRAN result adapter
+        that auto-load uses, then closes the summary on success.
+        """
+        from node_runner.solve.mystran_results import load_mystran_results
+        bundle = load_mystran_results(run)
+        if bundle and self._bundle_has_data(bundle):
+            self._consume_mystran_bundle(bundle, run)
+            self._update_status(
+                f"Loaded {self._bundle_disp_count(bundle):,} "
+                f"displacements ({(run.results_source or '?').upper()} "
+                f"source).")
+            try:
+                dlg.accept()
+            except Exception:
+                pass
+        else:
+            QMessageBox.warning(
+                self, "Load Results",
+                "No displacement data could be parsed from the OP2/F06 "
+                "in this run folder. Inspect the .ERR file for the "
+                "MYSTRAN-reported failure.")
+
+    def _open_folder(self, path):
+        """Open a folder (or file's parent) in the host file manager."""
+        import subprocess, sys
+        p = Path(path)
+        target = str(p if p.is_dir() else p.parent)
+        try:
+            if sys.platform == 'win32':
+                if p.is_file():
+                    # Open the file in its default app.
+                    os.startfile(str(p))
+                else:
+                    os.startfile(target)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', target])
+            else:
+                subprocess.Popen(['xdg-open', target])
+        except Exception:
+            pass
+
+    def _on_mystran_failed(self, msg):
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        # Build a MystranRun-like stub from any partial info we have.
+        run = getattr(self._solver_worker, '_run', None)
+        if run is not None:
+            self._mystran_results_loaded_msg = (
+                "MYSTRAN reported a non-zero exit code.")
+            self._show_mystran_summary(run, None)
+        else:
+            QMessageBox.critical(self, "MYSTRAN run failed", msg)
+        self._update_status("MYSTRAN run failed.", is_error=True)
+
+    def _on_mystran_cancelled(self):
+        if self._solver_dialog is not None:
+            self._solver_dialog.stop_timer()
+            self._solver_dialog.close()
+        self._update_status("MYSTRAN run cancelled.", is_error=False)
 
     def _update_results_status(self, run, bundle):
         """Refresh the status-bar Results segment."""
@@ -15971,6 +17243,41 @@ class MainWindow(QMainWindow):
 
     # --- Post-processing (OP2 results) handlers ---
 
+    def _detach_results(self):
+        """v5.2.2 issue 5: clear the loaded results bundle while
+        keeping the model itself open. Drops back to property coloring
+        so the user sees the geometry without the contour."""
+        self.op2_results = None
+        # Status bar Results segment.
+        if hasattr(self, '_status_results_lbl'):
+            try:
+                self._status_results_lbl.setText("")
+            except Exception:
+                pass
+        # Clear the toolbox dropdowns.
+        try:
+            if hasattr(self, 'results_tab'):
+                self.results_tab.populate_from_results(None)
+        except Exception:
+            pass
+        # v5.3.0 item 58: prefix-sweep so labels-text companion actors
+        # also get cleaned up.
+        for nm in ('result_min_marker', 'result_max_marker',
+                   'result_element_labels', 'result_undeformed_ref'):
+            self._remove_actors_by_prefix(nm)
+        # Flip the legacy results_widget hidden + switch color mode.
+        try:
+            self._set_coloring_mode('property')
+        except Exception:
+            pass
+        self._update_plot_visibility()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results', 'detached')
+        except Exception:
+            pass
+        self._update_status("Results detached.")
+
     def _load_results_dialog(self):
         """v5.1.1 item 34: graceful OP2 + F06 loader.
 
@@ -16145,6 +17452,1074 @@ class MainWindow(QMainWindow):
         if is_eig:
             self._populate_mode_combo()
         self._on_results_changed()
+
+    # ─── v5.1.0 item 25: Results sidebar tab handlers ──────────────────
+    #
+    # The ResultsTab widget emits high-level requests (contour, vector,
+    # deform, animate, ...) plus control-panel state changes (color
+    # range, levels, min/max markers, element labels, deformation).
+    # Each handler below translates the request into operations on
+    # the existing v5.0.x results infrastructure -- in particular the
+    # display-side results_subcase_combo / results_type_combo /
+    # results_component_combo, which drive _update_plot_visibility's
+    # results branch via _on_results_changed.
+
+    def _results_tab_select_combos(self, subcase, kind, component):
+        """Drive the existing results combos from a ResultsTab request.
+
+        ``kind`` is one of 'displacement', 'stress', 'spc_forces',
+        'eigenvector'. ``component`` is a string like 'T3' /
+        'von_mises' / 'Mode 2'.
+        """
+        # Map kind to the existing results_type_combo entries.
+        type_map = {
+            'displacement': 'Displacement',
+            'stress':       'Stress',
+            'spc_forces':   'SPC Forces',
+            'eigenvector':  'Eigenvector',
+        }
+        type_label = type_map.get(kind)
+        if type_label is None:
+            return
+        idx = self.results_type_combo.findText(type_label)
+        if idx >= 0:
+            self.results_type_combo.setCurrentIndex(idx)
+        # Subcase combo holds (subcase_id) as currentData.
+        for i in range(self.results_subcase_combo.count()):
+            if self.results_subcase_combo.itemData(i) == int(subcase):
+                self.results_subcase_combo.setCurrentIndex(i)
+                break
+        # For eigenvectors the component label encodes the mode index;
+        # the existing UI shows a separate mode_combo.
+        if kind == 'eigenvector' and component.startswith('Mode '):
+            try:
+                mode_idx = int(component.split()[1]) - 1
+                for i in range(self.results_mode_combo.count()):
+                    if self.results_mode_combo.itemData(i) == mode_idx:
+                        self.results_mode_combo.setCurrentIndex(i)
+                        break
+            except Exception:
+                pass
+        else:
+            idx = self.results_component_combo.findText(component)
+            if idx >= 0:
+                self.results_component_combo.setCurrentIndex(idx)
+
+    # ------------------------------------------------------------------
+    # v5.2.0 item 42: Post-Processing Toolbox signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_results_output_set_changed(self, sid):
+        """User picked a different Output Set in the toolbox.
+
+        v5.3.0 item 56: no longer auto-engages Results color mode.
+        Results load with the model undeformed + uncoloured
+        until the user explicitly picks a Deform Style or Contour
+        Style. Picking an Output Set only stages the selection.
+        """
+        sid = int(sid)
+        # Drive the legacy results_subcase_combo so the existing
+        # rendering branch (mainwindow.py:11879+) keeps working.
+        for i in range(self.results_subcase_combo.count()):
+            if self.results_subcase_combo.itemData(i) == sid:
+                self.results_subcase_combo.setCurrentIndex(i)
+                break
+        # Only re-render if we're already in Results mode (i.e. user
+        # already opted in). Don't auto-engage.
+        if self.color_mode == 'results':
+            self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'output_set_changed', subcase=sid)
+        except Exception:
+            pass
+
+    def _on_results_output_vector_changed(self, kind, component, mode_idx):
+        """v5.3.2 item 67: single Output Vector dropdown handler.
+
+        Stashes (kind, component, mode_idx) on self so both the
+        contour render path and the deformation block read from it.
+        Also drives the legacy results_type / results_component /
+        results_mode combos so the existing render pipeline (which
+        reads from those) gets the right scalar.
+        """
+        self._output_vector_kind = kind
+        self._output_vector_component = component
+        self._output_vector_mode_idx = int(mode_idx)
+        type_map = {
+            'displacement': 'Displacement',
+            'stress':       'Stress',
+            'spc_forces':   'SPC Forces',
+            'eigenvector':  'Eigenvector',
+        }
+        type_label = type_map.get(kind, 'Displacement')
+        idx = self.results_type_combo.findText(type_label)
+        if idx >= 0:
+            self.results_type_combo.setCurrentIndex(idx)
+        legacy_disp_label = {
+            'Magnitude':  'Magnitude', 'T1': 'T1 (X)', 'T2': 'T2 (Y)',
+            'T3': 'T3 (Z)', 'R1': 'R1 (RX)', 'R2': 'R2 (RY)',
+            'R3': 'R3 (RZ)', 'RMAG': 'Magnitude',
+        }
+        legacy_stress_label = {
+            'von_mises': 'von Mises',
+            'max_principal': 'Max Principal',
+            'min_principal': 'Min Principal',
+            'oxx': 'XX', 'oyy': 'YY', 'txy': 'XY',
+        }
+        if kind == 'stress':
+            comp_label = legacy_stress_label.get(component, component)
+        else:
+            comp_label = legacy_disp_label.get(component, component)
+        idx = self.results_component_combo.findText(comp_label)
+        if idx >= 0:
+            self.results_component_combo.setCurrentIndex(idx)
+        if kind == 'eigenvector' and mode_idx >= 0:
+            for i in range(self.results_mode_combo.count()):
+                if self.results_mode_combo.itemData(i) == int(mode_idx):
+                    self.results_mode_combo.setCurrentIndex(i)
+                    break
+        # Re-render only if we're already in Results mode (user
+        # opted in via a Style toggle). Picking an Output Vector
+        # never auto-engages results coloring.
+        if self.color_mode == 'results':
+            self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'output_vector_changed',
+                       kind=kind, component=component, mode_idx=mode_idx)
+        except Exception:
+            pass
+
+    def _on_results_deform_style_changed(self, style):
+        """User picked Undeformed / Deformed / Animate."""
+        self._results_deform_style = style
+        if style == 'undeformed':
+            self.deformation_scale_input.setText("0.0")
+            # Stop any running animation.
+            if self.anim_play_btn.isChecked():
+                self.anim_play_btn.setChecked(False)
+        elif style == 'deformed':
+            self._sync_deform_scale_to_widget()
+            if self.anim_play_btn.isChecked():
+                self.anim_play_btn.setChecked(False)
+            self._ensure_results_mode_active(trigger='deform')
+        elif style == 'animate':
+            self._sync_deform_scale_to_widget()
+            self._ensure_results_mode_active(trigger='animate')
+            if not self.anim_play_btn.isChecked():
+                self.anim_play_btn.setChecked(True)
+        self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'deform_style', style=style)
+        except Exception:
+            pass
+
+    def _on_results_deform_scale_changed(self, mode, value):
+        """User changed the deform scale mode (% of model | actual)."""
+        self._results_scale_mode = mode      # 'pct' or 'actual'
+        self._results_scale_value = float(value)
+        self._sync_deform_scale_to_widget()
+        self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'scale_mode', mode=mode, value=value)
+        except Exception:
+            pass
+
+    def _sync_deform_scale_to_widget(self):
+        """Translate the toolbox's scale mode/value into the legacy
+        ``deformation_scale_input`` value that ``_update_plot_visibility``
+        reads.
+
+        - ``actual``: pass the spinbox value straight through.
+        - ``pct``: scale so that the largest displacement reaches
+          ``value / 100 * model_bbox_diagonal``. Falls back to the raw
+          value if no displacement data is available yet.
+        """
+        mode = getattr(self, '_results_scale_mode', 'pct')
+        value = float(getattr(self, '_results_scale_value', 10.0))
+        if mode == 'actual':
+            self.deformation_scale_input.setText(f"{value:.6g}")
+            return
+        # Percent-of-model mode. Need bbox diagonal + max disp magnitude.
+        scale = value   # safe fallback
+        try:
+            grid = getattr(self, 'current_grid', None)
+            bundle = getattr(self, 'op2_results', None)
+            # v5.2.0 bug-fix (Round 2): MainWindow initializes
+            # ``current_grid`` to an empty UnstructuredGrid with
+            # degenerate bounds (1, -1, 1, -1, 1, -1) before any model
+            # loads. Guard against that so the % of model math doesn't
+            # produce nonsense (e.g. ~0.17 from sqrt(12)*0.05) when no
+            # real geometry is present.
+            if grid is not None and bundle is not None:
+                bnds = grid.bounds
+                has_real_bounds = (
+                    bnds[1] > bnds[0]
+                    and bnds[3] > bnds[2]
+                    and bnds[5] > bnds[4])
+            else:
+                has_real_bounds = False
+            if grid is not None and bundle is not None and has_real_bounds:
+                # v5.2.1 item 49: prefer the snapshot taken at results
+                # load time so subsequent renders never see a diag that
+                # has crept upward via an accidental grid mutation.
+                snap = float(getattr(self, '_undeformed_bbox_diag', 0.0) or 0.0)
+                if snap > 1e-30:
+                    diag = snap
+                else:
+                    diag = (
+                        (bnds[1] - bnds[0]) ** 2 +
+                        (bnds[3] - bnds[2]) ** 2 +
+                        (bnds[5] - bnds[4]) ** 2) ** 0.5
+                sid = self.results_subcase_combo.currentData()
+                sc = bundle.get('subcases', {}).get(sid, {})
+                disps = sc.get('displacements') or {}
+                if disps:
+                    max_mag = max(
+                        (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5
+                        for v in disps.values()
+                        if v and len(v) >= 3
+                    )
+                    if max_mag > 1e-30 and diag > 1e-30:
+                        scale = (value / 100.0) * diag / max_mag
+        except Exception:
+            scale = value
+        self.deformation_scale_input.setText(f"{scale:.6g}")
+
+    def _on_results_animation_settings_changed(self, mode, n_frames, delay_ms):
+        """User changed Sine vs Through Modes, frame count, or delay."""
+        self._anim_mode = mode                   # 'sine' or 'modes'
+        self._anim_n_frames = int(n_frames)
+        self._anim_delay_ms = int(delay_ms)
+        # If the timer is running, apply the new interval immediately.
+        if self._anim_timer.isActive():
+            self._anim_timer.setInterval(max(10, int(delay_ms)))
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'anim_settings',
+                       mode=mode, n_frames=n_frames, delay_ms=delay_ms)
+        except Exception:
+            pass
+
+    def _on_results_show_undeformed_ref_changed(self, on):
+        """Toggle the faint undeformed-wireframe overlay."""
+        self._results_show_undeformed_ref = bool(on)
+        self._refresh_undeformed_ref_actor()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'undeformed_ref', enabled=bool(on))
+        except Exception:
+            pass
+
+    def _refresh_undeformed_ref_actor(self):
+        """Build (or remove) the undeformed wireframe reference actor."""
+        actor_name = 'result_undeformed_ref'
+        try:
+            if actor_name in self.plotter.actors:
+                self.plotter.remove_actor(actor_name)
+        except Exception:
+            pass
+        if not getattr(self, '_results_show_undeformed_ref', False):
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        grid = getattr(self, 'current_grid', None)
+        if grid is None or grid.n_points == 0:
+            return
+        # Use the ORIGINAL (un-deformed) points to draw a faint
+        # wireframe. v5.2.2 issue 4: dropped the
+        # ``hasattr(gen, 'node_id_to_index')`` gate -- some loaded
+        # decks don't have that attribute on the generator, which made
+        # the wireframe silently skip even when the user toggled it on.
+        try:
+            import numpy as _np
+            # Build a wireframe copy from the source grid. Deep copy
+            # so any later mutation of current_grid doesn't leak.
+            wire = grid.copy(deep=True)
+            self.plotter.add_mesh(
+                wire,
+                style='wireframe',
+                color='#888888',
+                opacity=0.35,
+                line_width=1,
+                name=actor_name,
+                    reset_camera=False,
+                    show_scalar_bar=False,
+                )
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _on_results_contour_style_changed(self, style):
+        """User picked Filled / Filled+Edges / Discrete Bands / No Contour.
+
+        v5.3.2 item 68: explicit, aggressive teardown when style=='none'
+        so the contour really goes away:
+        1. Sweep every scalar bar from the plotter (the title-keyed
+           ``remove_scalar_bar`` is unreliable; also sweep the renderer
+           for any leftover vtkScalarBarActor).
+        2. Remove the named ``shells`` and ``beams`` actors so the
+           next ``add_mesh`` builds fresh ones with property RGB
+           (instead of inheriting the old contour mapper).
+        3. Remove min/max marker + element-label actors.
+        4. Force a re-render via ``_update_plot_visibility`` regardless
+           of current color_mode -- if results aren't active we should
+           still render the unchanged geometry to flush any stale
+           contour pixels.
+        """
+        self._results_contour_style = style
+        if style in ('filled', 'filled_edges', 'bands'):
+            self._ensure_results_mode_active(trigger='contour_style')
+        elif style == 'none':
+            # 1. Scalar bars.
+            self._clear_scalar_bars()
+            # 2. Force shells/beams actors to be recreated. Without
+            #    this PyVista's add_mesh(name='shells', scalars=...)
+            #    reuses the existing actor and may keep the old
+            #    scalar/cmap binding alive.
+            for nm in ('shells', 'beams'):
+                try:
+                    if nm in self.plotter.actors:
+                        self.plotter.remove_actor(nm)
+                except Exception:
+                    pass
+            # 3. Markers + labels (prefix sweep handles companion text
+            #    actors PyVista adds for add_point_labels).
+            for prefix in ('result_min_marker', 'result_max_marker',
+                           'result_element_labels'):
+                self._remove_actors_by_prefix(prefix)
+        # 4. Re-render. Even if color_mode != 'results' (e.g. user
+        #    never engaged any style), we still want the next frame
+        #    to reflect the property RGB state.
+        try:
+            self._update_plot_visibility()
+        except Exception:
+            pass
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'contour_style', style=style,
+                       color_mode=self.color_mode)
+        except Exception:
+            pass
+
+    def _on_results_data_conversion_changed(self, conversion):
+        """User picked Average / No Averaging / Max at Node / Min at Node."""
+        self._results_data_conversion = conversion
+        self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'data_conversion', mode=conversion)
+        except Exception:
+            pass
+
+    def _on_results_palette_changed(self, palette):
+        """User picked a colormap (jet/viridis/plasma/coolwarm/gray)."""
+        self._results_palette = palette
+        self._on_results_changed()
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'palette_changed', palette=palette)
+        except Exception:
+            pass
+
+    def _on_results_copy_values(self, subcase, kind, component):
+        """Legacy 'Copy values to CSV' kept for back-compat with any
+        external caller (e.g. tests). v5.2.0 routes the same workflow
+        through Tools -> Data Table instead."""
+        bundle = getattr(self, 'op2_results', None)
+        if not bundle:
+            return
+        sc = bundle.get('subcases', {}).get(int(subcase))
+        if not sc:
+            return
+        lines = ["id,value"]
+        try:
+            if kind == 'displacement':
+                arr = sc.get('displacements') or {}
+                comp_idx = {'T1': 0, 'T2': 1, 'T3': 2,
+                            'R1': 3, 'R2': 4, 'R3': 5}.get(component)
+                for nid, v in sorted(arr.items()):
+                    if comp_idx is not None and comp_idx < len(v):
+                        lines.append(f"{nid},{v[comp_idx]:.6e}")
+                    elif component == 'Magnitude' and len(v) >= 3:
+                        mag = (v[0]**2 + v[1]**2 + v[2]**2) ** 0.5
+                        lines.append(f"{nid},{mag:.6e}")
+            elif kind == 'stress':
+                arr = sc.get('stresses') or {}
+                for eid, sdict in sorted(arr.items()):
+                    v = sdict.get(component)
+                    if v is not None:
+                        lines.append(f"{eid},{float(v):.6e}")
+        except Exception:
+            pass
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText("\n".join(lines))
+        self._update_status(
+            f"Copied {len(lines) - 1} value(s) to clipboard "
+            f"(subcase {subcase} / {kind} / {component}).")
+
+    # --- Control-panel state (v5.1.0 names preserved for the contour pipeline) ---
+
+    def _on_results_color_range_changed(self, auto, vmin, vmax):
+        """User toggled Auto OR entered Manual min/max."""
+        self._results_user_auto_range = bool(auto)
+        self._results_user_vmin = float(vmin)
+        self._results_user_vmax = float(vmax)
+        # Apply to the active scalar-bar actor if one exists.
+        try:
+            if not auto and vmax > vmin:
+                for actor in self.plotter.actors.values():
+                    mapper = getattr(actor, 'mapper', None)
+                    if mapper is None:
+                        continue
+                    try:
+                        mapper.SetScalarRange(vmin, vmax)
+                    except Exception:
+                        continue
+                self.plotter.render()
+        except Exception:
+            pass
+
+    def _on_results_levels_changed(self, n_levels):
+        """User changed the contour level count."""
+        self._results_n_levels = int(n_levels)
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'levels_changed', n=int(n_levels))
+        except Exception:
+            pass
+        # Trigger a redraw so the new level count takes effect.
+        self._on_results_changed()
+
+    def _on_results_markers_changed(self, show_min, show_max):
+        """User toggled Min/Max markers."""
+        self._results_show_min_marker = bool(show_min)
+        self._results_show_max_marker = bool(show_max)
+        self._refresh_results_min_max_markers()
+
+    def _on_results_element_labels_changed(self, show, top_n):
+        """User toggled Show Element Value Labels."""
+        self._results_show_element_labels = bool(show)
+        self._results_element_labels_top_n = int(top_n)
+        self._refresh_results_element_value_labels()
+
+    # v5.2.0: ``_on_results_deformation_changed`` removed -- the
+    # toolbox now drives the deform style via three separate signals
+    # (``deform_style_changed`` / ``deform_scale_changed`` /
+    # ``animation_settings_changed``). Callers that previously called
+    # ``_on_results_deformation_changed(show, scale)`` should route
+    # through ``_on_results_deform_style_changed('deformed')`` +
+    # ``_on_results_deform_scale_changed('actual', scale)`` instead.
+
+    def _ensure_results_mode_active(self, trigger: str = ''):
+        """v5.3.3: switch into Results color mode WITHOUT clobbering the
+        user's current Output Vector selection. The previous version
+        hardcoded a Displacement-Magnitude default which kept the
+        scalar bar stuck on that title regardless of what the user
+        picked.
+
+        New behaviour:
+        1. If combos haven't been primed yet, prime them.
+        2. If the toolbox has a selected Output Vector
+           (``_output_vector_*`` attrs), respect it -- drive the legacy
+           combos to match.
+        3. Otherwise fall back to the first valid scalar in the active
+           subcase (Displacement / Magnitude on most decks; Eigenvector
+           for SOL 3).
+        4. Flip ``color_mode`` to ``'results'`` if not already.
+        """
+        if not getattr(self, 'op2_results', None):
+            return
+        bundle = self.op2_results
+        subs = bundle.get('subcases', {}) or {}
+        if not subs:
+            return
+        try:
+            if self.results_subcase_combo.count() == 0:
+                self._populate_results_combos()
+        except Exception:
+            pass
+        try:
+            cur_sid = self.results_subcase_combo.currentData()
+        except Exception:
+            cur_sid = None
+        if cur_sid is None:
+            first_sid = sorted(subs.keys())[0]
+            for i in range(self.results_subcase_combo.count()):
+                if self.results_subcase_combo.itemData(i) == first_sid:
+                    self.results_subcase_combo.setCurrentIndex(i)
+                    break
+        try:
+            sid_now = self.results_subcase_combo.currentData()
+        except Exception:
+            sid_now = None
+        sc_data = subs.get(sid_now, {}) if sid_now is not None else {}
+        # v5.3.3: respect the toolbox's current Output Vector. The
+        # _output_vector_kind / _component / _mode_idx attrs are set
+        # by _on_results_output_vector_changed; default to displacement
+        # / Magnitude only if those attrs aren't meaningful.
+        ov_kind = getattr(self, '_output_vector_kind', None)
+        ov_component = getattr(self, '_output_vector_component', None)
+        ov_mode = int(getattr(self, '_output_vector_mode_idx', -1))
+        if not ov_kind or not ov_component:
+            # No toolbox selection -- pick a sensible default for this
+            # subcase.
+            prefer_eig = (
+                bool(sc_data.get('eigenvectors')) and
+                not sc_data.get('displacements'))
+            ov_kind = 'eigenvector' if prefer_eig else 'displacement'
+            ov_component = 'Magnitude'
+            ov_mode = 0 if prefer_eig else -1
+        type_map = {
+            'displacement': 'Displacement',
+            'stress':       'Stress',
+            'spc_forces':   'SPC Forces',
+            'eigenvector':  'Eigenvector',
+        }
+        target_type = type_map.get(ov_kind, 'Displacement')
+        try:
+            idx = self.results_type_combo.findText(target_type)
+            if idx >= 0:
+                self.results_type_combo.setCurrentIndex(idx)
+        except Exception:
+            pass
+        legacy_disp_label = {
+            'Magnitude': 'Magnitude', 'T1': 'T1 (X)', 'T2': 'T2 (Y)',
+            'T3': 'T3 (Z)', 'R1': 'R1 (RX)', 'R2': 'R2 (RY)',
+            'R3': 'R3 (RZ)', 'RMAG': 'Magnitude',
+        }
+        legacy_stress_label = {
+            'von_mises': 'von Mises',
+            'max_principal': 'Max Principal',
+            'min_principal': 'Min Principal',
+            'oxx': 'XX', 'oyy': 'YY', 'txy': 'XY',
+        }
+        if ov_kind == 'stress':
+            comp_label = legacy_stress_label.get(ov_component, ov_component)
+        else:
+            comp_label = legacy_disp_label.get(ov_component, ov_component)
+        try:
+            comp_idx = self.results_component_combo.findText(comp_label)
+            if comp_idx < 0 and ov_kind != 'stress':
+                # Fall back to Magnitude/T3 only for displacement-shaped
+                # kinds.
+                comp_idx = self.results_component_combo.findText("Magnitude")
+            if comp_idx < 0 and ov_kind != 'stress':
+                comp_idx = self.results_component_combo.findText("T3 (Z)")
+            if comp_idx >= 0:
+                self.results_component_combo.setCurrentIndex(comp_idx)
+        except Exception:
+            pass
+        if ov_kind == 'eigenvector' and ov_mode >= 0:
+            try:
+                for i in range(self.results_mode_combo.count()):
+                    if self.results_mode_combo.itemData(i) == int(ov_mode):
+                        self.results_mode_combo.setCurrentIndex(i)
+                        break
+            except Exception:
+                pass
+        # Flip color mode into Results if it isn't already.
+        if self.color_mode != 'results':
+            try:
+                self._set_coloring_mode('results')
+            except Exception:
+                pass
+        try:
+            from node_runner.profiling import perf_event
+            perf_event(
+                'results', 'auto_engage',
+                trigger=trigger or 'unspecified',
+                subcase=int(sid_now) if sid_now is not None else -1,
+                type=self.results_type_combo.currentText(),
+                component=self.results_component_combo.currentText())
+        except Exception:
+            pass
+
+    # v5.2.0: ``_on_results_open_animation_dock`` and
+    # ``_on_results_open_vector_dock`` removed -- the sub-tabs they
+    # used to focus no longer exist. Vector overlay now lives under
+    # View -> Show Displacement Vectors; animation controls live in
+    # the Deform section of the Post-Processing Toolbox.
+
+    # --- Actor builders for min/max markers + element value labels ---
+
+    def _active_results_array(self):
+        """v5.1.2 item 38: return ``(nids, values, label)`` for the
+        currently active subcase/type/component combination, sourced
+        from ``self.op2_results`` (the canonical OP2 / F06 bundle)
+        rather than scraping VTK grid arrays.
+
+        Returns ``None`` if no bundle, no active selection, or no data
+        for the chosen kind/component.
+
+        ``nids`` is an int64 numpy array of node IDs.
+        ``values`` is a float numpy array of the same length carrying
+        the scalar component for each node.
+        ``label`` is a short kind/component string for telemetry.
+        """
+        import numpy as _np
+        bundle = getattr(self, 'op2_results', None)
+        if not bundle:
+            return None
+        # Subcase combo carries the SID via Qt.UserRole (currentData()).
+        sc_id = None
+        try:
+            sc_id = self.results_subcase_combo.currentData()
+        except Exception:
+            sc_id = None
+        if sc_id is None:
+            # Fall back to the first subcase in the bundle so the marker
+            # is meaningful even before the user touches the combos.
+            subs = bundle.get('subcases', {}) or {}
+            if not subs:
+                return None
+            sc_id = sorted(subs.keys())[0]
+        sc = bundle.get('subcases', {}).get(int(sc_id))
+        if not sc:
+            return None
+        # Result type
+        try:
+            result_type = self.results_type_combo.currentText()
+        except Exception:
+            result_type = "Displacement"
+        # Component (display text -> bundle slot)
+        try:
+            component = self.results_component_combo.currentText()
+        except Exception:
+            component = "Magnitude"
+        comp_idx = {"T1 (X)": 0, "T2 (Y)": 1, "T3 (Z)": 2,
+                    "R1 (RX)": 3, "R2 (RY)": 4, "R3 (RZ)": 5,
+                    # tolerate the short labels used by the tree
+                    "T1": 0, "T2": 1, "T3": 2, "R1": 3, "R2": 4, "R3": 5,
+                    }.get(component)
+        # Pull the data dict for this kind.
+        key_map = {"Displacement": "displacements",
+                   "Eigenvector": "eigenvectors",
+                   "SPC Forces": "spc_forces"}
+        if result_type in key_map:
+            raw = sc.get(key_map[result_type], {})
+            if result_type == "Eigenvector" and isinstance(raw, list):
+                try:
+                    mode_idx = max(0, self.results_mode_combo.currentIndex())
+                except Exception:
+                    mode_idx = 0
+                data_dict = raw[mode_idx] if mode_idx < len(raw) else {}
+            else:
+                data_dict = raw if isinstance(raw, dict) else {}
+            if not data_dict:
+                return None
+            nids = _np.array(sorted(data_dict.keys()), dtype=_np.int64)
+            values = _np.zeros(len(nids), dtype=float)
+            for i, n in enumerate(nids):
+                v = data_dict.get(int(n))
+                if not v:
+                    continue
+                if component == "Magnitude" and len(v) >= 3:
+                    values[i] = float((v[0]**2 + v[1]**2 + v[2]**2) ** 0.5)
+                elif comp_idx is not None and comp_idx < len(v):
+                    values[i] = float(v[comp_idx])
+            return nids, values, f"{result_type.lower()}/{component}"
+        # Stress is element-centred; signal the caller to handle that
+        # via _active_results_element_array() instead.
+        return None
+
+    def _active_results_element_array(self):
+        """Companion to ``_active_results_array`` for stress / strain.
+
+        Returns ``(eids, values, label)`` for element-centred output
+        (currently only Stress) or ``None``.
+        """
+        import numpy as _np
+        bundle = getattr(self, 'op2_results', None)
+        if not bundle:
+            return None
+        try:
+            sc_id = self.results_subcase_combo.currentData()
+        except Exception:
+            sc_id = None
+        if sc_id is None:
+            subs = bundle.get('subcases', {}) or {}
+            if not subs:
+                return None
+            sc_id = sorted(subs.keys())[0]
+        sc = bundle.get('subcases', {}).get(int(sc_id))
+        if not sc:
+            return None
+        try:
+            result_type = self.results_type_combo.currentText()
+        except Exception:
+            result_type = "Stress"
+        if result_type != "Stress":
+            return None
+        try:
+            component = self.results_component_combo.currentText()
+        except Exception:
+            component = "von Mises"
+        comp_key_map = {"von Mises": "von_mises",
+                        "Max Principal": "max_principal",
+                        "Min Principal": "min_principal",
+                        "XX": "oxx", "YY": "oyy", "XY": "txy"}
+        comp_key = comp_key_map.get(component, "von_mises")
+        stresses = sc.get('stresses', {}) or {}
+        if not stresses:
+            return None
+        eids = _np.array(sorted(stresses.keys()), dtype=_np.int64)
+        values = _np.array(
+            [float(stresses[int(e)].get(comp_key, 0.0)) for e in eids],
+            dtype=float)
+        return eids, values, f"stress/{comp_key}"
+
+    def _refresh_results_min_max_markers(self):
+        """v5.1.2 item 38: build (or remove) the min/max marker
+        callouts. Reads scalar values from the canonical OP2 / F06
+        bundle (``self.op2_results``) via ``_active_results_array``,
+        not from VTK grid arrays. This fixes the v5.1.1 bug where
+        VTK's ``vtkOriginalPointIds`` housekeeping array was being
+        picked up and reported as if it were a displacement field.
+        """
+        show_min = getattr(self, '_results_show_min_marker', False)
+        show_max = getattr(self, '_results_show_max_marker', False)
+        # v5.3.0 item 58: prefix-sweep so the labels-text companion
+        # actors get removed too. add_point_labels creates BOTH
+        # ``result_min_marker`` AND ``result_min_marker-labels``.
+        self._remove_actors_by_prefix('result_min_marker')
+        self._remove_actors_by_prefix('result_max_marker')
+        if not (show_min or show_max):
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        gen = getattr(self, 'current_generator', None)
+        grid = getattr(self, 'current_grid', None)
+        if gen is None or grid is None:
+            return
+        import numpy as _np
+        # Try nodal data first (Displacement / Eigenvector / SPC forces).
+        active = self._active_results_array()
+        if active is not None:
+            nids, values, label = active
+            if values.size == 0:
+                return
+            # Map nodes -> grid points via current_node_ids_sorted.
+            node_ids_sorted = getattr(self, 'current_node_ids_sorted', None)
+            if node_ids_sorted is None:
+                return
+            id_to_idx = {int(n): i for i, n in enumerate(node_ids_sorted)}
+            pts = _np.asarray(grid.points)
+            argmin_local = int(_np.argmin(values))
+            argmax_local = int(_np.argmax(values))
+            self._place_marker_at_node(
+                'min', int(nids[argmin_local]), float(values[argmin_local]),
+                label, id_to_idx, pts, enabled=show_min)
+            self._place_marker_at_node(
+                'max', int(nids[argmax_local]), float(values[argmax_local]),
+                label, id_to_idx, pts, enabled=show_max)
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        # Element-centred (Stress) fall-through.
+        active_e = self._active_results_element_array()
+        if active_e is not None:
+            eids, values, label = active_e
+            if values.size == 0:
+                return
+            try:
+                centers = _np.asarray(grid.cell_centers().points)
+            except Exception:
+                return
+            # Map eid -> grid cell index via grid.cell_data['EID'] if
+            # present, else fall back to assuming eids align with cells.
+            eid_to_cell = None
+            try:
+                cell_eids = grid.cell_data.get('EID')
+                if cell_eids is not None:
+                    cell_eids = _np.asarray(cell_eids).astype(_np.int64)
+                    eid_to_cell = {int(e): int(i)
+                                   for i, e in enumerate(cell_eids)}
+            except Exception:
+                eid_to_cell = None
+            argmin_local = int(_np.argmin(values))
+            argmax_local = int(_np.argmax(values))
+
+            def _place_e(which, eid, value, enabled):
+                if not enabled:
+                    return
+                if eid_to_cell is not None:
+                    ci = eid_to_cell.get(int(eid))
+                else:
+                    ci = int(_np.where(eids == int(eid))[0][0]) \
+                        if len(eids) else None
+                if ci is None or ci < 0 or ci >= len(centers):
+                    return
+                p = centers[ci]
+                v = float(value)
+                self._draw_marker_actor(which, p, v, label)
+                try:
+                    from node_runner.profiling import perf_event
+                    perf_event('results_tab', 'min_max_marker',
+                               which=which, scalar=label,
+                               value=round(v, 6), eid=int(eid))
+                except Exception:
+                    pass
+
+            _place_e('min', int(eids[argmin_local]),
+                     values[argmin_local], show_min)
+            _place_e('max', int(eids[argmax_local]),
+                     values[argmax_local], show_max)
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def _place_marker_at_node(self, which, nid, value, label,
+                              id_to_idx, pts, enabled):
+        """Place a single min/max marker at a node, or no-op if disabled."""
+        if not enabled:
+            return
+        idx = id_to_idx.get(int(nid))
+        if idx is None or idx < 0 or idx >= len(pts):
+            return
+        self._draw_marker_actor(which, pts[idx], float(value), label)
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'min_max_marker',
+                       which=which, scalar=label,
+                       value=round(float(value), 6),
+                       nid=int(nid))
+        except Exception:
+            pass
+
+    def _draw_marker_actor(self, which, point, value, label):
+        """Place a single point-label callout for the min or max marker."""
+        try:
+            self.plotter.add_point_labels(
+                [point], [f"{which.upper()}: {value:.4g}"],
+                name=f"result_{which}_marker",
+                point_color='red' if which == 'max' else 'blue',
+                point_size=10,
+                font_size=12,
+                text_color='white',
+                shape_color='black',
+                shape_opacity=0.6,
+                always_visible=True,
+                reset_camera=False,
+            )
+        except Exception:
+            pass
+
+    def _build_scalar_bar_kw(self):
+        """v5.3.2 item 70: shorter bar + pushed further down so the
+        multi-line title above has visible breathing room before the
+        top tick value.
+        """
+        orient = getattr(self, '_results_bar_orientation', 'right')
+        base = {
+            'color': 'white',
+            'title_font_size': 12,
+            'label_font_size': 10,
+            'fmt': '%.4g',
+        }
+        if orient == 'bottom':
+            base.update({
+                'vertical': False,
+                'position_x': 0.20,
+                'position_y': 0.08,
+                'width': 0.60,
+                'height': 0.05,
+            })
+        else:  # 'right'
+            # Shorter bar (0.55 height vs 0.65 before) + start lower
+            # (0.12 vs 0.18) so the title sits well clear of the top
+            # tick. The user reported the title was still too close in
+            # v5.3.1 -- this widens the gap by ~50 px on a typical
+            # 900-px viewport.
+            base.update({
+                'vertical': True,
+                'position_x': 0.90,
+                'position_y': 0.12,
+                'width': 0.06,
+                'height': 0.55,
+            })
+        return base
+
+    def _clear_scalar_bars(self):
+        """v5.3.1 item 65: sweep every scalar bar from the plotter.
+
+        PyVista's ``add_mesh(scalar_bar_args=...)`` adds a NEW scalar
+        bar each time the title differs from existing ones -- it does
+        not remove the prior bar. Cycling Contour Vector
+        Displacement->Stress accumulates ghost bars. Clear them all
+        before each render to keep exactly ONE bar at a time.
+        """
+        n = 0
+        try:
+            bars = list(getattr(self.plotter, 'scalar_bars', {}).keys())
+            for title in bars:
+                try:
+                    self.plotter.remove_scalar_bar(title)
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if n > 0:
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('results', 'scalar_bars_cleared', n_removed=n)
+            except Exception:
+                pass
+
+    def _remove_actors_by_prefix(self, prefix: str):
+        """v5.3.0 item 58: prefix-sweep actor removal.
+
+        PyVista's ``add_point_labels(...)`` creates BOTH a points actor
+        with the requested ``name`` AND a labels-text actor named
+        ``<name>-labels`` (or similar suffix). Removing by the base name
+        alone leaves the labels-text actor lingering -- which is why
+        v5.2.x's "Show Element Value Labels" checkbox couldn't be
+        toggled off. This helper sweeps every actor that matches the
+        base name OR begins with ``<base>-`` to wipe both.
+        """
+        try:
+            for nm in list(self.plotter.actors.keys()):
+                if nm == prefix or nm.startswith(prefix + '-'):
+                    try:
+                        self.plotter.remove_actor(nm)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _refresh_results_element_value_labels(self):
+        """v5.1.2 item 38: build (or remove) the per-element value-label
+        callouts. Reads from the canonical OP2 / F06 bundle rather than
+        scraping VTK grid arrays. Supports both nodal output (label per
+        node) and element output (label per element center).
+        """
+        show = getattr(self, '_results_show_element_labels', False)
+        top_n = int(getattr(self, '_results_element_labels_top_n', 0))
+        # v5.3.0 item 58: prefix-sweep so both the points actor AND
+        # the labels-text actor get removed.
+        self._remove_actors_by_prefix('result_element_labels')
+        if not show:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        grid = getattr(self, 'current_grid', None)
+        if grid is None:
+            return
+        import numpy as _np
+        # Prefer element-centred output if active; else fall back to
+        # nodal output and label nodes.
+        active_e = self._active_results_element_array()
+        if active_e is not None:
+            eids, values, _label = active_e
+            if values.size == 0:
+                return
+            try:
+                centers = _np.asarray(grid.cell_centers().points)
+            except Exception:
+                return
+            try:
+                cell_eids = grid.cell_data.get('EID')
+                cell_eids = (_np.asarray(cell_eids).astype(_np.int64)
+                             if cell_eids is not None else None)
+            except Exception:
+                cell_eids = None
+            if cell_eids is None:
+                return
+            eid_to_cell = {int(e): int(i)
+                           for i, e in enumerate(cell_eids)}
+            order = _np.argsort(_np.abs(values))[::-1]
+            if top_n > 0:
+                order = order[:top_n]
+            pick_pts, pick_labels = [], []
+            for k in order:
+                ci = eid_to_cell.get(int(eids[k]))
+                if ci is None or ci < 0 or ci >= len(centers):
+                    continue
+                pick_pts.append(centers[ci])
+                pick_labels.append(f"{float(values[k]):.3g}")
+            if not pick_pts:
+                return
+            self._draw_value_labels(pick_pts, pick_labels)
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('results_tab', 'element_value_labels',
+                           n_labels=int(len(pick_pts)), top_n=int(top_n),
+                           scope='element')
+            except Exception:
+                pass
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        active = self._active_results_array()
+        if active is None:
+            return
+        nids, values, _label = active
+        if values.size == 0:
+            return
+        node_ids_sorted = getattr(self, 'current_node_ids_sorted', None)
+        if node_ids_sorted is None:
+            return
+        id_to_idx = {int(n): i for i, n in enumerate(node_ids_sorted)}
+        pts = _np.asarray(grid.points)
+        order = _np.argsort(_np.abs(values))[::-1]
+        if top_n > 0:
+            order = order[:top_n]
+        pick_pts, pick_labels = [], []
+        for k in order:
+            pi = id_to_idx.get(int(nids[k]))
+            if pi is None or pi < 0 or pi >= len(pts):
+                continue
+            pick_pts.append(pts[pi])
+            pick_labels.append(f"{float(values[k]):.3g}")
+        if not pick_pts:
+            return
+        self._draw_value_labels(pick_pts, pick_labels)
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('results_tab', 'element_value_labels',
+                       n_labels=int(len(pick_pts)), top_n=int(top_n),
+                       scope='node')
+        except Exception:
+            pass
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _draw_value_labels(self, points, labels):
+        """Place the value-label actor on the plotter."""
+        try:
+            self.plotter.add_point_labels(
+                points, labels,
+                name='result_element_labels',
+                font_size=10,
+                point_size=4,
+                text_color='white',
+                shape_opacity=0.0,
+                always_visible=False,
+                reset_camera=False,
+            )
+        except Exception:
+            pass
 
     # ─── v5.1.0 item 25: Results sidebar tab handlers ──────────────────
     #
@@ -16515,19 +18890,20 @@ class MainWindow(QMainWindow):
         self.plotter.render()
 
     def _on_results_changed(self):
-        """Re-render when any results selection changes."""
+        """Re-render when any results selection changes.
+
+        v5.2.0 Round-2 Bug #4: the v5.1.2 path used to call
+        ``results_tab.populate_from_results(...)`` here so the tree-
+        widget refreshed on every contour update. That worked when the
+        v5.1.2 tab was passive. v5.2.0's toolbox actively drives
+        ``output_vector_changed`` on populate, which lands here and
+        re-calls populate, producing infinite recursion. Population is
+        now done ONCE at load time (``_consume_mystran_bundle`` and
+        ``_load_results_dialog``); this method only refreshes the
+        rendering side.
+        """
         if self.color_mode == "results":
             self._update_plot_visibility()
-            # v5.1.0 item 25: refresh tab tree + min/max marker actors
-            # to track the newly-active scalar.
-            try:
-                if hasattr(self, 'results_tab'):
-                    self.results_tab.populate_from_results(
-                        getattr(self, 'op2_results', None),
-                        file_label=(getattr(self, 'op2_results', {})
-                                    .get('filepath', '') or ''))
-            except Exception:
-                pass
             try:
                 self._refresh_results_min_max_markers()
             except Exception:
@@ -16537,13 +18913,36 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _results_tab_file_label(self):
+        """Compose a human-friendly tree-root label for the Results tab."""
+        bundle = getattr(self, 'op2_results', None) or {}
+        path_str = bundle.get('filepath', '') or ''
+        try:
+            stem = Path(path_str).stem if path_str else "Results"
+        except Exception:
+            stem = "Results"
+        src = (bundle.get('results_source') or '').upper()
+        if src:
+            return f"{stem} ({src} source)"
+        return stem or "Results"
+
     def _toggle_animation(self, checked):
         import math
         if checked:
+            # v5.1.2 item 39: auto-engage Results color mode + a default
+            # scalar selection so Play actually shows motion instead of
+            # silently doing nothing.
+            self._ensure_results_mode_active(trigger='animate')
             self.anim_play_btn.setText("Pause")
             self._anim_phase = 0.0
-            interval = max(10, 210 - self.anim_speed_slider.value())
-            self._anim_timer.start(interval)
+            # v5.2.0 item 44: timer interval comes from the toolbox's
+            # delay spinbox (`_anim_delay_ms`) rather than the legacy
+            # speed slider. Fall back to the slider value if the new
+            # state hasn't been set yet.
+            delay = int(getattr(self, '_anim_delay_ms', 0))
+            if delay <= 0:
+                delay = max(10, 210 - self.anim_speed_slider.value())
+            self._anim_timer.start(max(10, delay))
         else:
             self.anim_play_btn.setText("Play")
             self._anim_timer.stop()
@@ -16554,9 +18953,85 @@ class MainWindow(QMainWindow):
         if self._anim_timer.isActive():
             self._anim_timer.setInterval(max(10, 210 - value))
 
+    def _perf_actor_snapshot(self, label: str, **kw):
+        """v5.3.0 item 60: log the current set of plotter actors.
+
+        Used by the animation-tick telemetry to identify whether any
+        actor briefly disappears between two ticks (the suspected
+        flicker mechanism). Cheap -- only fires when NR_PROFILE is
+        active.
+        """
+        try:
+            from node_runner.profiling import perf_event, enabled
+            if not enabled():
+                return
+            names = sorted(self.plotter.actors.keys())
+            perf_event('actor_snapshot', label,
+                       n=len(names),
+                       names=','.join(names)[:300],
+                       **kw)
+        except Exception:
+            pass
+
     def _on_animation_tick(self):
+        """v5.2.0 item 44: dispatch on ``_anim_mode``.
+
+        - ``'sine'``: existing cosine-amplitude path, but stepping with
+          a phase increment derived from the configured frame count
+          (so changing Frames in the toolbox really changes the period).
+        - ``'modes'``: advance one mode index per tick. Wraps at the
+          end of the eigenvector list.
+
+        v5.3.0 item 60: wrapped with detailed telemetry to debug the
+        persistent animation flicker. Every tick emits:
+        * ``actor_snapshot`` events before / after update + render
+        * ``animation.tick`` with wall-times for update vs render
+        """
         import math
-        self._anim_phase += 0.15
+        import time
+        t0 = time.perf_counter()
+        self._anim_tick_counter = getattr(self, '_anim_tick_counter', 0) + 1
+        tick = self._anim_tick_counter
+        self._perf_actor_snapshot('anim_tick.before', tick=tick,
+                                  phase=round(self._anim_phase, 3))
+        mode = getattr(self, '_anim_mode', 'sine')
+        n_frames = max(3, int(getattr(self, '_anim_n_frames', 20)))
+        if mode == 'modes':
+            # Through Modes: cycle the legacy results_mode_combo.
+            count = self.results_mode_combo.count()
+            if count <= 0:
+                # No eigenvector data; fall back to sine.
+                mode = 'sine'
+            else:
+                cur = self.results_mode_combo.currentIndex()
+                new = (cur + 1) % count
+                self.results_mode_combo.setCurrentIndex(new)
+                self._anim_through_modes_current = new
+                # Use full deformation scale for each pose (no sine
+                # modulation -- we're showing the mode shape itself).
+                try:
+                    max_scale = float(self.deformation_scale_input.text() or 0)
+                except ValueError:
+                    max_scale = 1.0
+                if max_scale == 0:
+                    max_scale = 1.0
+                self._anim_override_scale = max_scale
+                t_upd_start = time.perf_counter()
+                self._update_plot_visibility()
+                t_upd_end = time.perf_counter()
+                self._perf_actor_snapshot('anim_tick.after_update', tick=tick,
+                                          update_ms=round((t_upd_end - t_upd_start) * 1000, 2))
+                try:
+                    from node_runner.profiling import perf_event
+                    perf_event('animation.tick', tick=tick, mode='modes',
+                               update_ms=round((t_upd_end - t_upd_start) * 1000, 2),
+                               total_ms=round((t_upd_end - t0) * 1000, 2))
+                except Exception:
+                    pass
+                return
+        # Default: sine animation.
+        phase_step = (2 * math.pi) / float(n_frames)
+        self._anim_phase += phase_step
         if self._anim_phase > 2 * math.pi:
             self._anim_phase -= 2 * math.pi
         try:
@@ -16566,7 +19041,20 @@ class MainWindow(QMainWindow):
         if max_scale == 0:
             max_scale = 1.0
         self._anim_override_scale = max_scale * math.sin(self._anim_phase)
+        t_upd_start = time.perf_counter()
         self._update_plot_visibility()
+        t_upd_end = time.perf_counter()
+        self._perf_actor_snapshot('anim_tick.after_update', tick=tick,
+                                  update_ms=round((t_upd_end - t_upd_start) * 1000, 2))
+        try:
+            from node_runner.profiling import perf_event
+            perf_event('animation.tick', tick=tick, mode='sine',
+                       phase=round(self._anim_phase, 3),
+                       override_scale=round(self._anim_override_scale, 6),
+                       update_ms=round((t_upd_end - t_upd_start) * 1000, 2),
+                       total_ms=round((t_upd_end - t0) * 1000, 2))
+        except Exception:
+            pass
 
     def _export_results_gif(self):
         import math

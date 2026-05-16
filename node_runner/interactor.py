@@ -30,7 +30,7 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
         # Circle mode state
         self._circle_center = None  # (x, y) screen coords
 
-        # Middle-button navigation state (Femap-style)
+        # Middle-button navigation state (professional)
         self._nav_mode = None          # 'rotate' or 'pan' when middle button active
         self._middle_btn_active = False
 
@@ -109,7 +109,7 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
         self.OnLeftButtonDown()
 
     def middle_button_press_event(self, obj, event):
-        """Femap-style: Middle=Rotate, Ctrl+Middle=Pan. Always works."""
+        """professional: Middle=Rotate, Ctrl+Middle=Pan. Always works."""
         self._middle_btn_active = True
         x, y = self.GetInteractor().GetEventPosition()
         self.FindPokedRenderer(x, y)
@@ -438,7 +438,7 @@ class ClickAndDragInteractor(vtk.vtkInteractorStyleTrackballCamera):
 
     # v4.0.3 (Stage N): only these actors carry valid node positions.
     # The node-picker fallback ignores hits on rigid-element spider
-    # lines, mass-glyph cubes, glyph fields, etc. — those don't have
+    # lines, mass-glyph cubes, glyph fields, etc.. those don't have
     # ``vtkOriginalPointIds`` and trying to map a click on them to a
     # node ID always misses.
     _NODE_PICK_ALLOWED_ACTORS = frozenset({

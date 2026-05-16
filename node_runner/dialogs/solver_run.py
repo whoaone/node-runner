@@ -69,12 +69,15 @@ class MystranPreflightDialog(QDialog):
         # green-banner case used to leave a big empty space below the
         # banner. Sized for the worst-case (many issues) only when we
         # actually have a table to fill.
+        # v5.3.0 item 54: drop sizes further on the no-issues path so the
+        # green banner fills the dialog cleanly. The issues path also
+        # uses a slightly smaller default since the table auto-sizes.
         if report.issues:
-            self.setMinimumSize(720, 460)
-            self.resize(820, 540)
+            self.setMinimumSize(680, 380)
+            self.resize(760, 440)
         else:
-            self.setMinimumSize(560, 260)
-            self.resize(620, 300)
+            self.setMinimumSize(440, 200)
+            self.resize(480, 220)
 
         layout = QVBoxLayout(self)
 
@@ -175,9 +178,11 @@ class MystranPreflightDialog(QDialog):
 
         # --- Buttons ---
         button_row = QHBoxLayout()
-        copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.clicked.connect(self._copy_to_clipboard)
-        button_row.addWidget(copy_btn)
+        # v5.3.0 item 54: hide Copy on the no-issues path -- nothing to copy.
+        if report.issues:
+            copy_btn = QPushButton("Copy to Clipboard")
+            copy_btn.clicked.connect(self._copy_to_clipboard)
+            button_row.addWidget(copy_btn)
         button_row.addStretch(1)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
@@ -192,6 +197,9 @@ class MystranPreflightDialog(QDialog):
         self._run_btn.clicked.connect(self.accept)
         button_row.addWidget(self._run_btn)
         layout.addLayout(button_row)
+        # v5.3.0 item 54: let Qt auto-shrink the dialog to the actual
+        # content so the no-issues form factor really IS compact.
+        self.adjustSize()
 
     def _copy_to_clipboard(self):
         try:
@@ -360,15 +368,24 @@ class RunMystranDialog(QDialog):
         MainWindow stores them on ``self.analysis_sets`` (a dict keyed
         by set id; see _open_analysis_set_manager).
         """
+        # v5.2.2 issue 8: dropped the "(Default - model SOL + Output
+        # Requests)" placeholder. If the user hasn't created an
+        # AnalysisSet yet, the combo is empty and the dialog disables
+        # the Run button until one exists -- forcing explicit setup
+        # over silent defaults.
         self._set_combo.clear()
-        self._set_combo.addItem("(Default — model SOL + Output Requests)", None)
+        had_any = False
         try:
             sets = getattr(self.main_window, 'analysis_sets', None) or {}
             for sid, aset in sets.items():
                 name = getattr(aset, 'name', f"Set {sid}")
                 self._set_combo.addItem(f"{name} (id={sid})", sid)
+                had_any = True
         except Exception:
             pass
+        if not had_any:
+            self._set_combo.addItem(
+                "(no AnalysisSet defined - click Edit AnalysisSets…)", None)
 
     def _edit_sets(self):
         try:
@@ -491,7 +508,7 @@ class SolverProgressDialog(QDialog):
     def _on_cancel(self):
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setText("Cancelling…")
-        self._stage_label.setText("Cancel requested — terminating MYSTRAN…")
+        self._stage_label.setText("Cancel requested. terminating MYSTRAN…")
         self.cancel_requested.emit()
 
 

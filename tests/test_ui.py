@@ -59,7 +59,7 @@ class TestMainWindow:
         assert not hasattr(main_window, "_status_format_lbl")
 
     def test_units_label_blank_by_default(self, main_window):
-        # Femap-style: units field hides itself when no hint set
+        # professional: units field hides itself when no hint set
         assert main_window._status_units_lbl.text() == ""
 
     def test_command_palette_action_with_shortcut(self, main_window):
@@ -244,15 +244,40 @@ class TestCrossSectionDock:
 # ---------------------------------------------------------------------------
 
 class TestResultBrowserDock:
+    """v5.2.0: the Tables / Animation / Vectors sub-tabs are gone --
+    Results UI is now the Post-Processing Toolbox (three collapsible
+    sections); tabular workflow moved to Tools -> Data Table. Tests
+    here assert the new layout and the back-compat shim on
+    ResultBrowserDock.
+    """
 
-    def test_dock_built(self, main_window):
-        assert main_window._result_browser_dock is not None
-        assert main_window._anim_timeline_widget is not None
-        assert main_window._vector_overlay_widget is not None
+    def test_results_tab_has_three_sections(self, main_window):
+        rt = main_window.results_tab
+        sections = rt.sections
+        assert len(sections) == 3
+        assert [s.title for s in sections] == ["Results", "Deform", "Contour"]
 
-    def test_dock_hidden_until_op2(self, main_window):
-        # No OP2 loaded -> dock should be hidden
-        assert not main_window._result_browser_dock.isVisible()
+    def test_legacy_dock_attribute_is_none(self, main_window):
+        # v5.2.0 wired _result_browser_dock to None (it was the in-tab
+        # ResultBrowserPanel in v5.1.2; the panel itself is gone now).
+        assert main_window._result_browser_dock is None
+        assert main_window._anim_timeline_widget is None
+        assert main_window._vector_overlay_widget is None
+
+    def test_result_browser_dock_back_compat_shim(self, qtbot):
+        # The dock class is still importable and instantiable; it wraps
+        # a ResultBrowserPanel and forwards the public API to it. Used
+        # by any external integrators that pre-date v5.2.0.
+        from node_runner.dialogs import ResultBrowserDock
+        import numpy as np
+        dock = ResultBrowserDock()
+        qtbot.addWidget(dock)
+        dock.update_nodal_results(
+            ['NID', 'Ux'],
+            {'NID': np.array([1, 2, 3]), 'Ux': np.array([0.1, 0.2, 0.3])},
+        )
+        # The shim's inner panel has the new data.
+        assert dock._panel._node_model.rowCount() == 3
 
 
 # ---------------------------------------------------------------------------

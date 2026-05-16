@@ -83,6 +83,10 @@ class ExportOptionsDialog(QDialog):
     def _on_radio_toggled(self, key, checked):
         if checked:
             self._selected_format = key
+            if hasattr(self, '_current_label') and self._current_label is not None:
+                self._current_label.setText(
+                    f"<b>Current default:</b> {FORMAT_LABELS.get(key, key)}"
+                )
 
     @property
     def selected_format(self):
@@ -178,7 +182,7 @@ class ExportDefaultsDialog(QDialog):
 class UnitsDialog(QDialog):
     """Settings-menu dialog for setting a free-text unit-system hint.
 
-    Node Runner is intentionally unitless (Femap-style): the model is just
+    Node Runner is intentionally unitless (professional): the model is just
     numbers. This dialog only sets a label that appears in the status bar
     so you remember which unit system you're working in. To actually
     rescale the model values, use **Tools > Convert Units...**.
@@ -286,7 +290,198 @@ class SaveBdfDialog(QDialog):
                  group_names=None,
                  parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Save BDF — Export Options")
+        self.setWindowTitle("Save BDF. Export Options")
+        self.setModal(True)
+        self.setMinimumWidth(540)
+        group_names = list(group_names or [])
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 8)
+        outer.setSpacing(8)
+
+        intro = QLabel(
+            "Choose where to save and how to translate the deck. "
+            "Source models on disk are never modified -- the deck is "
+            "written to the path below.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #cdd6f4; font-size: 11px;")
+        outer.addWidget(intro)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        # ---- Output path ----
+        path_row = QHBoxLayout()
+        self._path_edit = QLineEdit(default_path)
+        self._path_edit.setPlaceholderText("C:\\path\\to\\model.bdf")
+        path_row.addWidget(self._path_edit, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._pick_path)
+        path_row.addWidget(browse_btn)
+        form.addRow(QLabel("Output path:"), path_row)
+
+        # ---- Solver target ----
+        self._target_combo = QComboBox()
+        for key, label in SOLVER_TARGETS.items():
+            self._target_combo.addItem(label, key)
+        # Select the default target.
+        for i in range(self._target_combo.count()):
+            if self._target_combo.itemData(i) == default_target:
+                self._target_combo.setCurrentIndex(i)
+                break
+        self._target_combo.setToolTip(
+            "<b>Solver target</b><br>"
+            "<i>Generic</i>: vanilla BDF, MSC/NX-compatible. No "
+            "solver-specific PARAMs injected.<br>"
+            "<i>MYSTRAN</i>: applies the v5.0.0 MYSTRAN translation "
+            "(drops MSC-only PARAMs; injects SOLLIB / QUAD4TYP).<br>"
+            "<i>MSC / NX</i>: same as Generic in v5.1.0 -- placeholder "
+            "for future per-vendor translators.")
+        form.addRow(QLabel("Solver target:"), self._target_combo)
+
+        # ---- Field format ----
+        self._format_combo = QComboBox()
+        for key, label in FORMAT_LABELS.items():
+            self._format_combo.addItem(label, key)
+        for i in range(self._format_combo.count()):
+            if self._format_combo.itemData(i) == default_format:
+                self._format_combo.setCurrentIndex(i)
+                break
+        form.addRow(QLabel("Field format:"), self._format_combo)
+
+        # ---- Scope ----
+        self._scope_combo = QComboBox()
+        self._scope_combo.addItem("Full model", ("full", None))
+        if active_analysis_set_name:
+            self._scope_combo.addItem(
+                f"Active AnalysisSet: {active_analysis_set_name}",
+                ("analysis_set", None))
+        for gname in group_names:
+            self._scope_combo.addItem(f"Group: {gname}", ("group", gname))
+        self._scope_combo.setToolTip(
+            "<b>Scope</b><br>"
+            "Choose what to write. <i>Full model</i> writes everything.<br>"
+            "<i>Active AnalysisSet</i> writes the scoped sub-deck "
+            "defined by the active set (group_target + load/SPC SIDs). "
+            "<i>Group: NAME</i> writes only entities in that group plus "
+            "auto-collected dependencies.")
+        form.addRow(QLabel("Scope:"), self._scope_combo)
+
+        outer.addLayout(form)
+
+        # ---- NR-META options ----
+        meta_box = QGroupBox("Node Runner metadata")
+        meta_lay = QVBoxLayout(meta_box)
+        self._include_nr_meta = QCheckBox(
+            "Include Node Runner metadata (groups + tree state)")
+        self._include_nr_meta.setChecked(True)
+        self._include_nr_meta.setToolTip(
+            "Embeds group definitions and hidden-state as ordinary "
+            "Nastran $ NR-META comments. MSC / NX / MYSTRAN ignore "
+            "them. Node Runner restores them on re-import.")
+        meta_lay.addWidget(self._include_nr_meta)
+        self._sidecar_nrmeta = QCheckBox(
+            "Write to sidecar .nrmeta file instead of inline")
+        self._sidecar_nrmeta.setToolTip(
+            "When ON, the metadata is written to <bdf>.nrmeta and the "
+            ".bdf stays free of Node Runner comments. Useful when "
+            "handing the deck to a coworker who doesn't want $ NR-META "
+            "lines in their bulk data.")
+        meta_lay.addWidget(self._sidecar_nrmeta)
+        # When include is unchecked, sidecar should grey out.
+        self._include_nr_meta.toggled.connect(
+            lambda on: self._sidecar_nrmeta.setEnabled(on))
+        outer.addWidget(meta_box)
+
+        # ---- Remember choices ----
+        self._remember = QCheckBox(
+            "Remember solver target + field format for future saves")
+        outer.addWidget(self._remember)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        outer.addWidget(sep)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setDefault(True)
+        save.clicked.connect(self.accept)
+        button_row.addWidget(cancel)
+        button_row.addWidget(save)
+        outer.addLayout(button_row)
+
+    def _pick_path(self):
+        start = self._path_edit.text() or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save BDF", start,
+            "Nastran Bulk Data (*.bdf *.dat *.nas);;All files (*.*)")
+        if path:
+            self._path_edit.setText(path)
+
+    @property
+    def result_payload(self) -> dict:
+        scope_kind, scope_arg = self._scope_combo.currentData() or (
+            "full", None)
+        return {
+            "path": self._path_edit.text().strip(),
+            "target": self._target_combo.currentData() or "generic",
+            "field_format": self._format_combo.currentData() or "short",
+            "scope_kind": scope_kind,           # 'full' | 'analysis_set' | 'group'
+            "scope_arg": scope_arg,             # group name when scope_kind=='group'
+            "include_nr_meta": bool(self._include_nr_meta.isChecked()),
+            "sidecar_nrmeta": bool(
+                self._sidecar_nrmeta.isChecked()
+                and self._include_nr_meta.isChecked()),
+            "remember": bool(self._remember.isChecked()),
+        }
+
+
+# ---------------------------------------------------------------------------
+# v5.1.0 item 28: SaveBdfDialog
+# ---------------------------------------------------------------------------
+
+SOLVER_TARGETS = {
+    "generic": "Generic (MSC / NX compatible)",
+    "MSC":     "MSC Nastran",
+    "NX":      "Siemens NX Nastran",
+    "MYSTRAN": "MYSTRAN (open-source)",
+}
+
+
+class SaveBdfDialog(QDialog):
+    """v5.1.0 item 28: the Save BDF dialog.
+
+    Replaces the v5.0.x flow of "QFileDialog -> ExportOptionsDialog
+    (field-width only)" with a single richer dialog that lets the user
+    pick:
+
+    - Output path
+    - Solver target (Generic / MSC / NX / MYSTRAN) -- drives the
+      ``_write_bdf(target=...)`` translator path
+    - Field format (Short / Long / Free)
+    - Scope (Full Model / Active AnalysisSet / Group: <name>)
+      [the AnalysisSet entry is shown only when one is active; group
+      entries are populated from MainWindow.groups]
+    - Include $ NR-META block (default ON)
+    - Write to sidecar .nrmeta instead of inline (default OFF)
+    - Remember choices
+
+    The dialog is presentation-only: it returns its selections via
+    :attr:`result_payload`; the caller (MainWindow._save_file_dialog)
+    does the actual write.
+    """
+
+    def __init__(self, *, default_path="",
+                 default_format="short",
+                 default_target="generic",
+                 active_analysis_set_name=None,
+                 group_names=None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Save BDF. Export Options")
         self.setModal(True)
         self.setMinimumWidth(540)
         group_names = list(group_names or [])

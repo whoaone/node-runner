@@ -7,7 +7,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def get_entity_title_from_comment(comment, entity_type, entity_id):
     """
     Intelligently parses a Nastran comment string to find a title.
-    It looks for a colon as a delimiter, typical of Femap-generated titles.
+    It looks for a colon as a delimiter, typical of professional-tool-generated titles.
     If no valid title format is found, it returns a default name.
 
     Handles multi-line comments by extracting the last non-empty comment
@@ -29,7 +29,7 @@ def get_entity_title_from_comment(comment, entity_type, entity_id):
     if not meaningful:
         return default_title
 
-    # Look for a colon, which is the key delimiter for Femap-style titles.
+    # Look for a colon, which is the key delimiter for professional titles.
     if ':' in meaningful:
         # Split at the first colon and take the second part as the title.
         parts = meaningful.split(':', 1)
