@@ -1,115 +1,282 @@
-# Node Runner v5.3
+# Node Runner
 
-A lightweight pre, solve, and post environment for Nastran models. Built with Python, PySide6, PyVista, and the open-source MYSTRAN solver.
+> A lightweight, open-source pre, solve, and post environment for Nastran FEA models.
 
-## Changelog for v5.3.0
+![python](https://img.shields.io/badge/python-3.9%2B-blue) ![license](https://img.shields.io/badge/license-Apache--2.0-green) ![platform](https://img.shields.io/badge/platform-Windows-lightgrey) ![tests](https://img.shields.io/badge/tests-321%20passing-brightgreen) ![version](https://img.shields.io/badge/version-5.3.0-informational)
 
-UX consolidation + entity editor + group polish.
+Node Runner reads a Nastran bulk-data deck, renders the mesh interactively, drives the open-source MYSTRAN solver as a subprocess, and loads the results back into a Femap-style post-processing toolbox. It is built for engineers who want a real FEA workflow without paying a commercial-license-per-seat-per-year.
 
-**v5.3.0 same-day patch (2026-05-17):**
+<!-- TODO: Replace these placeholders with screenshots once captured. -->
+<p align="center">
+  <img src="docs/screenshots/hero-deformed-plate.png" alt="Deformed plate with contour gradient" width="720" />
+  <br><em>v5.3.0 post-processing toolbox driving a deformed CQUAD4 plate with displacement contour.</em>
+</p>
 
-* **RBE2 / RBE3 spider follows the deformed mesh.** Previously the rigid-element lines stayed pinned to undeformed node positions while the slave grids moved with the plate. The actor is now rebuilt with the deformed point coordinates on each results render. New `results.rbe_redrawn` profile-log catcher.
-* **Group editor populates every row.** The 5 tables in the Edit Group dialog had `setSortingEnabled(True)` set before the populate loop, causing Qt to scramble row / column correspondence mid-insert. Sorting is now disabled during populate and re-enabled after, matching the canonical pattern used by `NodeElementInfoDialog`.
-* **Default deform scale = `Actual` at `1.0`.** Previously `% of model` at `10.0` auto-fit the deformation to ~10% of the bbox, hiding the engineering magnitude. The new default shows the raw values; switch to `% of model` for auto-scaling on small-displacement decks.
-* **Output Vector dropdown shows CQUAD4 stress.** The F06 fallback parser now extracts top/bottom-fiber stress from CQUAD4 elements (Normal-X / Normal-Y / Shear-XY / Max / Min Principal / von Mises). CTRIA3 / CBEAM stress and strain / force parsing remain deferred to v5.3.1.
-* **STRESS / STRAIN / FORCE Output Requests reach the deck.** `_apply_case_control_from_set` now falls back to the analysis-set-level Output Requests when a per-subcase entry isn't explicitly set, so MYSTRAN actually computes what the user requested.
+---
 
-**v5.3.0 patch 2 (2026-05-17, same day):**
+## Why Node Runner
 
-Results-reading expansion. Closes the F06-fallback gap that left users seeing only Displacement in the Output Vector dropdown:
+Commercial FEA pre / post-processors are powerful but cost-locked. Open-source alternatives (PrePoMax, FreeCAD FEM, Gmsh) target their own solvers and don't play cleanly with Nastran-dialect decks. Node Runner sits in the gap:
 
-* **F06 CTRIA3 stress parser.** Mirrors the v5.3.0 CQUAD4 parser; handles the "Anywhere"/"in elem" row markers MYSTRAN emits. Combined with the existing CQUAD4 parser this covers shell stress for mixed-element decks.
-* **F06 CBAR stress + CBAR engineering forces parsers.** Two-station fiber stresses (SA1-SA4 + SB1-SB4 + axial + max/min) plus the one-row force table (M1/M2 at each end + V1/V2 + axial + torque). Beam-element decks now show stress and force contours.
-* **F06 SPC Force vector parsing.** The section was previously detected but its rows weren't stored; the `spc_forces` slot now populates. SPC Force - T1/T2/T3/Magnitude appear in the Output Vector dropdown.
-* **Bundle schema gains `strains` + `forces` slots.** F06 path matches the OP2 path so the dropdown's Strain/Force category gates work uniformly. Strain stays empty on F06-only paths (MYSTRAN doesn't emit strain to F06; OP2 fills it when pyNastran's MYSTRAN dialect is available).
-* **Output Vector dropdown gains Strain and Force categories.** Auto-detected from the bundle slots; categories only appear when their dict is non-empty.
-* **Scalar-bar `(geom × N)` annotation in `% of model` scale mode.** Makes the auto-fit multiplier explicit so users don't read 43.45 on the bar and wonder why the visible geometry is 1.4 inches. No annotation in `Actual` mode (the v5.3.0 default).
-* **Femap-style Vector Info dialog.** New `View → Vector Info...` opens a modeless readout of the active Output Vector's min/max with their Node or Element IDs. Refreshes live as you flip Output Set / Output Vector. Copy button writes a tab-separated row to the clipboard.
+| | Commercial (Femap / Patran / HyperMesh) | Node Runner | Other open-source |
+|---|---|---|---|
+| Nastran BDF / DAT import (with INCLUDE chains) | yes | yes | partial |
+| Open-source solver bundled | no | MYSTRAN (linked) | varies |
+| OP2 + F06 results parsing | yes | yes | rare |
+| Group-based scoping (Femap-style) | yes | yes | no |
+| Interactive 3D viewport (pan / zoom / pick) | yes | yes (PyVista) | yes |
+| Deform + contour independently | yes | yes | partial |
+| Per-element / per-property colouring | yes | yes | no |
+| Tabular results browser | yes | yes | partial |
+| License | proprietary | Apache-2.0 | varies |
+| Per-seat annual cost | thousands | zero | zero |
 
-Still deferred to v5.3.1+: CBEAM/CROD stress (no fixtures yet), broader OP2 parser expansion, strain F06 (MYSTRAN-side limitation).
+The trade-off is breadth: commercial tools cover dozens of solvers, hundreds of element formulations, decades of edge cases. Node Runner targets a focused slice (linear static, normal modes, linear buckling) and does that slice well.
 
-* **Model menu regrouped** into themed submenus (Geometry / Elements / Sections / Loads / Constraints / Modify). The 19-item flat list is gone; mesh-editing operations now live inside the Modify submenu. Duplicate `Orient Normals` removed from Tools.
-* **Settings menu removed.** Export Defaults, Units, Adaptive Node LOD, Element LOD Threshold, and the retired Parallel BDF Parsing toggle moved into `Edit -> Preferences` as new General / Export / Performance tabs. One place for all configuration.
-* **Solution Type submenu removed from Analysis menu.** SOL type lives only on the active AnalysisSet now (set via `Analysis -> Analysis Set Manager`), removing a second source of truth.
-* **Group editor expanded.** The Edit Group dialog gains Materials, Properties, and Coords tabs to match the Femap-faithful group schema. Stale node/element IDs now show `(not in current model)` instead of leaving cells blank, and group IDs are coerced to int so JSON-stringified group payloads resolve cleanly. `CreateGroupCommand` now produces the full 6-field schema; `_group_by_material` and `_group_by_element_type` auto-collect dependencies (properties / materials / coord systems).
-* **Probe Mode** gains a tooltip, status-bar help, and the `Ctrl+Shift+P` shortcut.
-* **Edit -> Select Entities** workflow reworked. The old "what type?" `QInputDialog` is replaced with a richer picker that offers Node / Element / Property / Material / Coord. Selecting a single entity opens a read-only details dialog with an `Edit...` button that routes to the existing editor for that type.
-* **View cube duplicate-actor bug fixed.** Toggling between light and dark mode used to accumulate orphaned orientation-marker widgets, producing the cluster of overlapping cubes the user reported. `_toggle_theme` now tears down the old widget and sweeps stale axes actors before adding the fresh marker. New `view_cube.rebuilt` profile-log event tracks the actor count.
+---
 
-## What it does
+## Quick start
 
-Node Runner reads a Nastran bulk-data file (`.bdf` or `.dat`), renders the mesh interactively, and lets you inspect or edit it before running an analysis. After a solve, it loads the results (OP2 or F06), animates deformations, and paints contour gradients on the elements.
-
-Core capabilities:
-
-* Imports a BDF / DAT deck (with INCLUDE chains) and renders nodes, elements, properties, materials, constraints, and loads in a 3D viewport.
-* Pre-flight scanner inspects a deck for cards MYSTRAN does not support before launching the solver.
-* Drives MYSTRAN as a subprocess with live stage feedback, then auto-loads the resulting OP2 or F06 back into a Results Toolbox.
-* Post-Processing Toolbox with three collapsible sections (Results, Deform, Contour) for picking an output vector and toggling deformation or contour rendering independently.
-* Data Table dialog (under Tools) for tabular inspection of nodal or element results.
-* Group-based scoping for runs, exports, and the BDF "Save BDF" path that round-trips Node Runner metadata via `$ NR-META` comment lines.
-
-## Running
-
-The easiest path on Windows is to grab `Node Runner.exe` from the latest release and run it. No Python install is required.
-
-To run from source, use the bundled venv:
-
-```
-run.bat
+```powershell
+# 1. Grab the latest release.
+#    https://github.com/whoaone/node-runner/releases/latest
+#    Download "Node Runner.exe" (~242 MB, Windows).
+#
+# 2. Run it. No Python or dependency install required.
+#
+# 3. File > Open > examples/cantilever_beam.bdf
+#
+# 4. (Optional, for solving) Edit > Preferences > MYSTRAN tab,
+#    point at the MYSTRAN executable from https://www.mystran.com/.
+#    Click Detect to auto-find it on PATH.
+#
+# 5. Analysis > Run Analysis (MYSTRAN), or Ctrl+R.
+#    The post-processing toolbox auto-opens on success.
 ```
 
-(or `.\run.ps1` from PowerShell, or `run.py` after activating the project venv).
+That should take under 60 seconds end-to-end once the exe is on disk.
 
-## Running analyses with MYSTRAN
+---
 
-Node Runner supports the solution types MYSTRAN runs:
+## Feature highlights
 
-* SOL 1 / 101 (linear static)
-* SOL 3 / 103 (normal modes)
-* SOL 5 / 105 (linear buckling)
+### Pre-processing
 
-Quickstart:
+* **BDF / DAT import** with full INCLUDE-chain resolution and lenient-mode fallback for decks with non-standard cards.
+* **6 themed Model menus** (Geometry / Elements / Sections / Loads / Constraints / Modify) so you find what you need without scrolling.
+* **Interactive 3D viewport** built on PyVista. Pan / zoom / pick / clipping plane / shading toggle / theme switch all live.
+* **Per-property and per-material colouring**, with per-cell RGB rendering on every shell and beam.
+* **Femap-style Groups** that house nodes, elements, properties, materials, AND coordinate systems. Auto-group by Property, Material, or Element Type. Group-scoped exports and runs.
+* **AnalysisSet** as the unit of work: SOL type, subcases, EIGRL parameters, output requests, params, scope (groups / load SIDs / SPC SIDs). One set, one run.
+* **Pre-flight scanner** that walks the deck before launching the solver, flagging cards MYSTRAN cannot handle (aero, nonlinear, contact, optimization) with a clean modal report.
 
-1. Download a MYSTRAN binary from the [upstream project](https://www.mystran.com/). Node Runner does **not** bundle it.
-2. Open **Edit → Preferences → MYSTRAN** and set the executable path (or click *Detect* to search `PATH` and common install locations).
-3. As a first-run sanity check, import [`examples/cantilever_beam.bdf`](examples/cantilever_beam.bdf) and run **Analysis → Run Analysis (MYSTRAN)** (Ctrl+R). The tip displacement at node 11 should land around `T3 = -0.0407 in`, matching the Euler-Bernoulli analytical solution to within one percent.
-4. For your own work, load a BDF, then **Analysis → Run Analysis (MYSTRAN)**.
-5. The pre-flight scan runs first. It flags any cards MYSTRAN cannot handle (aero, nonlinear, contact, optimization, etc.). Resolve blocking issues, accept warnings.
-6. The solver runs in a non-blocking dialog with stage tracking pulled from MYSTRAN's stdout.
-7. On finish, results auto-load into the Post-Processing Toolbox. The status bar updates with the SOL number and subcase count.
+### Solving (MYSTRAN integration)
+
+* **SOL 1 / 101** linear static
+* **SOL 3 / 103** normal modes (real eigenvalue)
+* **SOL 5 / 105** linear buckling
+* **Non-blocking QProcess driver** with live stage tracking (Reading BDF, Assembling K, Decomposing, Solving, Writing output).
+* **Auto-load results** on success: OP2 first (via pyNastran), F06 fallback (in-house parser) for decks where pyNastran's MYSTRAN dialect coverage hasn't caught up.
+* **Run history** under `~/.node_runner/mystran_runs/runs/` with stamped folder names and a `run_meta.json` summary. Browse previous runs from the Analysis menu.
+* **Case-control resolver** that bridges per-AnalysisSet Output Requests into per-subcase CASE CONTROL lines (STRESS / STRAIN / FORCE / DISPLACEMENT).
+
+### Post-processing toolbox
+
+* **Three collapsible sections** (Results / Deform / Contour) you toggle independently. Want a stress contour on a non-deformed mesh? Easy. Animate a displacement vector without contouring? Also easy.
+* **Output Vector dropdown** auto-detects what's in the bundle: Displacement, SPC Force, Stress (CQUAD4, CTRIA3, CBAR fiber-level), Strain (OP2 only), Element Forces (CBAR moments / shears / axial / torque), Eigenvector modes.
+* **Vector Info dialog** (Femap-style) showing Min / Max for the active vector with their Node or Element IDs and a copy-to-clipboard button.
+* **Scalar bar with "(geom x N)" tag** in `% of model` scale mode so the engineering value on the bar and the visible geometry never feel disconnected.
+* **Discrete bands**, levels, palette selection (jet / viridis / plasma / coolwarm / grayscale), and auto vs manual range gating.
+* **Min / Max marker callouts** and per-element value labels, both opt-in.
+* **Animation** in two modes: Sine wave (a single deformed mode oscillating) and Through Modes (steps through every mode in a normal-modes bundle). Configurable frame count and delay.
+
+### Tools and tabular access
+
+* **Data Table** under Tools, a dockable dialog showing nodal or element data for whatever entities you have selected, with one column per output vector. Live-syncs with selection. Exports to clipboard, CSV, or XLSX (XLSX needs `openpyxl`).
+* **Find Entities** with a Ctrl+F shortcut, a rich entity-type picker (Node / Element / Property / Material / Coord), and a read-only details dialog on single-id selection with an Edit... button that routes to the existing editor.
+* **Probe Mode** (Ctrl+Shift+P) for hover-tooltip readouts on the 3D viewport.
+
+---
 
 ## Card and PARAM compatibility
 
-The translator at `node_runner/solve/mystran_export.py` is the single source of truth for what Node Runner passes through, rewrites, or drops when exporting to MYSTRAN. A summary:
+The translator at `node_runner/solve/mystran_export.py` is the single source of truth for what Node Runner passes through, rewrites, or drops when exporting to MYSTRAN.
 
-* **Pass through:** `PARAM,WTMASS`, `PARAM,GRDPNT`, `PARAM,EPSIL`, `PCOMP`, `MAT8`, all linear element cards.
-* **Dropped with a warning:** MSC-only PARAMs (`COUPMASS`, `AUTOSPC`, `BAILOUT`, `MAXRATIO`, etc.).
-* **Blocking (pre-flight refuses to run):** aero cards (`CAERO*`, `AESTAT`, `TRIM`, `FLUTTER`), nonlinear (`NLPARM`), contact (`BCTABLE`, `BCONTACT`), optimization (`DESVAR`, `DCONSTR`, `DRESP*`), and unsupported element types (`CQUADR`, `CTRIAR`, `CWELD`, `CSEAM`).
-* **Injected on write:** `PARAM,SOLLIB` (default `SPARSE`), `PARAM,QUAD4TYP` (default `MIN4T`), plus any user-configured overrides from Preferences.
+| Category | Treatment |
+|---|---|
+| Standard linear element cards (CQUAD4, CTRIA3, CBAR, CBEAM, CROD, CBUSH, CHEXA, CTETRA, CPENTA, CONROD, RBE2, RBE3, RBAR) | Pass through |
+| Material cards (MAT1, MAT2, MAT8, MAT9) | Pass through |
+| Property cards (PSHELL, PCOMP, PBAR, PBEAM, PBARL, PROD, PSOLID, PBUSH) | Pass through |
+| `PARAM,WTMASS`, `PARAM,GRDPNT`, `PARAM,EPSIL`, `PARAM,POST` | Pass through |
+| MSC-only PARAMs (`COUPMASS`, `AUTOSPC`, `BAILOUT`, `MAXRATIO`, `K6ROT`) | Dropped with a warning |
+| Aero (`CAERO*`, `AESTAT`, `TRIM`, `FLUTTER`, etc.) | Blocking, pre-flight refuses to run |
+| Nonlinear (`NLPARM`, `NLPCI`) | Blocking |
+| Contact (`BCTABLE`, `BCONTACT`, `BCSET`) | Blocking |
+| Optimization (`DESVAR`, `DCONSTR`, `DRESP*`, `DOPTPRM`) | Blocking |
+| Unsupported elements (`CQUADR`, `CTRIAR`, `CWELD`, `CSEAM`) | Blocking |
+| `PARAM,SOLLIB` (default `SPARSE`) | Injected if not present |
+| `PARAM,QUAD4TYP` (default `MIN4T`) | Injected if not present |
 
-## Post-Processing Toolbox
+The pre-flight dialog explains every dropped or blocked card before the solver fires.
 
-The Results tab in the left sidebar opens after a solve (or after `File → Load Results`). It has three collapsible sections:
+---
 
-* **Results** holds two dropdowns: the **Output Set** (a subcase from the bundle) and the **Output Vector** (displacement components, stress components, SPC forces, eigenvector modes). The Output Vector you pick here drives the contour gradient and is the canonical "what you are looking at" selection.
-* **Deform** controls whether the model deforms. Style is Undeformed (default), Deformed, or Animate. Scale mode is `% of model` (auto-fits the deflection to a percentage of the bounding box diagonal) or `Actual`. Animation options (Sine wave or Through Modes, frame count, delay) are configurable in advance.
-* **Contour** controls whether a gradient is painted. Style is No Contour (default), Filled, Filled + Edges, or Discrete Bands. Data Conversion picks one of Average (nodal), No Averaging (centroid), Max at Node, or Min at Node. Levels and palette control the colormap. Auto Range vs Manual gates the min/max spin boxes. Annotations add Min/Max markers and per-element value labels.
+## Under the hood
 
-Deform and Contour are independent. You can deform a stress contour, deform without a contour, contour without deforming, or animate either or both.
+```
+┌──────────────────────┐
+│   Node Runner.exe    │
+│   (PyInstaller, ~242 │
+│    MB single-file)   │
+└──────────┬───────────┘
+           │
+           ├── PySide6           ← Qt UI (menus, dialogs, sidebar tabs)
+           ├── PyVista           ← 3D viewport + actor management
+           ├── VTK               ← low-level rendering
+           ├── numpy             ← per-cell scalar arrays
+           ├── pyNastran         ← BDF parse / write + OP2 results
+           ├── openpyxl          ← Data Table xlsx export
+           └── mystran.exe       ← driven as a QProcess subprocess
+                                   (not bundled; user-configured path)
+```
 
-## Data Table (Tools menu)
+The codebase is organized into a few major modules:
 
-A dockable dialog that shows tabular nodal or element data for whatever entities you have selected in the viewport, with one column per output vector. Selection updates the table live. The current view exports to clipboard, CSV, or XLSX (requires `openpyxl` for the latter).
+* `node_runner/mainwindow.py` (~20k lines) houses the `MainWindow` class, the rendering pipeline, every menu wiring, and all the cross-cutting handlers.
+* `node_runner/dialogs/` is one file per dialog (creators, editors, group editor, results tab, preferences, etc.).
+* `node_runner/solve/` carries the MYSTRAN export translator, the QProcess runner, the F06 fallback parser, and the run-history helpers.
+* `node_runner/commands.py` provides the Command pattern (undo / redo) for every model mutation.
+* `node_runner/scene_build.py` is the vectorized cell-array builder for the 3D viewport.
+* `tests/` carries 321 pytest cases, run headless via pytest-qt.
+
+---
+
+## Building from source
+
+```powershell
+# Clone
+git clone https://github.com/whoaone/node-runner.git
+cd node-runner
+
+# Install dependencies into a venv
+python -m venv venv
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Run from source
+.\venv\Scripts\python.exe -m node_runner
+
+# Or run the tests
+.\venv\Scripts\python.exe -m pytest tests/ -q
+
+# Build the standalone exe
+.\venv\Scripts\pyinstaller.exe --noconfirm "Node Runner.spec"
+# Output lands in dist/Node Runner.exe
+```
+
+Python 3.9+ required. The PyInstaller build needs a working Qt runtime in the venv (pulled in automatically by `pip install pyside6`).
+
+---
 
 ## Tests
 
-```
-pytest tests/ -q
+```powershell
+.\venv\Scripts\python.exe -m pytest tests/ -q
 ```
 
-Roughly 285 tests pass on a clean tree. One end-to-end MYSTRAN test is gated behind `pytest -m mystran_e2e` and skipped by default.
+321 pytest cases pass on a clean tree. One end-to-end MYSTRAN test is gated behind `pytest -m mystran_e2e` and skipped by default. Headless rendering uses pytest-qt's offscreen Qt platform.
+
+---
+
+## Roadmap
+
+Plans for the next several releases (subject to change):
+
+### v5.3.1 (next)
+* CTRIA3 + CBEAM + CROD F06 stress parsers.
+* F06 strain block expansion once MYSTRAN starts emitting strains.
+* Broader OP2 parser coverage (beyond CQUAD4 + CTRIA3 + CBAR).
+
+### v5.4
+* Element-local coordinate-system contours.
+* Free-body diagrams on demand for any node set (Femap section 5.11.1.1).
+* Element quality histogram with jacobian / skew / aspect-ratio thresholds.
+* CSV results export with full statistics per output vector.
+
+### v6.0
+* External solver hooks (NX Nastran, MSC Nastran) via subprocess driver. Same workflow as MYSTRAN.
+* Cloud / remote solver execution.
+* Composite ply-by-ply post-processing UI.
+* PDF report generation from saved results.
+
+---
+
+## Contributing
+
+Issues and pull requests welcome. Before opening a PR:
+
+1. Run `pytest tests/ -q`. The full suite must pass.
+2. Add a regression test for any bug fix or new feature.
+3. Match the existing code style (4-space indent, no trailing whitespace, no em-dashes).
+4. For UI changes, attach a short screen recording or screenshot to the PR.
+5. Update the changelog block at the top of this README in the section for the next release.
+
+The codebase favors instrumentation over guesswork. If you touch a hot path, leave a `perf_event` catcher behind so the next developer can see what changed.
+
+---
+
+## Acknowledgements
+
+Built on the shoulders of these open-source projects:
+
+* [MYSTRAN](https://www.mystran.com/) by Bill Case and contributors. The actual solver.
+* [pyNastran](https://github.com/SteveDoyle2/pyNastran) by Steve Doyle. BDF parse / write + OP2 reader.
+* [PyVista](https://pyvista.org/) and the underlying [VTK](https://vtk.org/). The 3D viewport.
+* [PySide6](https://doc.qt.io/qtforpython-6/) (Qt for Python). The UI.
+* [openpyxl](https://openpyxl.readthedocs.io/) for the Data Table xlsx exporter.
+
+---
 
 ## License
 
-See `LICENSE`.
+Apache License 2.0. See `LICENSE`.
+
+---
+
+## Changelog
+
+### v5.3.0 (2026-05-17)
+
+UX consolidation + entity editor + group polish + results-reading expansion.
+
+**Major UX consolidation:**
+
+* **Model menu regrouped** into themed submenus (Geometry / Elements / Sections / Loads / Constraints / Modify). The 19-item flat list is gone; mesh-editing operations now live inside the Modify submenu. Duplicate `Orient Normals` removed from Tools.
+* **Settings menu removed.** Export Defaults, Units, Adaptive Node LOD, Element LOD Threshold, and the retired Parallel BDF Parsing toggle moved into `Edit > Preferences` as new General / Export / Performance tabs. One place for all configuration.
+* **Solution Type submenu removed from Analysis menu.** SOL type lives only on the active AnalysisSet now (set via `Analysis > Analysis Set Manager`), removing a second source of truth.
+* **Edit > Select Entities** workflow reworked. The old "what type?" `QInputDialog` is replaced with a richer picker that offers Node / Element / Property / Material / Coord. Selecting a single entity opens a read-only details dialog with an `Edit...` button that routes to the existing editor for that type.
+* **Probe Mode** gains a tooltip, status-bar help, and the `Ctrl+Shift+P` shortcut.
+* **Group editor expanded.** The Edit Group dialog gains Materials, Properties, and Coords tabs to match the Femap-faithful group schema. Stale node/element IDs now show `(not in current model)` instead of leaving cells blank, and group IDs are coerced to int so JSON-stringified group payloads resolve cleanly. `CreateGroupCommand` now produces the full 6-field schema; `_group_by_material` and `_group_by_element_type` auto-collect dependencies (properties / materials / coord systems).
+
+**Bug fixes:**
+
+* **RBE2 / RBE3 spider follows the deformed mesh.** Previously the rigid-element lines stayed pinned to undeformed node positions while the slave grids moved with the plate. The actor is now rebuilt with the deformed point coordinates on each results render.
+* **Group editor populates every row.** The 5 tables in the Edit Group dialog had `setSortingEnabled(True)` set before the populate loop, causing Qt to scramble row / column correspondence mid-insert. Sorting is now disabled during populate and re-enabled after, matching the canonical pattern used by `NodeElementInfoDialog`.
+* **View cube duplicate-actor bug.** Toggling between light and dark mode used to accumulate orphaned orientation-marker widgets, producing a cluster of overlapping cubes. `_toggle_theme` now tears down the old widget and sweeps stale axes actors before adding the fresh marker.
+* **Default deform scale = `Actual` at `1.0`.** Previously `% of model` at `10.0` auto-fit the deformation to ~10% of the bbox, hiding the engineering magnitude. The new default shows the raw values; switch to `% of model` for auto-scaling on small-displacement decks.
+
+**Results-reading expansion:**
+
+* **CQUAD4 + CTRIA3 + CBAR F06 stress parsers** (top/bottom fiber, max-of-fiber von Mises for shells; SA1-SA4 + axial + max/min for bars).
+* **CBAR engineering forces parser** (bending moments at A and B, shear, axial, torque).
+* **SPC Force vector parsing** that populates the bundle. Previously the section was detected but rows were dropped.
+* **Bundle schema gains `strains` + `forces` slots.** F06 path matches the OP2 path so the Strain / Force dropdown categories work uniformly.
+* **Output Vector dropdown gains Strain and Force categories.** Auto-detected from the bundle slots; categories only appear when their dict is non-empty.
+* **STRESS / STRAIN / FORCE Output Requests reach the deck.** `_apply_case_control_from_set` now falls back to the analysis-set-level Output Requests when a per-subcase entry isn't explicitly set, so MYSTRAN actually computes what the user requested.
+* **Scalar-bar `(geom x N)` annotation** in `% of model` scale mode. Makes the auto-fit multiplier explicit so users don't read 43.45 on the bar and wonder why the visible geometry is 1.4 inches.
+* **Vector Info dialog.** New `View > Vector Info...` opens a modeless readout of the active Output Vector's min/max with their Node or Element IDs. Refreshes live as you flip Output Set / Output Vector. Copy button writes a tab-separated row to the clipboard.
+
+**Still deferred to v5.3.1+:** CBEAM / CROD F06 stress (no test fixtures yet), F06 strain (MYSTRAN-side limitation), broader OP2 parser expansion.
+
+---
+
+Older releases: see the [Releases page](https://github.com/whoaone/node-runner/releases) for v1.0.0 through v5.2.0 changelogs.
