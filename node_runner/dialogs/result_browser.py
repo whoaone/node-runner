@@ -29,7 +29,8 @@ from PySide6.QtCore import (
 from PySide6.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
     QTableView, QHeaderView, QLabel, QLineEdit, QPushButton, QCheckBox,
-    QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
+    QSlider, QSpinBox, QDoubleSpinBox, QComboBox, QDialog, QFormLayout,
+    QApplication, QFrame,
 )
 
 
@@ -430,3 +431,154 @@ class VectorOverlayWidget(QWidget):
         scale_row.addWidget(self.scale_spin)
         scale_row.addStretch(1)
         layout.addLayout(scale_row)
+
+
+# ---------------------------------------------------------------------------
+# v5.3.0 patch 2 Q8: Femap-style Vector Info dialog
+# ---------------------------------------------------------------------------
+
+
+class VectorInfoDialog(QDialog):
+    """Modeless readout of min/max + their node/element IDs for the
+    currently-active scalar in the Results sidebar tab.
+
+    Femap calls this "Vector Info". It refreshes whenever the user
+    changes the Output Set or Output Vector. Stays open across
+    multiple result loads.
+
+    The parent MainWindow drives ``refresh`` via signal hookups in
+    ``initUI``; the dialog itself only renders the data it's handed and
+    fires a Copy-to-clipboard action.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Vector Info")
+        self.setWindowFlags(
+            Qt.Dialog | Qt.WindowTitleHint | Qt.CustomizeWindowHint
+            | Qt.WindowCloseButtonHint)
+        self.setModal(False)
+        self.setMinimumWidth(380)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(6)
+
+        header = QLabel(
+            "<b>Min/Max readout</b> for the active Output Vector. "
+            "Updates live as you flip Output Set / Output Vector in "
+            "the Results sidebar tab.")
+        header.setWordWrap(True)
+        outer.addWidget(header)
+
+        form = QFormLayout()
+        form.setSpacing(4)
+        form.setContentsMargins(0, 4, 0, 4)
+        self._subcase_label = QLabel("--")
+        self._vector_label = QLabel("--")
+        self._max_label = QLabel("--")
+        self._max_id_label = QLabel("--")
+        self._min_label = QLabel("--")
+        self._min_id_label = QLabel("--")
+        self._delta_label = QLabel("--")
+        for lab in (self._max_label, self._min_label, self._delta_label):
+            lab.setStyleSheet("font-family: Consolas, monospace;")
+        form.addRow("Output Set:", self._subcase_label)
+        form.addRow("Vector:", self._vector_label)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        outer.addLayout(form)
+        outer.addWidget(sep)
+
+        form2 = QFormLayout()
+        form2.setSpacing(4)
+        form2.setContentsMargins(0, 4, 0, 4)
+        form2.addRow("Max:", self._max_label)
+        form2.addRow("  at:", self._max_id_label)
+        form2.addRow("Min:", self._min_label)
+        form2.addRow("  at:", self._min_id_label)
+        form2.addRow("Δ:", self._delta_label)
+        outer.addLayout(form2)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._copy_btn = QPushButton("Copy to clipboard")
+        self._copy_btn.clicked.connect(self._copy_to_clipboard)
+        self._copy_btn.setEnabled(False)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.hide)
+        btn_row.addWidget(self._copy_btn)
+        btn_row.addWidget(close_btn)
+        outer.addLayout(btn_row)
+
+        # Last-rendered info snapshot for the Copy button.
+        self._last = None  # type: dict | None
+
+    def refresh(self, info: dict | None):
+        """Update the dialog from a ``{...}`` dict produced by
+        ``MainWindow._compute_active_min_max()``. Pass ``None`` to
+        render the empty state."""
+        if not info:
+            self._subcase_label.setText("--")
+            self._vector_label.setText("--")
+            self._max_label.setText("(no data)")
+            self._max_id_label.setText("--")
+            self._min_label.setText("(no data)")
+            self._min_id_label.setText("--")
+            self._delta_label.setText("--")
+            self._copy_btn.setEnabled(False)
+            self._last = None
+            return
+        sc = info.get('subcase') or "?"
+        sc_title = info.get('subcase_title') or ""
+        if sc_title:
+            self._subcase_label.setText(f"Subcase {sc}: {sc_title}")
+        else:
+            self._subcase_label.setText(f"Subcase {sc}")
+        self._vector_label.setText(str(info.get('label') or "--"))
+        max_v = info.get('max_value')
+        min_v = info.get('min_value')
+        max_id = info.get('max_id')
+        min_id = info.get('min_id')
+        kind = info.get('kind') or "Node"
+        if max_v is not None:
+            self._max_label.setText(f"{max_v:.6g}")
+            self._max_id_label.setText(f"{kind} {max_id}")
+        else:
+            self._max_label.setText("(no data)")
+            self._max_id_label.setText("--")
+        if min_v is not None:
+            self._min_label.setText(f"{min_v:.6g}")
+            self._min_id_label.setText(f"{kind} {min_id}")
+        else:
+            self._min_label.setText("(no data)")
+            self._min_id_label.setText("--")
+        if max_v is not None and min_v is not None:
+            self._delta_label.setText(f"{(max_v - min_v):.6g}")
+        else:
+            self._delta_label.setText("--")
+        self._copy_btn.setEnabled(True)
+        self._last = info
+
+    def _copy_to_clipboard(self):
+        info = self._last
+        if not info:
+            return
+        sc = info.get('subcase')
+        sc_title = info.get('subcase_title') or ""
+        label = info.get('label') or ""
+        kind = info.get('kind') or "Node"
+        line = "\t".join((
+            f"Subcase {sc}",
+            sc_title,
+            label,
+            f"max={info.get('max_value')!r}",
+            f"max_{kind.lower()}={info.get('max_id')!r}",
+            f"min={info.get('min_value')!r}",
+            f"min_{kind.lower()}={info.get('min_id')!r}",
+        ))
+        try:
+            QApplication.clipboard().setText(line)
+        except Exception:
+            pass

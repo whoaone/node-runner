@@ -83,6 +83,19 @@ DEFAULT_SIZES = {
     'highlight_outline_width': 5,
 }
 
+# v5.3.0 Item C: defaults for the consolidated settings tabs that used
+# to live under the top-level "Settings" menu.
+DEFAULT_EXPORT_FORMAT = "short"
+EXPORT_FORMATS = ("short", "long", "free")
+DEFAULT_UNITS = ""
+UNIT_SUGGESTIONS = (
+    "(custom)", "mm / N / t", "mm / N / kg", "m / N / kg",
+    "in / lbf / slug", "in / lbf / lbf-s2/in",
+)
+DEFAULT_ADAPTIVE_LOD = True
+DEFAULT_ELEM_LOD_THRESHOLD = 500_000
+DEFAULT_PARALLEL_PARSING = False
+
 
 # ----------------------------------------------------------------------
 # QSettings load/save helpers (module-level so app startup can read
@@ -122,6 +135,29 @@ def load_preferences() -> dict:
         mystran = mystran_settings.get_all()
     except Exception:
         mystran = {}
+    # v5.3.0 Item C: new tabs consolidating Settings menu items.
+    export_format = qs.value("export/default_format",
+                             DEFAULT_EXPORT_FORMAT, type=str)
+    if export_format not in EXPORT_FORMATS:
+        export_format = DEFAULT_EXPORT_FORMAT
+    units_label = qs.value("display/units", DEFAULT_UNITS, type=str) or ""
+    try:
+        adaptive_lod = bool(
+            qs.value("render/adaptive_lod", DEFAULT_ADAPTIVE_LOD, type=bool))
+    except Exception:
+        adaptive_lod = DEFAULT_ADAPTIVE_LOD
+    try:
+        elem_lod_threshold = int(
+            qs.value("render/elem_lod_threshold",
+                     DEFAULT_ELEM_LOD_THRESHOLD, type=int))
+    except Exception:
+        elem_lod_threshold = DEFAULT_ELEM_LOD_THRESHOLD
+    try:
+        parallel_parsing = bool(
+            qs.value("import/parallel_parsing",
+                     DEFAULT_PARALLEL_PARSING, type=bool))
+    except Exception:
+        parallel_parsing = DEFAULT_PARALLEL_PARSING
     return {
         'colors': colors,
         'highlight_color': highlight,
@@ -130,6 +166,11 @@ def load_preferences() -> dict:
         'materials_library_path': materials_library_path,
         'results_bar_orientation': results_bar_orientation,
         'mystran': mystran,
+        'export_format': export_format,
+        'units_label': units_label,
+        'adaptive_lod': adaptive_lod,
+        'elem_lod_threshold': elem_lod_threshold,
+        'parallel_parsing': parallel_parsing,
     }
 
 
@@ -156,6 +197,22 @@ def save_preferences(payload: dict):
             mystran_settings.save_all(payload['mystran'])
         except Exception:
             pass
+    # v5.3.0 Item C: new tabs consolidating Settings menu items.
+    if 'export_format' in payload and payload['export_format'] in EXPORT_FORMATS:
+        qs.setValue("export/default_format", str(payload['export_format']))
+    if 'units_label' in payload:
+        qs.setValue("display/units", str(payload['units_label']))
+    if 'adaptive_lod' in payload:
+        qs.setValue("render/adaptive_lod", bool(payload['adaptive_lod']))
+    if 'elem_lod_threshold' in payload:
+        try:
+            qs.setValue("render/elem_lod_threshold",
+                        int(payload['elem_lod_threshold']))
+        except (TypeError, ValueError):
+            pass
+    if 'parallel_parsing' in payload:
+        qs.setValue("import/parallel_parsing",
+                    bool(payload['parallel_parsing']))
     qs.sync()
 
 
@@ -243,6 +300,13 @@ class PreferencesDialog(QDialog):
         self._results_bar_orient_combo: Optional[QComboBox] = None
         self._library_path_edit: Optional[QLineEdit] = None
         self._library_status_label: Optional[QLabel] = None
+        # v5.3.0 Item C: new Export / Units / Performance tab widgets.
+        self._export_format_combo: Optional[QComboBox] = None
+        self._units_line: Optional[QLineEdit] = None
+        self._units_suggest_combo: Optional[QComboBox] = None
+        self._adaptive_lod_check: Optional[QCheckBox] = None
+        self._elem_lod_spin: Optional[QSpinBox] = None
+        self._parallel_parse_check: Optional[QCheckBox] = None
         # MYSTRAN tab widgets (v5.0.0 items 12-18)
         self._mystran_exe_edit: Optional[QLineEdit] = None
         self._mystran_version_label: Optional[QLabel] = None
@@ -256,6 +320,10 @@ class PreferencesDialog(QDialog):
         self._mystran_cleanup_spin: Optional[QSpinBox] = None
 
         self._tabs = QTabWidget()
+        # v5.3.0 Item C: General tab leads (units label first because it's
+        # the most-seen preference); then visual / rendering tabs; then
+        # solver / library; then performance + export at the end.
+        self._tabs.addTab(self._build_general_tab(), "General")
         self._tabs.addTab(self._build_colors_tab(), "Entity Colors")
         self._tabs.addTab(self._build_sizes_tab(), "Entity Sizes")
         self._tabs.addTab(self._build_rendering_tab(), "Rendering")
@@ -265,6 +333,10 @@ class PreferencesDialog(QDialog):
         self._tabs.addTab(self._build_library_tab(), "Library")
         self._tabs.addTab(self._build_mystran_tab(), "MYSTRAN")
         self._tabs.addTab(self._build_highlight_tab(), "Highlight")
+        # v5.3.0 Item C: tabs consolidated from the (now-deleted)
+        # top-level Settings menu.
+        self._tabs.addTab(self._build_export_tab(), "Export")
+        self._tabs.addTab(self._build_performance_tab(), "Performance")
         outer.addWidget(self._tabs)
 
         sep = QFrame()
@@ -1069,6 +1141,123 @@ class PreferencesDialog(QDialog):
     # Result
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # v5.3.0 Item C: tabs consolidated from the Settings menu.
+    # ------------------------------------------------------------------
+
+    def _build_general_tab(self):
+        """Units label + free-text hint. Mirrors the old UnitsDialog."""
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(8)
+        lay.setContentsMargins(10, 10, 10, 10)
+        header = QLabel(
+            "Unit-system hint shown in the status bar. Node Runner is "
+            "intentionally unitless; this label is a memory aid only and "
+            "does not affect numbers. To rescale, use Tools → Convert "
+            "Units...")
+        header.setWordWrap(True)
+        lay.addWidget(header)
+        self._units_line = QLineEdit(self._initial.get('units_label') or "")
+        self._units_line.setPlaceholderText(
+            "e.g. mm / N / t   or   in / lbf / slug")
+        lay.addWidget(self._units_line)
+        lay.addWidget(QLabel("Quick pick:"))
+        self._units_suggest_combo = QComboBox()
+        self._units_suggest_combo.addItems(UNIT_SUGGESTIONS)
+        self._units_suggest_combo.currentTextChanged.connect(
+            self._on_units_suggestion)
+        lay.addWidget(self._units_suggest_combo)
+        lay.addStretch(1)
+        return w
+
+    def _on_units_suggestion(self, text):
+        if text and text != "(custom)" and self._units_line is not None:
+            self._units_line.setText(text)
+
+    def _build_export_tab(self):
+        """Default Nastran field format. Mirrors ExportDefaultsDialog."""
+        try:
+            from node_runner.dialogs.export import (
+                FORMAT_LABELS, FORMAT_DESCRIPTIONS,
+            )
+        except Exception:
+            FORMAT_LABELS = {"short": "Short (8 chars)",
+                             "long": "Long (16 chars)", "free": "Free"}
+            FORMAT_DESCRIPTIONS = {k: "" for k in FORMAT_LABELS}
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(8)
+        lay.setContentsMargins(10, 10, 10, 10)
+        header = QLabel(
+            "Default Nastran field format used when saving / exporting. "
+            "The Save dialog still offers per-file overrides.")
+        header.setWordWrap(True)
+        lay.addWidget(header)
+        self._export_format_combo = QComboBox()
+        for key in EXPORT_FORMATS:
+            self._export_format_combo.addItem(
+                FORMAT_LABELS.get(key, key), userData=key)
+        cur = self._initial.get('export_format', DEFAULT_EXPORT_FORMAT)
+        if cur not in EXPORT_FORMATS:
+            cur = DEFAULT_EXPORT_FORMAT
+        for i in range(self._export_format_combo.count()):
+            if self._export_format_combo.itemData(i) == cur:
+                self._export_format_combo.setCurrentIndex(i)
+                break
+        lay.addWidget(self._export_format_combo)
+        descs = QLabel(
+            "<b>Short</b> (8-char fields) is the historical default and "
+            "most compatible. <b>Long</b> (16-char) preserves more "
+            "precision; some older readers reject it. <b>Free</b> "
+            "(comma-separated) is the most readable but also the least "
+            "universally supported.")
+        descs.setWordWrap(True)
+        descs.setStyleSheet("color: #888; font-size: 11px; padding: 6px 0;")
+        lay.addWidget(descs)
+        lay.addStretch(1)
+        return w
+
+    def _build_performance_tab(self):
+        """Adaptive Node LOD + Element LOD Threshold + parallel parsing."""
+        w = QWidget()
+        lay = QFormLayout(w)
+        lay.setSpacing(8)
+        lay.setContentsMargins(10, 10, 10, 10)
+        self._adaptive_lod_check = QCheckBox(
+            "Decimate huge node clouds when zoomed out")
+        self._adaptive_lod_check.setChecked(
+            bool(self._initial.get('adaptive_lod', DEFAULT_ADAPTIVE_LOD)))
+        self._adaptive_lod_check.setToolTip(
+            "When enabled, large node clouds (>50k points) are stride-"
+            "sampled at far camera distances to keep interaction smooth. "
+            "Picking still sees every node.")
+        lay.addRow("Adaptive Node LOD:", self._adaptive_lod_check)
+        self._elem_lod_spin = QSpinBox()
+        self._elem_lod_spin.setRange(1000, 50_000_000)
+        self._elem_lod_spin.setSingleStep(50_000)
+        try:
+            self._elem_lod_spin.setValue(int(
+                self._initial.get('elem_lod_threshold',
+                                  DEFAULT_ELEM_LOD_THRESHOLD)))
+        except (TypeError, ValueError):
+            self._elem_lod_spin.setValue(DEFAULT_ELEM_LOD_THRESHOLD)
+        self._elem_lod_spin.setToolTip(
+            "Above this cell count the displayed mesh stride-samples "
+            "shells and extracts the outer surface of solids. Picking "
+            "and queries are unaffected.")
+        lay.addRow("Element LOD threshold (cells):", self._elem_lod_spin)
+        self._parallel_parse_check = QCheckBox(
+            "Use parallel BDF parsing (experimental)")
+        self._parallel_parse_check.setChecked(
+            bool(self._initial.get('parallel_parsing',
+                                   DEFAULT_PARALLEL_PARSING)))
+        self._parallel_parse_check.setToolTip(
+            "Retired feature kept for compatibility. Was slower than "
+            "single-threaded due to GIL contention on most decks.")
+        lay.addRow("Parallel parsing:", self._parallel_parse_check)
+        return w
+
     def result_payload(self) -> dict:
         colors = {k: s.current_color() for k, s in self._swatches.items()}
         sizes = {k: sb.value() for k, sb in self._size_spins.items()}
@@ -1116,6 +1305,23 @@ class PreferencesDialog(QDialog):
             data = self._results_bar_orient_combo.currentData()
             if data in ('right', 'bottom'):
                 results_bar_orientation = data
+        # v5.3.0 Item C: pull values from the new tabs.
+        export_format = DEFAULT_EXPORT_FORMAT
+        if self._export_format_combo is not None:
+            data = self._export_format_combo.currentData()
+            if data in EXPORT_FORMATS:
+                export_format = data
+        units_label = (self._units_line.text().strip()
+                       if self._units_line is not None else DEFAULT_UNITS)
+        adaptive_lod = (bool(self._adaptive_lod_check.isChecked())
+                        if self._adaptive_lod_check is not None
+                        else DEFAULT_ADAPTIVE_LOD)
+        elem_lod_threshold = (int(self._elem_lod_spin.value())
+                              if self._elem_lod_spin is not None
+                              else DEFAULT_ELEM_LOD_THRESHOLD)
+        parallel_parsing = (bool(self._parallel_parse_check.isChecked())
+                            if self._parallel_parse_check is not None
+                            else DEFAULT_PARALLEL_PARSING)
         return {
             'colors': colors,
             'highlight_color': highlight,
@@ -1124,4 +1330,9 @@ class PreferencesDialog(QDialog):
             'materials_library_path': materials_library_path,
             'results_bar_orientation': results_bar_orientation,
             'mystran': mystran,
+            'export_format': export_format,
+            'units_label': units_label,
+            'adaptive_lod': adaptive_lod,
+            'elem_lod_threshold': elem_lod_threshold,
+            'parallel_parsing': parallel_parsing,
         }

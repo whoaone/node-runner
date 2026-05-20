@@ -120,16 +120,18 @@ class TestThemeAMenuWiring:
 
 class TestThemeCMenuWiring:
 
-    @pytest.mark.parametrize("label", [
-        "Distributed Load (PLOAD1)...",
-        "Element Pressure (PLOAD2)...",
-        "Enforced Displacement (SPCD)...",
-        "Multi-Point Constraint (MPC)...",
-        "Bolt Preload (BOLT)...",
+    # v5.3.0 Item A: regrouped into Loads / Constraints submenus.
+    @pytest.mark.parametrize("submenu, label", [
+        ("Loads", "Distributed Load (PLOAD1)..."),
+        ("Loads", "Element Pressure (PLOAD2)..."),
+        ("Loads", "Enforced Displacement (SPCD)..."),
+        ("Loads", "Bolt Preload (BOLT)..."),
+        ("Constraints", "Multi-Point Constraint (MPC)..."),
     ])
-    def test_model_menu_has(self, main_window, label):
-        action = _find_action_path(main_window.menuBar(), "&Model", label)
-        assert action is not None, f"missing Model > {label}"
+    def test_model_menu_has(self, main_window, submenu, label):
+        action = _find_action_path(
+            main_window.menuBar(), "&Model", submenu, label)
+        assert action is not None, f"missing Model > {submenu} > {label}"
 
     @pytest.mark.parametrize("label", [
         "Rigid Bar (RBAR)...",
@@ -145,16 +147,25 @@ class TestThemeCMenuWiring:
 
 class TestSettingsAndToolsMenu:
 
-    def test_settings_export_defaults(self, main_window):
-        action = _find_action_path(
-            main_window.menuBar(), "&Settings", "Export Defaults...",
-        )
-        assert action is not None
+    # v5.3.0 Item C: Settings menu deleted; Export Defaults / Units
+    # moved into Edit > Preferences tabs ("Export" and "General"). The
+    # standalone dialog classes are still importable for back-compat
+    # but no menu entry triggers them.
+    def test_settings_menu_removed(self, main_window):
+        bar = main_window.menuBar()
+        for act in bar.actions():
+            assert act.text() != "&Settings", (
+                "v5.3.0 Item C: top-level Settings menu must be gone "
+                "(its entries live under Edit > Preferences now).")
 
-    def test_settings_unit_label(self, main_window):
-        # Renamed from "Units..." to be unitless-aware
-        action = _find_action_path(main_window.menuBar(), "&Settings", "Units...")
-        assert action is not None
+    def test_preferences_dialog_has_consolidated_tabs(self, main_window):
+        # The dialog is constructed on demand; verify the class exposes
+        # the new tab builders so the migration is complete.
+        from node_runner.dialogs.preferences import PreferencesDialog
+        for fn in ("_build_general_tab", "_build_export_tab",
+                   "_build_performance_tab"):
+            assert hasattr(PreferencesDialog, fn), (
+                f"PreferencesDialog should define {fn} (v5.3.0 Item C).")
 
     def test_tools_convert_units(self, main_window):
         action = _find_action_path(

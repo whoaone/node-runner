@@ -99,16 +99,63 @@ class GroupEditorDialog(QDialog):
     def __init__(self, group_name, group_data, model, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Edit Group: {group_name}")
-        self.setMinimumSize(500, 400)
-        self.resize(600, 450)
+        self.setMinimumSize(560, 480)
+        self.resize(720, 560)
         self._group_name = group_name
-        self._nodes = list(group_data.get("nodes", []))
-        self._elements = list(group_data.get("elements", []))
+
+        # v5.3.0 Item D1: coerce IDs to int so groups loaded from
+        # JSON-stringified storage (or other shapes) still resolve
+        # against model.nodes / model.elements (which use int keys).
+        # Drop empty/None entries and collapse duplicates.
+        def _coerce_ids(seq):
+            out = set()
+            for v in (seq or []):
+                if v is None:
+                    continue
+                try:
+                    out.add(int(v))
+                except (TypeError, ValueError):
+                    try:
+                        s = str(v).strip()
+                        if s:
+                            out.add(int(s))
+                    except (TypeError, ValueError):
+                        pass
+            return sorted(out)
+
+        self._nodes = _coerce_ids(group_data.get("nodes", []))
+        self._elements = _coerce_ids(group_data.get("elements", []))
+        self._properties = _coerce_ids(group_data.get("properties", []))
+        self._materials = _coerce_ids(group_data.get("materials", []))
+        self._coords = _coerce_ids(group_data.get("coords", []))
         self._model = model
         self._removed_nodes = []
         self._removed_elements = []
         self._added_nodes = []
         self._added_elements = []
+        self._removed_properties = []
+        self._removed_materials = []
+        self._removed_coords = []
+        self._added_properties = []
+        self._added_materials = []
+        self._added_coords = []
+        # Diagnostic: count IDs that don't resolve against the
+        # current model so we can tell stale-from-bug at a glance.
+        try:
+            from node_runner.profiling import perf_event
+            if model is not None:
+                missing_n = sum(1 for n in self._nodes if n not in model.nodes)
+                all_elems = {**model.elements, **getattr(model, 'rigid_elements', {})}
+                missing_e = sum(1 for e in self._elements if e not in all_elems)
+                if missing_n or missing_e:
+                    perf_event('group_editor.stale_ids',
+                               group=group_name,
+                               n_missing_nodes=missing_n,
+                               n_missing_elements=missing_e,
+                               n_total_nodes=len(self._nodes),
+                               n_total_elements=len(self._elements))
+        except Exception:
+            pass
 
         layout = QVBoxLayout(self)
 
@@ -124,7 +171,12 @@ class GroupEditorDialog(QDialog):
         self._nodes_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._nodes_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self._nodes_table.verticalHeader().setVisible(False)
-        self._nodes_table.setSortingEnabled(True)
+        # v5.3.0 P4: disable sorting DURING population to keep row /
+        # column correspondence. Qt re-sorts on every setItem when
+        # sorting is enabled, scrambling cells. Re-enable after the
+        # populate loop (matches the canonical pattern at
+        # NodeElementInfoDialog.__init__).
+        self._nodes_table.setSortingEnabled(False)
         for row, nid in enumerate(sorted(self._nodes)):
             item = QTableWidgetItem()
             item.setData(QtCore.Qt.DisplayRole, nid)
@@ -135,6 +187,14 @@ class GroupEditorDialog(QDialog):
                     vi = QTableWidgetItem()
                     vi.setData(QtCore.Qt.DisplayRole, round(float(val), 6))
                     self._nodes_table.setItem(row, col + 1, vi)
+            else:
+                # v5.3.0 Item D1: surface stale IDs visibly instead of
+                # leaving the row blank. Helps the user spot groups
+                # that reference a deck they're no longer using.
+                tag = QTableWidgetItem("(not in current model)")
+                tag.setForeground(QtCore.Qt.gray)
+                self._nodes_table.setItem(row, 1, tag)
+        self._nodes_table.setSortingEnabled(True)
         self._nodes_table.horizontalHeader().setStretchLastSection(True)
         nodes_layout.addWidget(self._nodes_table)
         nodes_btn_layout = QHBoxLayout()
@@ -157,7 +217,8 @@ class GroupEditorDialog(QDialog):
         self._elems_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._elems_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self._elems_table.verticalHeader().setVisible(False)
-        self._elems_table.setSortingEnabled(True)
+        # v5.3.0 P4: disable sort during populate; re-enable after.
+        self._elems_table.setSortingEnabled(False)
         all_elements = {}
         if model:
             all_elements = {**model.elements, **model.rigid_elements}
@@ -175,6 +236,12 @@ class GroupEditorDialog(QDialog):
                 else:
                     pid_item.setText(str(pid_val))
                 self._elems_table.setItem(row, 2, pid_item)
+            else:
+                # v5.3.0 Item D1: stale-ID indicator.
+                tag = QTableWidgetItem("(not in current model)")
+                tag.setForeground(QtCore.Qt.gray)
+                self._elems_table.setItem(row, 1, tag)
+        self._elems_table.setSortingEnabled(True)
         self._elems_table.horizontalHeader().setStretchLastSection(True)
         elems_layout.addWidget(self._elems_table)
         elems_btn_layout = QHBoxLayout()
@@ -187,6 +254,141 @@ class GroupEditorDialog(QDialog):
         elems_btn_layout.addStretch()
         elems_layout.addLayout(elems_btn_layout)
         tabs.addTab(elems_tab, f"Elements ({len(self._elements)})")
+
+        # ── v5.3.0 Item D2: Materials / Properties / Coords tabs ──
+        # Femap-faithful group editor: groups can house materials and
+        # properties (not just nodes + elements). Each tab follows the
+        # same Remove Selected / Add by ID pattern as Nodes / Elements.
+
+        def _make_extra_tab(label, ids_attr, model_dict_name,
+                            columns, lookup_fn):
+            """Build one tab (Materials / Properties / Coords).
+
+            label: human label for the tab and dialogs ("Materials").
+            ids_attr: attribute on self holding the current id list
+                      ("_materials").
+            model_dict_name: name of the model attribute that has the
+                             id -> entity dict ("materials").
+            columns: list of column headers.
+            lookup_fn(entity) -> list[str|int] populating columns 1..N.
+            """
+            tab = QWidget()
+            tab_layout = QVBoxLayout(tab)
+            ids = getattr(self, ids_attr)
+            table = QTableWidget(len(ids), len(columns))
+            table.setHorizontalHeaderLabels(columns)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            table.setSelectionMode(QTableWidget.ExtendedSelection)
+            table.verticalHeader().setVisible(False)
+            # v5.3.0 P4: disable sort during populate; re-enable after.
+            table.setSortingEnabled(False)
+            model_dict = (getattr(model, model_dict_name, {}) or {}
+                          if model is not None else {})
+            for row, vid in enumerate(sorted(ids)):
+                item = QTableWidgetItem()
+                item.setData(QtCore.Qt.DisplayRole, vid)
+                table.setItem(row, 0, item)
+                if vid in model_dict:
+                    entity = model_dict[vid]
+                    try:
+                        cells = lookup_fn(entity) or []
+                    except Exception:
+                        cells = []
+                    for ci, val in enumerate(cells):
+                        if ci + 1 >= len(columns):
+                            break
+                        cell = QTableWidgetItem()
+                        if isinstance(val, (int, float)):
+                            cell.setData(QtCore.Qt.DisplayRole, val)
+                        else:
+                            cell.setText("" if val is None else str(val))
+                        table.setItem(row, ci + 1, cell)
+                else:
+                    tag = QTableWidgetItem("(not in current model)")
+                    tag.setForeground(QtCore.Qt.gray)
+                    table.setItem(row, 1, tag)
+            table.setSortingEnabled(True)
+            table.horizontalHeader().setStretchLastSection(True)
+            tab_layout.addWidget(table)
+            btn_row = QHBoxLayout()
+            remove_btn = QPushButton("Remove Selected")
+            add_btn = QPushButton("Add by ID...")
+            btn_row.addWidget(remove_btn)
+            btn_row.addWidget(add_btn)
+            btn_row.addStretch()
+            tab_layout.addLayout(btn_row)
+            return tab, table, remove_btn, add_btn
+
+        # Materials tab
+        def _mat_cells(mat):
+            mtype = getattr(mat, 'type', '')
+            e_val = getattr(mat, 'e', None) or getattr(mat, 'E', None)
+            rho_val = getattr(mat, 'rho', None) or getattr(mat, 'RHO', None)
+            return [mtype, e_val, rho_val]
+
+        (mats_tab, self._mats_table,
+         remove_mats_btn, add_mats_btn) = _make_extra_tab(
+            "Materials", "_materials", "materials",
+            ["MID", "Type", "E", "Density"],
+            _mat_cells)
+        remove_mats_btn.clicked.connect(
+            lambda: self._remove_selected_extra(
+                self._mats_table, self._materials,
+                self._removed_materials, 2))
+        add_mats_btn.clicked.connect(
+            lambda: self._add_extra_by_id(
+                "Materials", self._mats_table, self._materials,
+                self._added_materials, "materials", _mat_cells, 2))
+        tabs.addTab(mats_tab, f"Materials ({len(self._materials)})")
+
+        # Properties tab
+        def _prop_cells(prop):
+            mid_val = getattr(prop, 'mid', None)
+            return [getattr(prop, 'type', ''), mid_val]
+
+        (props_tab, self._props_table,
+         remove_props_btn, add_props_btn) = _make_extra_tab(
+            "Properties", "_properties", "properties",
+            ["PID", "Type", "MID"],
+            _prop_cells)
+        remove_props_btn.clicked.connect(
+            lambda: self._remove_selected_extra(
+                self._props_table, self._properties,
+                self._removed_properties, 3))
+        add_props_btn.clicked.connect(
+            lambda: self._add_extra_by_id(
+                "Properties", self._props_table, self._properties,
+                self._added_properties, "properties", _prop_cells, 3))
+        tabs.addTab(props_tab, f"Properties ({len(self._properties)})")
+
+        # Coords tab
+        def _coord_cells(coord):
+            origin = getattr(coord, 'origin', None) or getattr(coord, 'e1', None)
+            ostr = ""
+            if origin is not None:
+                try:
+                    ostr = "(" + ", ".join(
+                        f"{float(v):.4g}" for v in origin) + ")"
+                except Exception:
+                    ostr = str(origin)
+            return [getattr(coord, 'type', ''), ostr]
+
+        (coords_tab, self._coords_table,
+         remove_coords_btn, add_coords_btn) = _make_extra_tab(
+            "Coords", "_coords", "coords",
+            ["CID", "Type", "Origin"],
+            _coord_cells)
+        remove_coords_btn.clicked.connect(
+            lambda: self._remove_selected_extra(
+                self._coords_table, self._coords,
+                self._removed_coords, 4))
+        add_coords_btn.clicked.connect(
+            lambda: self._add_extra_by_id(
+                "Coords", self._coords_table, self._coords,
+                self._added_coords, "coords", _coord_cells, 4))
+        tabs.addTab(coords_tab, f"Coords ({len(self._coords)})")
+
         self._tabs = tabs
 
         # Dialog buttons
@@ -286,9 +488,93 @@ class GroupEditorDialog(QDialog):
                     self._elems_table.setItem(row, 2, pid_item)
             self._tabs.setTabText(1, f"Elements ({self._elems_table.rowCount()})")
 
+    def _remove_selected_extra(self, table, id_list, removed_list, tab_index):
+        """Generic Remove Selected handler for Materials / Properties /
+        Coords tabs."""
+        rows = sorted(set(idx.row() for idx in table.selectedIndexes()),
+                      reverse=True)
+        for row in rows:
+            id_item = table.item(row, 0)
+            if id_item:
+                vid = id_item.data(QtCore.Qt.DisplayRole)
+                if vid in id_list:
+                    id_list.remove(vid)
+                    removed_list.append(vid)
+            table.removeRow(row)
+        # Tab indices: 0 Nodes, 1 Elements, 2 Materials, 3 Properties,
+        # 4 Coords.
+        labels = {2: "Materials", 3: "Properties", 4: "Coords"}
+        if tab_index in labels:
+            self._tabs.setTabText(
+                tab_index, f"{labels[tab_index]} ({table.rowCount()})")
+
+    def _add_extra_by_id(self, label, table, id_list, added_list,
+                         model_dict_name, lookup_fn, tab_index):
+        """Generic Add by ID handler for Materials / Properties / Coords."""
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, f"Add {label}", f"Enter {label.lower()} IDs (comma-separated):")
+        if not (ok and text.strip()):
+            return
+        model_dict = ({} if self._model is None else
+                      getattr(self._model, model_dict_name, {}) or {})
+        new_ids = []
+        for part in text.split(','):
+            part = part.strip()
+            if part.isdigit():
+                vid = int(part)
+                if vid not in id_list:
+                    id_list.append(vid)
+                    added_list.append(vid)
+                    new_ids.append(vid)
+        for vid in new_ids:
+            row = table.rowCount()
+            table.insertRow(row)
+            item = QTableWidgetItem()
+            item.setData(QtCore.Qt.DisplayRole, vid)
+            table.setItem(row, 0, item)
+            if vid in model_dict:
+                try:
+                    cells = lookup_fn(model_dict[vid]) or []
+                except Exception:
+                    cells = []
+                for ci, val in enumerate(cells):
+                    cell = QTableWidgetItem()
+                    if isinstance(val, (int, float)):
+                        cell.setData(QtCore.Qt.DisplayRole, val)
+                    else:
+                        cell.setText("" if val is None else str(val))
+                    table.setItem(row, ci + 1, cell)
+            else:
+                tag = QTableWidgetItem("(not in current model)")
+                tag.setForeground(QtCore.Qt.gray)
+                table.setItem(row, 1, tag)
+        labels = {2: "Materials", 3: "Properties", 4: "Coords"}
+        if tab_index in labels:
+            self._tabs.setTabText(
+                tab_index, f"{labels[tab_index]} ({table.rowCount()})")
+
     def get_changes(self):
-        """Returns (added_nodes, added_elements, removed_nodes, removed_elements)."""
-        return self._added_nodes, self._added_elements, self._removed_nodes, self._removed_elements
+        """Returns the seven-tuple of change sets.
+
+        Backward-compat note: pre-v5.3.0 callers unpacked four values
+        (nodes/elements only). After v5.3.0 the dialog also returns the
+        added/removed sets for materials / properties / coords. Callers
+        unpacking four values should be updated; the legacy attribute
+        accessors (added_nodes/etc.) remain as a fallback.
+        """
+        return {
+            "added_nodes": self._added_nodes,
+            "added_elements": self._added_elements,
+            "removed_nodes": self._removed_nodes,
+            "removed_elements": self._removed_elements,
+            "added_properties": self._added_properties,
+            "added_materials": self._added_materials,
+            "added_coords": self._added_coords,
+            "removed_properties": self._removed_properties,
+            "removed_materials": self._removed_materials,
+            "removed_coords": self._removed_coords,
+        }
 
 
 class LenientImportReportDialog(QDialog):

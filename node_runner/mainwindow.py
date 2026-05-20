@@ -1170,8 +1170,13 @@ class MainWindow(QMainWindow):
         # explicitly engages either. This stops a Deform-Style toggle
         # from also painting a contour the user never asked for.
         self._results_deform_style = 'undeformed'      # undeformed|deformed|animate
-        self._results_scale_mode = 'pct'               # pct | actual
-        self._results_scale_value = 10.0
+        # v5.3.0 P3: default to 'actual' at 1.0 so the user sees the
+        # raw engineering deformation. Previously defaulted to 'pct' at
+        # 10.0 which auto-fit the deformation to ~10% of the bbox and
+        # made it hard to interpret. Users can still switch to 'pct'
+        # for auto-scaling on small-displacement decks.
+        self._results_scale_mode = 'actual'            # actual | pct
+        self._results_scale_value = 1.0
         self._results_show_undeformed_ref = False
         self._results_contour_style = 'none'           # none|filled|filled_edges|bands
         self._results_data_conversion = 'average'      # average|no_avg|max_node|min_node
@@ -1570,13 +1575,37 @@ class MainWindow(QMainWindow):
         prefs_action.triggered.connect(self._open_preferences_dialog)
         edit_menu.addAction(prefs_action)
 
-        # --- Model menu (merged: old Model + Mesh + Edit items) ---
+        # --- Model menu (v5.3.0 Item A: regrouped into themed submenus) ---
+        # Structure:
+        #   Model
+        #   ├── Geometry      Nodes, Coordinate System
+        #   ├── Elements      (existing element creators)
+        #   ├── Sections      Property, Material
+        #   ├── Loads         Load, Load Combination, PLOAD1, PLOAD2, SPCD,
+        #   │                 Bolt Preload
+        #   ├── Constraints   Constraint, MPC
+        #   ├── ─────
+        #   ├── Connections   (existing)
+        #   ├── Geometry Mesh (existing)
+        #   ├── ─────
+        #   └── Modify        (existing + Flip Normals, Orient Normals,
+        #                      Split Plates)
         model_menu = menu_bar.addMenu("&Model")
+        try:
+            model_menu.setToolTipsVisible(True)
+        except Exception:
+            pass
 
-        # Section 1: Create - Nodes, Elements, Properties, Materials, Coords
+        # ── Geometry submenu ──
+        geometry_submenu = model_menu.addMenu("Geometry")
         create_nodes_action = QAction("Nodes...", self)
         create_nodes_action.triggered.connect(self._create_nodes)
-        model_menu.addAction(create_nodes_action)
+        geometry_submenu.addAction(create_nodes_action)
+        create_coord_action = QAction("Coordinate System...", self)
+        create_coord_action.triggered.connect(self._create_coord_system)
+        geometry_submenu.addAction(create_coord_action)
+
+        # ── Elements submenu (unchanged) ──
         elements_menu = model_menu.addMenu("Elements")
         create_lines_action = QAction("Line...", self)
         create_lines_action.triggered.connect(self._create_line_elements)
@@ -1605,45 +1634,47 @@ class MainWindow(QMainWindow):
         create_plotel_action = QAction("Plot Element (PLOTEL)...", self)
         create_plotel_action.triggered.connect(self._create_plotels)
         elements_menu.addAction(create_plotel_action)
+
+        # ── Sections submenu (properties + materials) ──
+        sections_submenu = model_menu.addMenu("Sections")
         create_prop_action = QAction("Property...", self)
         create_prop_action.triggered.connect(self._create_property)
-        model_menu.addAction(create_prop_action)
+        sections_submenu.addAction(create_prop_action)
         create_mat_action = QAction("Material...", self)
         create_mat_action.triggered.connect(self._create_material)
-        model_menu.addAction(create_mat_action)
-        create_coord_action = QAction("Coordinate System...", self)
-        create_coord_action.triggered.connect(self._create_coord_system)
-        model_menu.addAction(create_coord_action)
+        sections_submenu.addAction(create_mat_action)
 
-        # Section 2: Loads & Constraints
-        model_menu.addSeparator()
+        # ── Loads submenu ──
+        loads_submenu = model_menu.addMenu("Loads")
         create_load_action = QAction("Load...", self)
         create_load_action.triggered.connect(self._create_load)
-        model_menu.addAction(create_load_action)
-        create_constraint_action = QAction("Constraint...", self)
-        create_constraint_action.triggered.connect(self._create_constraint)
-        model_menu.addAction(create_constraint_action)
+        loads_submenu.addAction(create_load_action)
         create_load_combo_action = QAction("Load Combination (LOAD)...", self)
         create_load_combo_action.triggered.connect(self._create_load_combination)
-        model_menu.addAction(create_load_combo_action)
-        # --- Theme C: additional load and BC creators ---
+        loads_submenu.addAction(create_load_combo_action)
         create_pload1_action = QAction("Distributed Load (PLOAD1)...", self)
         create_pload1_action.triggered.connect(self._create_pload1)
-        model_menu.addAction(create_pload1_action)
+        loads_submenu.addAction(create_pload1_action)
         create_pload2_action = QAction("Element Pressure (PLOAD2)...", self)
         create_pload2_action.triggered.connect(self._create_pload2)
-        model_menu.addAction(create_pload2_action)
+        loads_submenu.addAction(create_pload2_action)
         create_spcd_action = QAction("Enforced Displacement (SPCD)...", self)
         create_spcd_action.triggered.connect(self._create_spcd)
-        model_menu.addAction(create_spcd_action)
-        create_mpc_action = QAction("Multi-Point Constraint (MPC)...", self)
-        create_mpc_action.triggered.connect(self._create_mpc)
-        model_menu.addAction(create_mpc_action)
+        loads_submenu.addAction(create_spcd_action)
         create_bolt_action = QAction("Bolt Preload (BOLT)...", self)
         create_bolt_action.triggered.connect(self._create_bolt)
-        model_menu.addAction(create_bolt_action)
+        loads_submenu.addAction(create_bolt_action)
 
-        # Section 3: Modify (moved from Edit menu)
+        # ── Constraints submenu ──
+        constraints_submenu = model_menu.addMenu("Constraints")
+        create_constraint_action = QAction("Constraint...", self)
+        create_constraint_action.triggered.connect(self._create_constraint)
+        constraints_submenu.addAction(create_constraint_action)
+        create_mpc_action = QAction("Multi-Point Constraint (MPC)...", self)
+        create_mpc_action.triggered.connect(self._create_mpc)
+        constraints_submenu.addAction(create_mpc_action)
+
+        # ── Modify submenu (edits + mesh-editing + flip/orient/split) ──
         model_menu.addSeparator()
         modify_menu = model_menu.addMenu("Modify")
         move_nodes_action = QAction("Transform Nodes...", self)
@@ -1658,7 +1689,6 @@ class MainWindow(QMainWindow):
         edit_mats_action = QAction("Materials...", self)
         edit_mats_action.triggered.connect(self._open_material_editor)
         modify_menu.addAction(edit_mats_action)
-        # --- Theme A: mesh-editing operations ---
         modify_menu.addSeparator()
         split_quad_action = QAction("Split QUAD into TRIA...", self)
         split_quad_action.triggered.connect(self._open_split_quad_tool)
@@ -1681,18 +1711,18 @@ class MainWindow(QMainWindow):
         insert_edge_node_action = QAction("Insert Node on Edge...", self)
         insert_edge_node_action.triggered.connect(self._open_insert_edge_node_tool)
         modify_menu.addAction(insert_edge_node_action)
-
-        # Section 4: Mesh Operations (moved from Mesh menu)
-        model_menu.addSeparator()
+        # v5.3.0 Item A: fold the formerly-top-level mesh ops into Modify
+        # (they're modify-type operations).
+        modify_menu.addSeparator()
         flip_normals_action = QAction("Flip Element Normals...", self)
         flip_normals_action.triggered.connect(self._open_element_flip_tool)
-        model_menu.addAction(flip_normals_action)
+        modify_menu.addAction(flip_normals_action)
         orient_normals_action = QAction("Orient Normals (Auto)...", self)
         orient_normals_action.triggered.connect(self._auto_orient_normals)
-        model_menu.addAction(orient_normals_action)
+        modify_menu.addAction(orient_normals_action)
         split_plates_action = QAction("Split Plates...", self)
         split_plates_action.triggered.connect(self._open_element_split_tool)
-        model_menu.addAction(split_plates_action)
+        modify_menu.addAction(split_plates_action)
 
         # Section 5: Connections (moved from Mesh menu)
         model_menu.addSeparator()
@@ -1827,43 +1857,18 @@ class MainWindow(QMainWindow):
 
         analysis_menu = menu_bar.addMenu("&Analysis")
         analysis_set_mgr_action = QAction("Analysis Set Manager...", self)
+        analysis_set_mgr_action.setStatusTip(
+            "Single home for SOL type, subcases, EIGRL, output requests, "
+            "and params. Edit the active AnalysisSet here.")
         analysis_set_mgr_action.triggered.connect(self._open_analysis_set_manager)
         analysis_menu.addAction(analysis_set_mgr_action)
         analysis_menu.addSeparator()
-        sol_menu = analysis_menu.addMenu("Solution Type")
-        try:
-            sol_menu.setToolTipsVisible(True)
-        except Exception:
-            pass
-        from node_runner.solve import mystran_tips as _stips
-        sol_none_action = QAction("None (Punch)", self, checkable=True, checked=True)
-        sol_none_action.setToolTip(
-            "<b>None (Punch)</b><br>No SOL number written -- the deck "
-            "exports as a punch fragment. Use only when handing the "
-            "deck to a solver other than MSC / MYSTRAN.")
-        sol_101_action = QAction("SOL 101 - Linear Statics", self, checkable=True)
-        sol_101_action.setToolTip(_stips.SOL_101)
-        sol_103_action = QAction("SOL 103 - Normal Modes", self, checkable=True)
-        sol_103_action.setToolTip(_stips.SOL_103)
-        sol_105_action = QAction("SOL 105 - Buckling", self, checkable=True)
-        sol_105_action.setToolTip(_stips.SOL_105)
-        sol_106_action = QAction("SOL 106 - Nonlinear Static", self, checkable=True)
-        sol_106_action.setToolTip(
-            "<b>SOL 106. Nonlinear Static</b><br>"
-            "Iterative nonlinear (large-deformation, material "
-            "nonlinearity, contact). <b>NOT supported by MYSTRAN.</b> "
-            "Selecting this will cause MYSTRAN pre-flight to block "
-            "the run. Use for MSC / NX export only.")
-        sol_group = QActionGroup(self)
-        for action in [sol_none_action, sol_101_action, sol_103_action, sol_105_action, sol_106_action]:
-            sol_group.addAction(action)
-            sol_menu.addAction(action)
-        sol_none_action.triggered.connect(lambda: self._set_sol_type(None))
-        sol_101_action.triggered.connect(lambda: self._set_sol_type(101))
-        sol_103_action.triggered.connect(lambda: self._set_sol_type(103))
-        sol_105_action.triggered.connect(lambda: self._set_sol_type(105))
-        sol_106_action.triggered.connect(lambda: self._set_sol_type(106))
-        analysis_menu.addSeparator()
+        # v5.3.0 Item B: Solution Type submenu removed. SOL type now
+        # lives only on AnalysisSet.sol_type, set via the Analysis Set
+        # Manager. The global `self.sol_type` instance variable stays as
+        # a write-cache mirror of the active set's sol_type so existing
+        # export / run paths reading it continue to work; it's no longer
+        # user-mutable from a top-level menu.
         subcase_action = QAction("Subcases (Case Control)...", self)
         subcase_action.triggered.connect(self._open_subcase_editor)
         analysis_menu.addAction(subcase_action)
@@ -1943,11 +1948,24 @@ class MainWindow(QMainWindow):
         fbd_action = QAction("Free Body Diagram...", self)
         fbd_action.triggered.connect(self._show_free_body_diagram)
         tools_menu.addAction(fbd_action)
-        # Theme B: Probe tool. Hovering over nodes/elements while this is
-        # checked surfaces a tooltip with their results.
+        # Probe tool. Hovering over nodes/elements while this is checked
+        # surfaces a tooltip with their results.
         self.probe_mode_action = QAction("Probe Mode", self, checkable=True)
+        self.probe_mode_action.setShortcut("Ctrl+Shift+P")
+        self.probe_mode_action.setStatusTip(
+            "Hover over a node or element to display its ID, type, "
+            "and (if results are loaded) result values at the cursor.")
+        self.probe_mode_action.setToolTip(
+            "<b>Probe Mode</b><br>"
+            "Toggle ON to see hover tooltips with entity IDs and "
+            "result values at the cursor. Toggle OFF to restore normal "
+            "cursor behavior.<br><i>Shortcut: Ctrl+Shift+P</i>")
         self.probe_mode_action.toggled.connect(self._toggle_probe_mode)
         tools_menu.addAction(self.probe_mode_action)
+        try:
+            tools_menu.setToolTipsVisible(True)
+        except Exception:
+            pass
         # Command palette - same shortcut as install_command_palette_shortcut,
         # but having a menu entry makes it discoverable and provides a
         # second way to fire it if the global shortcut gets eaten by a
@@ -1977,10 +1995,9 @@ class MainWindow(QMainWindow):
         orphan_check_action = QAction("Orphan Check...", self)
         orphan_check_action.triggered.connect(self._show_orphan_check)
         model_check_menu.addAction(orphan_check_action)
-        model_check_menu.addSeparator()
-        orient_normals_action2 = QAction("Orient Normals (Auto)...", self)
-        orient_normals_action2.triggered.connect(self._auto_orient_normals)
-        model_check_menu.addAction(orient_normals_action2)
+        # v5.3.0 Item A: dropped the duplicate "Orient Normals (Auto)"
+        # entry that used to live here. The canonical home is now
+        # Model -> Modify -> Orient Normals (Auto).
 
         groups_menu = menu_bar.addMenu("&Groups")
         groups_select_action = QAction("Select Entities...", self)
@@ -2011,6 +2028,19 @@ class MainWindow(QMainWindow):
         find_entities_action.setShortcut("Ctrl+F")
         find_entities_action.triggered.connect(self._open_find_entity_tool)
         view_menu.addAction(find_entities_action)
+        # v5.3.0 patch 2 Q8: Femap-style Vector Info readout.
+        vector_info_action = QAction("Vector Info...", self)
+        vector_info_action.setStatusTip(
+            "Min/Max readout for the active Output Vector with their "
+            "node/element IDs. Modeless; updates live.")
+        vector_info_action.setToolTip(
+            "<b>Vector Info</b><br>"
+            "Opens a modeless dialog showing the Min/Max of the active "
+            "Output Vector along with their Node or Element IDs. "
+            "Refreshes live as you flip the Output Set / Vector "
+            "combos in the Results sidebar tab.")
+        vector_info_action.triggered.connect(self._open_vector_info_dialog)
+        view_menu.addAction(vector_info_action)
         view_menu.addSeparator()
 
         # --- Orientation submenu (was "Zoom" + standalone "Standard Views") ---
@@ -2192,30 +2222,21 @@ class MainWindow(QMainWindow):
         display_settings_action.triggered.connect(self._open_display_settings)
         tools_submenu.addAction(display_settings_action)
 
-        settings_menu = menu_bar.addMenu("&Settings")
-        export_defaults_action = QAction("Export Defaults...", self)
-        export_defaults_action.triggered.connect(self._open_export_defaults_dialog)
-        settings_menu.addAction(export_defaults_action)
-        units_action = QAction("Units...", self)
-        units_action.triggered.connect(self._open_units_dialog)
-        settings_menu.addAction(units_action)
-        settings_menu.addSeparator()
-        # Phase 4.1: adaptive node decimation toggle.
+        # v5.3.0 Item C: top-level Settings menu deleted. All of its
+        # entries (Export Defaults, Units, Adaptive Node LOD, Element
+        # LOD Threshold, Parallel BDF Parsing) now live under
+        # Edit -> Preferences as dedicated tabs.
+        #
+        # The standalone action QAction objects below are kept as
+        # invisible placeholders so any code that imperatively triggers
+        # them (legacy command-palette entries, tests) continues to work
+        # without NoneType crashes.
         self.adaptive_lod_action = QAction(
             "Adaptive Node LOD (decimate huge clouds)", self, checkable=True,
         )
         self.adaptive_lod_action.setChecked(self._adaptive_lod_enabled)
         self.adaptive_lod_action.toggled.connect(self._toggle_adaptive_lod)
-        settings_menu.addAction(self.adaptive_lod_action)
-        # v3.2.0: element-level LOD threshold (professional).
-        elem_lod_action = QAction("Element LOD Threshold...", self)
-        elem_lod_action.triggered.connect(self._open_elem_lod_dialog)
-        settings_menu.addAction(elem_lod_action)
-        # Parallel BDF parsing toggle has been retired (was slower than
-        # single-threaded due to GIL contention; left stale-True values
-        # in some users' QSettings causing huge import hangs). The
-        # action is kept as a hidden no-op so any external code or
-        # registry references don't NoneType-crash.
+        self.adaptive_lod_action.setVisible(False)
         self.parallel_parsing_action = QAction(
             "Parallel BDF Parsing (retired)", self, checkable=True,
         )
@@ -6128,12 +6149,24 @@ class MainWindow(QMainWindow):
         from node_runner.dialogs.info import GroupEditorDialog
         dialog = GroupEditorDialog(name, group_data, model, self)
         if dialog.exec():
-            added_n, added_e, removed_n, removed_e = dialog.get_changes()
-            if added_n or added_e or removed_n or removed_e:
+            # v5.3.0 Item D2: get_changes() now returns a dict carrying
+            # nodes / elements / properties / materials / coords. Build
+            # the ModifyGroupCommand with all six channels.
+            ch = dialog.get_changes()
+            any_change = any(ch.values())
+            if any_change:
                 cmd = ModifyGroupCommand(
                     self.groups, name,
-                    add_nodes=added_n, add_elements=added_e,
-                    remove_nodes=removed_n, remove_elements=removed_e,
+                    add_nodes=ch.get("added_nodes"),
+                    add_elements=ch.get("added_elements"),
+                    remove_nodes=ch.get("removed_nodes"),
+                    remove_elements=ch.get("removed_elements"),
+                    add_properties=ch.get("added_properties"),
+                    add_materials=ch.get("added_materials"),
+                    add_coords=ch.get("added_coords"),
+                    remove_properties=ch.get("removed_properties"),
+                    remove_materials=ch.get("removed_materials"),
+                    remove_coords=ch.get("removed_coords"),
                 )
                 self.command_manager.execute(cmd, model)
                 self._populate_groups_list()
@@ -6178,8 +6211,26 @@ class MainWindow(QMainWindow):
                 if hasattr(elem, "nodes"):
                     nids.update(n for n in elem.nodes if n)
             gid = self._next_gid()
+            # v5.3.0 Item D1: also populate properties (was missing).
+            # Auto-collect coord systems referenced by the selected
+            # elements + their nodes so the group is Femap-faithful.
+            cids: set[int] = set()
+            for eid in eids:
+                elem = all_elements[eid]
+                cid = getattr(elem, 'cid', None)
+                if isinstance(cid, int) and cid > 0:
+                    cids.add(cid)
+            for nid in nids:
+                node = model.nodes.get(nid)
+                if node is not None:
+                    cp = getattr(node, 'cp', None)
+                    if isinstance(cp, int) and cp > 0:
+                        cids.add(cp)
             self.groups[f"MAT {mid}"] = self._make_group_data(
-                gid, nodes=list(nids), elements=eids, materials=[mid])
+                gid, nodes=list(nids), elements=eids,
+                properties=sorted(pids_for_mid),
+                materials=[mid],
+                coords=sorted(cids))
         self._populate_groups_list()
         self._update_status(f"Created {len(model.materials)} material groups.")
 
@@ -6221,9 +6272,42 @@ class MainWindow(QMainWindow):
                     n for n in elem.nodes if n)
         for etype, data in sorted(type_groups.items()):
             gid = self._next_gid()
+            # v5.3.0 Item D1: auto-collect dependencies (PIDs from
+            # elements, MIDs from those properties, CIDs from element
+            # cid + node cp) so TYPE groups carry the full schema.
+            pids: set[int] = set()
+            cids: set[int] = set()
+            for eid in data["elements"]:
+                elem = all_elements.get(eid)
+                if elem is None:
+                    continue
+                pid_val = getattr(elem, 'pid', None)
+                if isinstance(pid_val, int) and pid_val > 0:
+                    pids.add(pid_val)
+                cid_val = getattr(elem, 'cid', None)
+                if isinstance(cid_val, int) and cid_val > 0:
+                    cids.add(cid_val)
+            mids: set[int] = set()
+            for pid in pids:
+                prop = model.properties.get(pid)
+                if prop is None:
+                    continue
+                for attr in ('mid', 'mid1', 'mid2', 'mid3', 'mid4'):
+                    mv = getattr(prop, attr, None)
+                    if isinstance(mv, int) and mv > 0:
+                        mids.add(mv)
+            for nid in data["nodes"]:
+                node = model.nodes.get(nid)
+                if node is not None:
+                    cp = getattr(node, 'cp', None)
+                    if isinstance(cp, int) and cp > 0:
+                        cids.add(cp)
             self.groups[f"TYPE {etype}"] = self._make_group_data(
                 gid, nodes=list(data["nodes"]),
-                elements=data["elements"])
+                elements=data["elements"],
+                properties=sorted(pids),
+                materials=sorted(mids),
+                coords=sorted(cids))
         self._populate_groups_list()
         self._update_status(f"Created {len(type_groups)} element type groups.")
 
@@ -7863,8 +7947,35 @@ class MainWindow(QMainWindow):
                 self._on_results_changed()
             except Exception:
                 pass
+        # v5.3.0 Item C: apply consolidated settings from the new tabs
+        # (Export / General / Performance) that replaced the Settings menu.
+        try:
+            new_export = payload.get('export_format')
+            if new_export and self._loaded_filepath is None:
+                self._export_format = new_export
+        except Exception:
+            pass
+        try:
+            self._units = payload.get('units_label', self._units) or ""
+        except Exception:
+            pass
+        try:
+            self._adaptive_lod_enabled = bool(
+                payload.get('adaptive_lod', self._adaptive_lod_enabled))
+        except Exception:
+            pass
+        try:
+            self._parallel_parsing_enabled = bool(
+                payload.get('parallel_parsing',
+                            getattr(self, '_parallel_parsing_enabled', False)))
+        except Exception:
+            pass
         if self.current_generator:
             self._update_viewer(self.current_generator, reset_camera=False)
+        try:
+            self._refresh_status_widgets()
+        except Exception:
+            pass
         self._update_status("Preferences applied - viewer updated.")
 
     # ─── F8: LOAD Combination ────────────────────────────────────────────
@@ -8080,6 +8191,27 @@ class MainWindow(QMainWindow):
         lines = ['CEND']
         model.case_control_deck = CaseControlDeck(lines, log=None)
 
+        # v5.3.0 P1A: pre-build a per-subcase resolver that falls back
+        # to the analysis-set-level Output Requests when a subcase
+        # doesn't specify its own value. Subcase keys are short
+        # ("disp"/"stress"/"force"/"strain"); analysis-set keys are
+        # long ("displacement"/"stress"/"force"/"strain"). The earlier
+        # code only read the short keys, so the user's Output Requests
+        # dialog choices never reached the deck when subcases existed.
+        short_to_long = {
+            'disp': 'displacement',
+            'stress': 'stress',
+            'force': 'force',
+            'strain': 'strain',
+        }
+
+        def _resolve_request(subcase_dict, short_key):
+            val = subcase_dict.get(short_key, 'NONE')
+            if val and val != 'NONE':
+                return val
+            return active_set.output_requests.get(
+                short_to_long[short_key], 'NONE')
+
         for sc in subcases:
             subcase = model.case_control_deck.create_new_subcase(sc['id'])
             if sc.get('load_sid'):
@@ -8091,14 +8223,20 @@ class MainWindow(QMainWindow):
             if sc.get('statsub_id'):
                 subcase.add('STATSUB', sc['statsub_id'], [], 'STRESS-type')
 
-            # Per-subcase output requests (from subcase dict if present)
-            for req_key, req_name in [('disp', 'DISPLACEMENT'), ('stress', 'STRESS'),
-                                       ('force', 'FORCE'), ('strain', 'STRAIN')]:
-                val = sc.get(req_key, 'NONE')
+            # Per-subcase output requests (subcase dict first, then
+            # analysis-set Output Requests as fallback).
+            n_requests_emitted = 0
+            for req_key, req_name in [('disp', 'DISPLACEMENT'),
+                                       ('stress', 'STRESS'),
+                                       ('force', 'FORCE'),
+                                       ('strain', 'STRAIN')]:
+                val = _resolve_request(sc, req_key)
                 if val == 'ALL':
-                    subcase.add(req_name, 'ALL', ['SORT1'], 'STRESS-type')
+                    subcase.add(
+                        req_name, 'ALL', ['SORT1'], 'STRESS-type')
+                    n_requests_emitted += 1
 
-            # Additional global output requests from the analysis set
+            # Additional global output requests from the analysis set.
             extra_map = {
                 'velocity': 'VELOCITY', 'acceleration': 'ACCELERATION',
                 'spcforce': 'SPCFORCES', 'mpcforce': 'MPCFORCES',
@@ -8108,6 +8246,14 @@ class MainWindow(QMainWindow):
                 val = active_set.output_requests.get(key, 'NONE')
                 if val == 'ALL':
                     subcase.add(cc_name, 'ALL', ['SORT1'], 'STRESS-type')
+                    n_requests_emitted += 1
+            try:
+                from node_runner.profiling import perf_event
+                perf_event('mystran', 'export.case_control_emitted',
+                           subcase_id=sc['id'],
+                           n_requests=n_requests_emitted)
+            except Exception:
+                pass
 
     # ─── F6: Renumber Nodes/Elements ─────────────────────────────────────
 
@@ -10882,58 +11028,228 @@ class MainWindow(QMainWindow):
                 self._update_status(f"Deleted load combination SID {combo_sid}.")
 
     def _open_find_entity_tool(self):
-        """Launches a tool to find and zoom to selected entities."""
-        if not self.current_generator or not self.current_generator.model.nodes:
-            self._update_status("No model loaded to find entities in.", is_error=True)
+        """v5.3.0 Item F: Edit → Select Entities.
+
+        Replaces the v3.x QInputDialog (which asked "what type?" then
+        opened the selection bar) with an entity-type picker that also
+        offers Property / Material / Coord, then opens the selection
+        bar. When the user accepts a single entity, the details dialog
+        opens with an Edit... button that routes to the appropriate
+        editor.
+        """
+        if not self.current_generator:
+            self._update_status(
+                "No model loaded to find entities in.", is_error=True)
             return
-
-        entity_types = ["Node", "Element"]
-        entity_type, ok = QInputDialog.getItem(self, "Select Entity Type", 
-                                               "What type of entity do you want to find?", entity_types, 0, False)
-
-        if ok and entity_type:
-            if entity_type == 'Node':
-                all_ids = self.current_generator.model.nodes.keys()
-            else:
-                all_ids = self.current_generator.model.elements.keys()
-            select_by = self._build_select_by_data() if entity_type == 'Element' else None
+        model = self.current_generator.model
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+        )
+        picker = QDialog(self)
+        picker.setWindowTitle("Select Entities")
+        picker.setModal(True)
+        picker.setMinimumWidth(440)
+        layout = QVBoxLayout(picker)
+        title = QLabel(
+            "<b>Pick an entity type</b><br>"
+            "After choosing, the selection window opens for that type. "
+            "Selecting a single entity shows its details with an "
+            "<i>Edit...</i> button.")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        chosen = {'type': None}
+        options = [
+            ('Node', getattr(model, 'nodes', None) or {}),
+            ('Element', getattr(model, 'elements', None) or {}),
+            ('Property', getattr(model, 'properties', None) or {}),
+            ('Material', getattr(model, 'materials', None) or {}),
+            ('Coord', getattr(model, 'coords', None) or {}),
+        ]
+        for label, d in options:
+            b = QPushButton(f"{label}\n({len(d)})")
+            b.setMinimumHeight(56)
+            if not d:
+                b.setEnabled(False)
+                b.setToolTip(
+                    f"No {label.lower()}s in the loaded model.")
+            b.clicked.connect(
+                lambda _checked, t=label: (
+                    chosen.__setitem__('type', t), picker.accept()))
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+        cancel_row = QHBoxLayout()
+        cancel_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(picker.reject)
+        cancel_row.addWidget(cancel_btn)
+        layout.addLayout(cancel_row)
+        if picker.exec() != QDialog.Accepted or not chosen['type']:
+            return
+        entity_type = chosen['type']
+        # Selection-bar only handles Node + Element today; for the other
+        # entity types skip the bar and open the editor directly.
+        if entity_type in ('Node', 'Element'):
+            all_ids = (getattr(model, entity_type.lower() + 's', None)
+                       or {}).keys()
+            select_by = (self._build_select_by_data()
+                         if entity_type == 'Element' else None)
             self._start_selection(entity_type, all_ids,
                                   self._on_find_entities_accept, select_by)
+        else:
+            self._open_entity_editor(entity_type, None)
 
     def _on_find_entities_accept(self):
-        """Callback for when the user confirms their selection in the Find tool."""
+        """Callback for when the user confirms their selection in the
+        Find tool. v5.3.0 Item F: on single-id selection, route to the
+        entity-details dialog with an Edit... action."""
         selected_ids = self.selection_bar.get_selected_ids()
         entity_type = self.selection_bar.entity_type
         self._end_selection_mode()
 
         if not selected_ids:
-            # --- FIX: Call the correct highlighting function with an empty list ---
-            # This correctly removes any existing highlight actor from the scene.
             self._highlight_entities(entity_type, [])
             self._update_status("Highlight cleared.")
             return
-        
-        # --- Calculate bounding box of selection and zoom to it ---
+
+        # Calculate bounding box of selection and zoom to it.
         all_points = []
         if entity_type == 'Node':
             for nid in selected_ids:
                 if nid in self.current_generator.model.nodes:
-                    all_points.append(self.current_generator.model.nodes[nid].xyz)
-        else: # Element
+                    all_points.append(
+                        self.current_generator.model.nodes[nid].xyz)
+        else:  # Element
             nodes_to_get = set()
             for eid in selected_ids:
                 if eid in self.current_generator.model.elements:
-                    nodes_to_get.update(self.current_generator.model.elements[eid].nodes)
+                    nodes_to_get.update(
+                        self.current_generator.model.elements[eid].nodes)
             for nid in nodes_to_get:
-                 if nid in self.current_generator.model.nodes:
-                    all_points.append(self.current_generator.model.nodes[nid].xyz)
-        
+                if nid in self.current_generator.model.nodes:
+                    all_points.append(
+                        self.current_generator.model.nodes[nid].xyz)
+
         if all_points:
             bounds = pv.PolyData(np.array(all_points)).bounds
             self.plotter.reset_camera(bounds=bounds, render=False)
-            self._highlight_entities(entity_type, selected_ids) # Re-highlight after zoom
-        
-        self._update_status(f"Found and zoomed to {len(selected_ids)} {entity_type.lower()}(s).")
+            self._highlight_entities(entity_type, selected_ids)
+
+        # v5.3.0 Item F: single-id select -> show details + Edit...
+        if len(selected_ids) == 1:
+            self._update_status(
+                f"Selected {entity_type.lower()} {selected_ids[0]}.")
+            self._show_entity_details(entity_type, selected_ids[0])
+        else:
+            self._update_status(
+                f"Found and zoomed to {len(selected_ids)} "
+                f"{entity_type.lower()}(s).")
+
+    def _show_entity_details(self, entity_type, entity_id):
+        """v5.3.0 Item F: Read-only details dialog for a single entity
+        plus an Edit... button that routes to the existing editor for
+        that entity type. Cheap and reuses Modify-menu editors instead
+        of building per-entity edit dialogs."""
+        from PySide6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+            QTableWidget, QTableWidgetItem,
+        )
+        model = self.current_generator.model
+        # Resolve the entity object based on type.
+        entity = None
+        details = []
+        if entity_type == 'Node':
+            entity = model.nodes.get(entity_id)
+            if entity is not None:
+                details = [
+                    ("NID", entity_id),
+                    ("X", round(float(entity.xyz[0]), 6)),
+                    ("Y", round(float(entity.xyz[1]), 6)),
+                    ("Z", round(float(entity.xyz[2]), 6)),
+                    ("CP (input coord sys)", getattr(entity, 'cp', 0)),
+                    ("CD (output coord sys)", getattr(entity, 'cd', 0)),
+                ]
+        elif entity_type == 'Element':
+            all_elems = {**model.elements,
+                         **getattr(model, 'rigid_elements', {})}
+            entity = all_elems.get(entity_id)
+            if entity is not None:
+                details = [
+                    ("EID", entity_id),
+                    ("Type", getattr(entity, 'type', '')),
+                    ("PID", getattr(entity, 'pid', '')),
+                    ("Nodes", str(list(getattr(entity, 'nodes', [])))),
+                ]
+        if entity is None:
+            self._update_status(
+                f"{entity_type} {entity_id} not found in model.",
+                is_error=True)
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{entity_type} {entity_id}")
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+        header = QLabel(
+            f"<b>{entity_type} {entity_id}</b><br>"
+            f"Read-only summary. Click <i>Edit...</i> to open the "
+            f"{entity_type.lower()} editor.")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+        table = QTableWidget(len(details), 2)
+        table.setHorizontalHeaderLabels(["Field", "Value"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.horizontalHeader().setStretchLastSection(True)
+        for row, (k, v) in enumerate(details):
+            table.setItem(row, 0, QTableWidgetItem(str(k)))
+            cell = QTableWidgetItem()
+            if isinstance(v, (int, float)):
+                cell.setData(QtCore.Qt.DisplayRole, v)
+            else:
+                cell.setText("" if v is None else str(v))
+            table.setItem(row, 1, cell)
+        layout.addWidget(table)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        edit_btn = QPushButton("Edit...")
+        edit_btn.setDefault(True)
+        edit_btn.clicked.connect(
+            lambda: (dlg.accept(),
+                     self._open_entity_editor(entity_type, entity_id)))
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(edit_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec()
+
+    def _open_entity_editor(self, entity_type, entity_id):
+        """v5.3.0 Item F: dispatch to the existing editor dialog for
+        the given entity type. entity_id is informational only --
+        editors are full-list views; we pass it via status bar.
+        """
+        try:
+            if entity_type == 'Node':
+                self._open_node_move_tool()
+            elif entity_type == 'Element':
+                self._open_element_editor()
+            elif entity_type == 'Property':
+                self._open_property_editor()
+            elif entity_type == 'Material':
+                self._open_material_editor()
+            elif entity_type == 'Coord':
+                self._update_status(
+                    "No coordinate-system editor yet. Coord systems "
+                    "are edited via Model -> Geometry -> Coordinate "
+                    "System.")
+            else:
+                self._update_status(
+                    f"No editor for entity type '{entity_type}'.",
+                    is_error=True)
+        except Exception as exc:
+            self._update_status(
+                f"Editor failed: {exc}", is_error=True)
     
 
 
@@ -12211,6 +12527,26 @@ class MainWindow(QMainWindow):
                                 pass
                     except Exception:
                         pass
+                    # v5.3.0 P2: refresh RBE2/RBE3 spider geometry so
+                    # the lines follow the deformed slave nodes. Mirrors
+                    # the v5.2.1 Item 51 node-cloud rebuild pattern.
+                    if self._has_rbe_elements():
+                        try:
+                            import time as _t
+                            _rbe_t0 = _t.perf_counter()
+                            self._create_rbe_actors(
+                                points_source=_deformed_points)
+                            try:
+                                from node_runner.profiling import perf_event
+                                perf_event(
+                                    'results', 'rbe_redrawn',
+                                    points_source='deformed',
+                                    wall_ms=round(
+                                        (_t.perf_counter() - _rbe_t0) * 1000, 2))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
 
                 _cstyle = getattr(self, '_results_contour_style', 'none')
                 if _cstyle == 'none':
@@ -12368,6 +12704,19 @@ class MainWindow(QMainWindow):
                         if conv_mode != 'average':
                             title = (f"{result_type}\n{component}\n"
                                      f"({_CONV_LABEL.get(conv_mode, conv_mode)})\n")
+                        # v5.3.0 patch 2 Q7: when scale mode is "% of
+                        # model" the bar values are raw engineering
+                        # numbers but the geometry is auto-scaled. Tag
+                        # the title so the disconnect is explicit. In
+                        # "actual" mode (the v5.3.0 default) the bar
+                        # values and visible geometry agree, so no
+                        # annotation is needed.
+                        if getattr(self, '_results_scale_mode', 'actual') == 'pct':
+                            _applied = float(getattr(
+                                self, '_results_applied_scale', 1.0) or 1.0)
+                            if abs(_applied - 1.0) > 1e-6:
+                                title = title.rstrip('\n') + \
+                                    f"\n(geom × {_applied:.3g})\n"
                         # v5.3.1 item 65: explicit clim so changing
                         # vector / data conversion actually refreshes
                         # the scalar bar range. Honors the user's
@@ -12807,10 +13156,54 @@ class MainWindow(QMainWindow):
 
         self.plotter.set_background(bg_color)
 
-        self.plotter.remove_axes()
+        # v5.3.0 Item G fix: explicitly tear down the orientation marker
+        # widget before remove_axes() so the underlying
+        # vtkOrientationMarkerWidget is disposed (not just its actor).
+        # Without this, each theme toggle accumulated a stale axes widget,
+        # producing the cluster of overlapping cubes the user reported.
+        actors_before = len(getattr(self.plotter, 'actors', {}) or {})
+        try:
+            owidget = getattr(self.plotter, '_orientation_widget', None)
+            if owidget is not None:
+                try:
+                    owidget.SetEnabled(False)
+                except Exception:
+                    pass
+                self.plotter._orientation_widget = None
+        except Exception:
+            pass
+        try:
+            self.plotter.remove_axes()
+        except Exception:
+            pass
+        # Belt-and-suspenders: sweep any leftover OrientationMarker /
+        # axes actors that survived remove_axes().
+        try:
+            for nm in list((self.plotter.actors or {}).keys()):
+                low = nm.lower()
+                if 'orientation' in low or 'axes' in low:
+                    try:
+                        self.plotter.remove_actor(nm)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         self.plotter.add_axes()
-        self.axes_actor = self.plotter.renderer.axes_actor
+        try:
+            self.axes_actor = self.plotter.renderer.axes_actor
+        except Exception:
+            self.axes_actor = None
         self._set_axes_label_color(label_color_tuple)
+        try:
+            from node_runner.profiling import perf_event
+            actors_after = len(getattr(self.plotter, 'actors', {}) or {})
+            perf_event('view_cube.rebuilt',
+                       n_actors_before=actors_before,
+                       n_actors_after=actors_after,
+                       is_dark=self.is_dark_theme)
+        except Exception:
+            pass
 
         self.theme_button.setText(f"Switch to {'Light' if self.is_dark_theme else 'Dark'} Mode")
         self._update_plot_visibility()
@@ -14045,7 +14438,17 @@ class MainWindow(QMainWindow):
                     actor = pv.PolyData(np.array(coords))
                     self.plotter.add_mesh(actor, name=f"constraint_actors_{sid}", style='wireframe', render_lines_as_tubes=False, show_edges=False, pickable=False, color='cyan', opacity=0)
 
-    def _create_rbe_actors(self):
+    def _has_rbe_elements(self) -> bool:
+        """v5.3.0 P2: cheap gate to skip RBE rebuild on decks without
+        any rigid elements."""
+        try:
+            return bool(
+                self.current_generator
+                and self.current_generator.model.rigid_elements)
+        except Exception:
+            return False
+
+    def _create_rbe_actors(self, points_source=None):
         """v4.0.2 (Stage B): vectorized RBE2/RBE3 spider-line builder.
 
         Pre-v4.0.2 the per-element loop called
@@ -14062,6 +14465,11 @@ class MainWindow(QMainWindow):
         Legacy fallback retained as
         ``_create_rbe_actors_legacy``; the new path falls back on any
         mismatch detected via a length assertion.
+
+        v5.3.0 P2: ``points_source`` (optional) lets the caller supply
+        a deformed-point array so the RBE spider follows the deformed
+        mesh. Default ``None`` falls through to ``self.current_grid.points``
+        (the model-load path).
         """
         from node_runner.profiling import perf_stage, perf_event
         self.plotter.remove_actor('rbe_actors', render=False)
@@ -14151,7 +14559,12 @@ class MainWindow(QMainWindow):
         # gives O(log N) per query, vectorized over the whole array.
         nids_sorted = np.asarray(self.current_node_ids_sorted, dtype=np.int64)
         n_nodes = nids_sorted.size
-        pts_array = np.asarray(self.current_grid.points)
+        # v5.3.0 P2: caller can override the points used to build the
+        # spider geometry (e.g. with the deformed-mesh point array).
+        if points_source is not None:
+            pts_array = np.asarray(points_source)
+        else:
+            pts_array = np.asarray(self.current_grid.points)
 
         with perf_stage('rbe', 'searchsorted_lookup', n_spokes=n_spokes,
                         n_nodes=int(n_nodes)):
@@ -17687,6 +18100,10 @@ class MainWindow(QMainWindow):
                         scale = (value / 100.0) * diag / max_mag
         except Exception:
             scale = value
+        # v5.3.0 patch 2 Q7: remember the applied scale so the scalar
+        # bar title can annotate "(geom × N)" when in pct mode. The
+        # actual scale is what multiplies the displacement vectors.
+        self._results_applied_scale = float(scale)
         self.deformation_scale_input.setText(f"{scale:.6g}")
 
     def _on_results_animation_settings_changed(self, mode, n_frames, delay_ms):
@@ -18177,6 +18594,85 @@ class MainWindow(QMainWindow):
             [float(stresses[int(e)].get(comp_key, 0.0)) for e in eids],
             dtype=float)
         return eids, values, f"stress/{comp_key}"
+
+    def _compute_active_min_max(self):
+        """v5.3.0 patch 2 Q8: shared helper used by min/max markers AND
+        the Vector Info dialog. Walks the active bundle for the current
+        subcase + Output Vector and returns a dict with the min/max
+        scalar values plus their ID and kind ('Node' / 'Element').
+
+        Returns ``None`` when no bundle is loaded or the active vector
+        has no data.
+        """
+        import numpy as _np
+        nodal = self._active_results_array()
+        if nodal is not None:
+            nids, values, label = nodal
+            if values.size == 0:
+                return None
+            kind = 'Node'
+            ids = nids
+        else:
+            element = self._active_results_element_array()
+            if element is None:
+                return None
+            eids, values, label = element
+            if values.size == 0:
+                return None
+            kind = 'Element'
+            ids = eids
+        argmin_local = int(_np.argmin(values))
+        argmax_local = int(_np.argmax(values))
+        bundle = getattr(self, 'op2_results', None) or {}
+        sc_id = None
+        try:
+            sc_id = self.results_subcase_combo.currentData()
+        except Exception:
+            pass
+        sc_title = ""
+        if bundle and sc_id is not None:
+            sc = bundle.get('subcases', {}).get(int(sc_id), {})
+            sc_title = sc.get('title') or sc.get('subtitle') or ""
+        return {
+            'subcase': sc_id,
+            'subcase_title': sc_title,
+            'label': label,
+            'kind': kind,
+            'max_value': float(values[argmax_local]),
+            'max_id': int(ids[argmax_local]),
+            'min_value': float(values[argmin_local]),
+            'min_id': int(ids[argmin_local]),
+        }
+
+    def _open_vector_info_dialog(self):
+        """View -> Vector Info... handler. Lazy-creates the modeless
+        dialog and refreshes it from the current results bundle."""
+        from node_runner.dialogs.result_browser import VectorInfoDialog
+        dlg = getattr(self, '_vector_info_dialog', None)
+        if dlg is None:
+            dlg = VectorInfoDialog(self)
+            self._vector_info_dialog = dlg
+        try:
+            dlg.refresh(self._compute_active_min_max())
+        except Exception:
+            dlg.refresh(None)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _refresh_vector_info_dialog(self):
+        """Called whenever results change so the open dialog (if any)
+        updates live. Cheap no-op when the dialog isn't open."""
+        dlg = getattr(self, '_vector_info_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        try:
+            dlg.refresh(self._compute_active_min_max())
+        except Exception:
+            try:
+                dlg.refresh(None)
+            except Exception:
+                pass
 
     def _refresh_results_min_max_markers(self):
         """v5.1.2 item 38: build (or remove) the min/max marker
@@ -18912,6 +19408,14 @@ class MainWindow(QMainWindow):
                 self._refresh_results_element_value_labels()
             except Exception:
                 pass
+        # v5.3.0 patch 2 Q8: Vector Info dialog refreshes live when
+        # the user changes the active output set / vector even if
+        # color_mode != 'results' (e.g. browsing values while staying
+        # in property colors).
+        try:
+            self._refresh_vector_info_dialog()
+        except Exception:
+            pass
 
     def _results_tab_file_label(self):
         """Compose a human-friendly tree-root label for the Results tab."""

@@ -2099,7 +2099,19 @@ class CreateGroupCommand(Command):
         self._gid = gid
 
     def execute(self, model) -> None:
-        self._groups[self._name] = {"nodes": [], "elements": [], "gid": self._gid}
+        # v5.3.0 Item D1: full v3.4.0+ schema so groups carry all
+        # six fields (gid, nodes, elements, properties, materials,
+        # coords). Prior versions wrote only the first three, leaving
+        # downstream code that read .get('properties', []) on freshly
+        # created groups to silently see empty lists.
+        self._groups[self._name] = {
+            "gid": self._gid,
+            "nodes": [],
+            "elements": [],
+            "properties": [],
+            "materials": [],
+            "coords": [],
+        }
 
     def undo(self, model) -> None:
         self._groups.pop(self._name, None)
@@ -2163,41 +2175,63 @@ class RenameGroupCommand(Command):
 
 
 class ModifyGroupCommand(Command):
-    """Add or remove nodes/elements from a group."""
+    """Add or remove nodes / elements / properties / materials / coords
+    from a group."""
 
     def __init__(self, groups_dict: dict, name: str,
                  add_nodes: list | None = None,
                  add_elements: list | None = None,
                  remove_nodes: list | None = None,
-                 remove_elements: list | None = None):
+                 remove_elements: list | None = None,
+                 # v5.3.0 Item D2: extended schema support
+                 add_properties: list | None = None,
+                 add_materials: list | None = None,
+                 add_coords: list | None = None,
+                 remove_properties: list | None = None,
+                 remove_materials: list | None = None,
+                 remove_coords: list | None = None):
         self._groups = groups_dict
         self._name = name
         self._add_nodes = add_nodes or []
         self._add_elements = add_elements or []
         self._remove_nodes = remove_nodes or []
         self._remove_elements = remove_elements or []
+        self._add_properties = add_properties or []
+        self._add_materials = add_materials or []
+        self._add_coords = add_coords or []
+        self._remove_properties = remove_properties or []
+        self._remove_materials = remove_materials or []
+        self._remove_coords = remove_coords or []
+
+    @staticmethod
+    def _apply(group, key, add, remove):
+        cur = set(group.get(key, []))
+        group[key] = list((cur | set(add)) - set(remove))
 
     def execute(self, model) -> None:
         g = self._groups.get(self._name)
         if not g:
             return
-        g["nodes"] = list(
-            (set(g["nodes"]) | set(self._add_nodes)) - set(self._remove_nodes)
-        )
-        g["elements"] = list(
-            (set(g["elements"]) | set(self._add_elements)) - set(self._remove_elements)
-        )
+        self._apply(g, "nodes", self._add_nodes, self._remove_nodes)
+        self._apply(g, "elements", self._add_elements, self._remove_elements)
+        self._apply(g, "properties",
+                    self._add_properties, self._remove_properties)
+        self._apply(g, "materials",
+                    self._add_materials, self._remove_materials)
+        self._apply(g, "coords", self._add_coords, self._remove_coords)
 
     def undo(self, model) -> None:
         g = self._groups.get(self._name)
         if not g:
             return
-        g["nodes"] = list(
-            (set(g["nodes"]) | set(self._remove_nodes)) - set(self._add_nodes)
-        )
-        g["elements"] = list(
-            (set(g["elements"]) | set(self._remove_elements)) - set(self._add_elements)
-        )
+        # Undo swaps add/remove sets.
+        self._apply(g, "nodes", self._remove_nodes, self._add_nodes)
+        self._apply(g, "elements", self._remove_elements, self._add_elements)
+        self._apply(g, "properties",
+                    self._remove_properties, self._add_properties)
+        self._apply(g, "materials",
+                    self._remove_materials, self._add_materials)
+        self._apply(g, "coords", self._remove_coords, self._add_coords)
 
     @property
     def description(self) -> str:

@@ -1,6 +1,40 @@
-# Node Runner v5.2
+# Node Runner v5.3
 
 A lightweight pre, solve, and post environment for Nastran models. Built with Python, PySide6, PyVista, and the open-source MYSTRAN solver.
+
+## Changelog for v5.3.0
+
+UX consolidation + entity editor + group polish.
+
+**v5.3.0 same-day patch (2026-05-17):**
+
+* **RBE2 / RBE3 spider follows the deformed mesh.** Previously the rigid-element lines stayed pinned to undeformed node positions while the slave grids moved with the plate. The actor is now rebuilt with the deformed point coordinates on each results render. New `results.rbe_redrawn` profile-log catcher.
+* **Group editor populates every row.** The 5 tables in the Edit Group dialog had `setSortingEnabled(True)` set before the populate loop, causing Qt to scramble row / column correspondence mid-insert. Sorting is now disabled during populate and re-enabled after — matching the canonical pattern used by `NodeElementInfoDialog`.
+* **Default deform scale = `Actual` at `1.0`.** Previously `% of model` at `10.0` auto-fit the deformation to ~10% of the bbox, hiding the engineering magnitude. The new default shows the raw values; switch to `% of model` for auto-scaling on small-displacement decks.
+* **Output Vector dropdown shows CQUAD4 stress.** The F06 fallback parser now extracts top/bottom-fiber stress from CQUAD4 elements (Normal-X / Normal-Y / Shear-XY / Max / Min Principal / von Mises). CTRIA3 / CBEAM stress and strain / force parsing remain deferred to v5.3.1.
+* **STRESS / STRAIN / FORCE Output Requests reach the deck.** `_apply_case_control_from_set` now falls back to the analysis-set-level Output Requests when a per-subcase entry isn't explicitly set, so MYSTRAN actually computes what the user requested.
+
+**v5.3.0 patch 2 (2026-05-17, same day):**
+
+Results-reading expansion. Closes the F06-fallback gap that left users seeing only Displacement in the Output Vector dropdown:
+
+* **F06 CTRIA3 stress parser.** Mirrors the v5.3.0 CQUAD4 parser; handles the "Anywhere"/"in elem" row markers MYSTRAN emits. Combined with the existing CQUAD4 parser this covers shell stress for mixed-element decks.
+* **F06 CBAR stress + CBAR engineering forces parsers.** Two-station fiber stresses (SA1-SA4 + SB1-SB4 + axial + max/min) plus the one-row force table (M1/M2 at each end + V1/V2 + axial + torque). Beam-element decks now show stress and force contours.
+* **F06 SPC Force vector parsing.** The section was previously detected but its rows weren't stored; the `spc_forces` slot now populates. SPC Force - T1/T2/T3/Magnitude appear in the Output Vector dropdown.
+* **Bundle schema gains `strains` + `forces` slots.** F06 path matches the OP2 path so the dropdown's Strain/Force category gates work uniformly. Strain stays empty on F06-only paths (MYSTRAN doesn't emit strain to F06; OP2 fills it when pyNastran's MYSTRAN dialect is available).
+* **Output Vector dropdown gains Strain and Force categories.** Auto-detected from the bundle slots; categories only appear when their dict is non-empty.
+* **Scalar-bar `(geom × N)` annotation in `% of model` scale mode.** Makes the auto-fit multiplier explicit so users don't read 43.45 on the bar and wonder why the visible geometry is 1.4 inches. No annotation in `Actual` mode (the v5.3.0 default).
+* **Femap-style Vector Info dialog.** New `View → Vector Info...` opens a modeless readout of the active Output Vector's min/max with their Node or Element IDs. Refreshes live as you flip Output Set / Output Vector. Copy button writes a tab-separated row to the clipboard.
+
+Still deferred to v5.3.1+: CBEAM/CROD stress (no fixtures yet), broader OP2 parser expansion, strain F06 (MYSTRAN-side limitation).
+
+* **Model menu regrouped** into themed submenus (Geometry / Elements / Sections / Loads / Constraints / Modify). The 19-item flat list is gone; mesh-editing operations now live inside the Modify submenu. Duplicate `Orient Normals` removed from Tools.
+* **Settings menu removed.** Export Defaults, Units, Adaptive Node LOD, Element LOD Threshold, and the retired Parallel BDF Parsing toggle moved into `Edit -> Preferences` as new General / Export / Performance tabs. One place for all configuration.
+* **Solution Type submenu removed from Analysis menu.** SOL type lives only on the active AnalysisSet now (set via `Analysis -> Analysis Set Manager`), removing a second source of truth.
+* **Group editor expanded.** The Edit Group dialog gains Materials, Properties, and Coords tabs to match the Femap-faithful group schema. Stale node/element IDs now show `(not in current model)` instead of leaving cells blank, and group IDs are coerced to int so JSON-stringified group payloads resolve cleanly. `CreateGroupCommand` now produces the full 6-field schema; `_group_by_material` and `_group_by_element_type` auto-collect dependencies (properties / materials / coord systems).
+* **Probe Mode** gains a tooltip, status-bar help, and the `Ctrl+Shift+P` shortcut.
+* **Edit -> Select Entities** workflow reworked. The old "what type?" `QInputDialog` is replaced with a richer picker that offers Node / Element / Property / Material / Coord. Selecting a single entity opens a read-only details dialog with an `Edit...` button that routes to the existing editor for that type.
+* **View cube duplicate-actor bug fixed.** Toggling between light and dark mode used to accumulate orphaned orientation-marker widgets, producing the cluster of overlapping cubes the user reported. `_toggle_theme` now tears down the old widget and sweeps stale axes actors before adding the fresh marker. New `view_cube.rebuilt` profile-log event tracks the actor count.
 
 ## What it does
 

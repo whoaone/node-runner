@@ -84,6 +84,26 @@ SPC_COMPONENTS = [
     ("T2 (Y)",        "T2"),
     ("T3 (Z)",        "T3"),
 ]
+# v5.3.0 patch 2 Q6: Strain (OP2 only -- MYSTRAN doesn't emit strain
+# to F06) and CBAR element-engineering forces.
+STRAIN_COMPONENTS = [
+    ("εxx",            "exx"),
+    ("εyy",            "eyy"),
+    ("γxy",            "exy"),
+    ("Max Principal",  "max_principal"),
+    ("Min Principal",  "min_principal"),
+    ("Equivalent",     "von_mises"),
+]
+FORCE_COMPONENTS = [
+    ("Axial",                       "axial"),
+    ("Torque",                      "torque"),
+    ("Bend Moment 1, End A",        "m1_a"),
+    ("Bend Moment 2, End A",        "m2_a"),
+    ("Bend Moment 1, End B",        "m1_b"),
+    ("Bend Moment 2, End B",        "m2_b"),
+    ("Shear, Plane 1",              "v1"),
+    ("Shear, Plane 2",              "v2"),
+]
 
 
 PALETTES = [
@@ -190,6 +210,17 @@ class ResultsTab(QWidget):
         self.output_vector_combo = QComboBox()
         self.output_vector_combo.setSizePolicy(QSizePolicy.Expanding,
                                                QSizePolicy.Fixed)
+        # v5.3.0 P1C: clarify what's supported so users aren't
+        # surprised when stress / strain / force are absent on F06-only
+        # results. CQUAD4 stress arrived in v5.3.0; broader coverage in
+        # v5.3.1+.
+        self.output_vector_combo.setToolTip(
+            "<b>Output Vector</b><br>"
+            "Categories appear only for data that's present in the "
+            "loaded bundle. Currently supported from F06: "
+            "Displacements, SPC Forces, CQUAD4 stress, eigenvectors. "
+            "CTRIA3 / CBEAM stress + strain + force are parsed from "
+            "OP2 when available; F06 expansion ships in v5.3.1.")
         self.output_vector_combo.currentIndexChanged.connect(
             self._on_output_vector_changed)
         rb.addRow("Output Vector:", self.output_vector_combo)
@@ -235,7 +266,10 @@ class ResultsTab(QWidget):
         scale_mode_row = QHBoxLayout()
         self._scale_mode_pct = QRadioButton("% of model")
         self._scale_mode_actual = QRadioButton("Actual")
-        self._scale_mode_pct.setChecked(True)
+        # v5.3.0 P3: default to 'Actual' at 1.0 (raw engineering
+        # deformation) so users see the real magnitude immediately.
+        # Switch to '% of model' if you want auto-fit visual scaling.
+        self._scale_mode_actual.setChecked(True)
         self._scale_mode_group = QButtonGroup(self)
         self._scale_mode_group.addButton(self._scale_mode_pct)
         self._scale_mode_group.addButton(self._scale_mode_actual)
@@ -248,8 +282,8 @@ class ResultsTab(QWidget):
         self.scale_value_spin = QDoubleSpinBox()
         self.scale_value_spin.setDecimals(4)
         self.scale_value_spin.setRange(0.0, 1.0e9)
-        self.scale_value_spin.setValue(10.0)
-        self.scale_value_spin.setSingleStep(1.0)
+        self.scale_value_spin.setValue(1.0)
+        self.scale_value_spin.setSingleStep(0.1)
         self.scale_value_spin.editingFinished.connect(self._on_scale_changed)
         sg.addRow("Scale value:", self.scale_value_spin)
         db.addWidget(scale_group)
@@ -424,6 +458,9 @@ class ResultsTab(QWidget):
 
         Pass ``None`` to clear the dropdowns.
         """
+        # v5.3.0 patch 2: cache the bundle locally so the dropdown
+        # rebuild + tests work without a MainWindow parent.
+        self._cached_bundle = op2_results
         self._loading = True
         try:
             self.output_set_combo.clear()
@@ -543,6 +580,27 @@ class ResultsTab(QWidget):
                         f"Stress - {label}",
                         ('stress', key, -1))
                 first = False
+            # v5.3.0 patch 2 Q6: Strain + Force categories (gated on
+            # the bundle slot being non-empty so empty F06 paths don't
+            # display dead entries).
+            if sc.get('strains'):
+                if not first:
+                    self.output_vector_combo.insertSeparator(
+                        self.output_vector_combo.count())
+                for label, key in STRAIN_COMPONENTS:
+                    self.output_vector_combo.addItem(
+                        f"Strain - {label}",
+                        ('strain', key, -1))
+                first = False
+            if sc.get('forces'):
+                if not first:
+                    self.output_vector_combo.insertSeparator(
+                        self.output_vector_combo.count())
+                for label, key in FORCE_COMPONENTS:
+                    self.output_vector_combo.addItem(
+                        f"Force - {label}",
+                        ('force', key, -1))
+                first = False
             eigs = sc.get('eigenvectors') or []
             if eigs:
                 freqs = sc.get('frequencies') or []
@@ -582,17 +640,18 @@ class ResultsTab(QWidget):
     def _find_bundle_from_parent(self):
         """Locate the live op2_results dict on MainWindow.
 
-        Avoids storing a reference here; ``populate_from_results``
-        is always called with the current bundle, but the Output
-        Vector combo also rebuilds whenever the user picks a new
-        subcase, so we need to read the bundle on demand.
+        Walks the parent chain; falls back to the bundle that
+        ``populate_from_results`` was last called with (so standalone
+        / test instances work without a MainWindow parent).
         """
         p = self.parent()
         while p is not None:
             if hasattr(p, 'op2_results'):
-                return getattr(p, 'op2_results', None)
+                live = getattr(p, 'op2_results', None)
+                if live:
+                    return live
             p = p.parent()
-        return None
+        return getattr(self, '_cached_bundle', None)
 
     # ----- Deform handlers -----
 
