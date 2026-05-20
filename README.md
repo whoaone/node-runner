@@ -6,12 +6,6 @@
 
 Node Runner reads a Nastran bulk-data deck, renders the mesh interactively, drives the open-source MYSTRAN solver as a subprocess, and loads the results back into a Femap-style post-processing toolbox. It is built for engineers who want a real FEA workflow without paying a commercial-license-per-seat-per-year.
 
-<!-- TODO: Replace these placeholders with screenshots once captured. -->
-<p align="center">
-  <img src="docs/screenshots/hero-deformed-plate.png" alt="Deformed plate with contour gradient" width="720" />
-  <br><em>v5.3.0 post-processing toolbox driving a deformed CQUAD4 plate with displacement contour.</em>
-</p>
-
 ---
 
 ## Why Node Runner
@@ -217,8 +211,7 @@ Issues and pull requests welcome. Before opening a PR:
 1. Run `pytest tests/ -q`. The full suite must pass.
 2. Add a regression test for any bug fix or new feature.
 3. Match the existing code style (4-space indent, no trailing whitespace, no em-dashes).
-4. For UI changes, attach a short screen recording or screenshot to the PR.
-5. Update the changelog block at the top of this README in the section for the next release.
+4. Update the changelog block at the top of this README in the section for the next release.
 
 The codebase favors instrumentation over guesswork. If you touch a hot path, leave a `perf_event` catcher behind so the next developer can see what changed.
 
