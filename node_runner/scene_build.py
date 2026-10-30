@@ -170,8 +170,26 @@ def build_node_coords_vectorized(model, sorted_node_ids):
         # to rotate into the global frame, then add the origin.
         axes = np.column_stack([i_hat, j_hat, k_hat])
         mask = cp_ids == cp_int
-        out[mask] = origin + xyz[mask] @ axes.T
+        local = _to_rectangular(xyz[mask], getattr(cs, 'Type', 'R'))
+        out[mask] = origin + local @ axes.T
     return out
+
+
+def _to_rectangular(p, coord_type):
+    """Local (r, theta, z) or (r, theta, phi) in degrees -> local x, y, z.
+
+    GRID positions in a cylindrical (C) or spherical (S) coord are not
+    x, y, z, so they must be converted before the rotation into basic.
+    """
+    if coord_type == 'C':
+        r, t, z = p[:, 0], np.radians(p[:, 1]), p[:, 2]
+        return np.column_stack([r * np.cos(t), r * np.sin(t), z])
+    if coord_type == 'S':
+        r, t, f = p[:, 0], np.radians(p[:, 1]), np.radians(p[:, 2])
+        return np.column_stack([r * np.sin(t) * np.cos(f),
+                                r * np.sin(t) * np.sin(f),
+                                r * np.cos(t)])
+    return p
 
 
 def build_element_arrays_vectorized(
@@ -402,10 +420,18 @@ def build_element_arrays_vectorized(
             for i, r in enumerate(rows):
                 cells_all.append(np.concatenate(
                     [[len(r)], flat_idx[i, :len(r)]]).astype(np.int64))
-        # cell_types: pick the dominant cell type for this kind.
-        info_proto = ETYPE_INFO[etype_by_kind[kind][0]]
-        cell_types_all.append(
-            np.full(len(rows), info_proto['vtk_cell'], dtype=np.uint8))
+        # cell_types: one type per kind when every row has the same width
+        # (CHEXA / CHEXA20 etc. share a VTK type). Mixed widths (CTETRA and
+        # CHEXA in one 'solid' bucket) need each element's own type, or VTK
+        # reads a 4-node tet as a hex and crashes.
+        if uniform:
+            info_proto = ETYPE_INFO[etype_by_kind[kind][0]]
+            cell_types_all.append(
+                np.full(len(rows), info_proto['vtk_cell'], dtype=np.uint8))
+        else:
+            cell_types_all.append(np.array(
+                [ETYPE_INFO[t]['vtk_cell'] for t in etype_by_kind[kind]],
+                dtype=np.uint8))
         eids_all.append(np.asarray(eid_by_kind[kind], dtype=np.int64))
         pids_all.append(np.asarray(pid_by_kind[kind], dtype=np.int64))
         etype_all.append(np.asarray(etype_by_kind[kind], dtype=object))

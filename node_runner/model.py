@@ -1507,6 +1507,13 @@ class NastranModelGenerator:
     
       # --- NEW: Element Quality Calculation Methods (Phase 1) ---
 
+    def _global_node_coords(self):
+        """{nid: basic xyz} for every node. node.xyz is in the node's CP,
+        so geometry from it is wrong for nodes in any other coord."""
+        from node_runner.scene_build import build_node_coords_vectorized
+        nids = sorted(self.model.nodes)
+        return dict(zip(nids, build_node_coords_vectorized(self.model, nids)))
+
     def calculate_element_quality(self):
         """
         Calculates quality metrics for all shell elements in the model.
@@ -1517,7 +1524,7 @@ class NastranModelGenerator:
         """
         quality_data = {}
         # Get all node coordinates once to avoid repeated lookups inside the loop
-        all_node_coords = {nid: node.xyz for nid, node in self.model.nodes.items()}
+        all_node_coords = self._global_node_coords()
 
         for eid, element in self.model.elements.items():
             try:
@@ -1642,16 +1649,17 @@ class NastranModelGenerator:
         min(det) / max(det) - 1.0 is a perfect cube; <0 indicates inverted.
         """
         p = points
-        # Corner -> three edge-neighbors (along x, y, z faces of unit hex)
+        # Corner -> three edge-neighbors, ordered right-handed so a
+        # perfect cube gives the same positive determinant at all 8 corners.
         corners = (
             (0, 1, 3, 4),
             (1, 2, 0, 5),
             (2, 3, 1, 6),
             (3, 0, 2, 7),
-            (4, 5, 7, 0),
-            (5, 6, 4, 1),
-            (6, 7, 5, 2),
-            (7, 4, 6, 3),
+            (4, 7, 5, 0),
+            (5, 4, 6, 1),
+            (6, 5, 7, 2),
+            (7, 6, 4, 3),
         )
         dets = []
         for c, a, b, d in corners:
@@ -1659,8 +1667,11 @@ class NastranModelGenerator:
             v2 = points[b] - points[c]
             v3 = points[d] - points[c]
             dets.append(float(np.dot(v1, np.cross(v2, v3))))
-        dets = [abs(x) for x in dets if abs(x) > 1e-12]
-        if not dets:
+        # Reversed node order flips every corner alike (not inverted);
+        # mixed signs mean a folded or inverted element.
+        sign = 1.0 if sum(dets) >= 0 else -1.0
+        dets = [sign * x for x in dets]
+        if max(dets) < 1e-12:
             return 0.0
         return min(dets) / max(dets)
 
@@ -1841,7 +1852,7 @@ class NastranModelGenerator:
             structural_mass, by_pid ({pid: mass}), notes (list of strings).
         """
         model = self.model
-        all_node_coords = {nid: node.xyz for nid, node in model.nodes.items()}
+        all_node_coords = self._global_node_coords()
         by_pid = {}
         total_weighted_pos = np.zeros(3)
         total_mass = 0.0
@@ -2539,7 +2550,7 @@ class NastranModelGenerator:
         from collections import deque, defaultdict
 
         edge_map = self.build_shell_adjacency_graph()
-        all_node_coords = {nid: node.xyz for nid, node in self.model.nodes.items()}
+        all_node_coords = self._global_node_coords()
 
         # Build adjacency eid → [nbr_eid, ...]
         adjacency = defaultdict(set)
@@ -2628,7 +2639,7 @@ class NastranModelGenerator:
         from collections import defaultdict
 
         edge_map = self.build_shell_adjacency_graph()
-        all_node_coords = {nid: node.xyz for nid, node in self.model.nodes.items()}
+        all_node_coords = self._global_node_coords()
 
         adjacency = defaultdict(set)
         for _key, entries in edge_map.items():
